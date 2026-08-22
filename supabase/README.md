@@ -38,11 +38,13 @@ cd 项目根目录（含 supabase/ 文件夹）
 supabase link --project-ref <你的项目引用ID>   # 在项目 Settings → General 里找
 ```
 
-部署两个函数：
+部署四个函数：
 
 ```bash
 supabase functions deploy send-otp
 supabase functions deploy verify-otp
+supabase functions deploy create-patient
+supabase functions deploy invite-member
 ```
 
 配置密钥（在 Dashboard → Edge Functions → 对应函数 → Secrets 里添加，或 CLI）：

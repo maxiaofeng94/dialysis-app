@@ -5,6 +5,7 @@ import ReportView from '../views/ReportView.vue'
 import TrendView from '../views/TrendView.vue'
 import SettingsView from '../views/SettingsView.vue'
 import LoginView from '../views/LoginView.vue'
+import MembersView from '../views/MembersView.vue'
 import { useAuth } from '../stores/auth'
 import { isCloudConfigured } from '../lib/supabase'
 
@@ -17,6 +18,7 @@ const router = createRouter({
     { path: '/trend', name: 'trend', component: TrendView, meta: { tabbar: true } },
     { path: '/settings', name: 'settings', component: SettingsView, meta: { tabbar: true } },
     { path: '/login', name: 'login', component: LoginView },
+    { path: '/members', name: 'members', component: MembersView },
   ],
 })
 

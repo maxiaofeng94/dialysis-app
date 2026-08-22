@@ -6,6 +6,8 @@ import { useAuth } from '../stores/auth'
 import { repository } from '../repo'
 import { DEFAULT_RINSE_BACK_ML } from '../constants'
 import { currentPatientId } from '../stores/patient'
+import { listMyPatients, createPatient } from '../lib/cloudAdmin'
+import { migrateLocalToCloud } from '../lib/migrate'
 import { todayStr, parseNum, fmt, formatDateCN, calcAge } from '../utils/format'
 import { getEffectiveDryWeight } from '../utils/calc'
 import { uuid } from '../utils/id'
@@ -32,7 +34,68 @@ const dwForm = reactive({ value: '', effectiveDate: '', note: '' })
 const showDwForm = ref(false)
 const fileInput = ref<HTMLInputElement>()
 
-onMounted(load)
+const myPatients = ref<{ patient: Patient; role: string }[]>([])
+const showNewPatient = ref(false)
+const newPatientForm = reactive({ name: '', wheelchairWeight: '', rinseBackVolume: '' })
+
+onMounted(async () => {
+  await load()
+  if (isLoggedIn.value) {
+    myPatients.value = await listMyPatients()
+  }
+})
+
+async function switchPatient(id: string) {
+  currentPatientId.value = id
+  showToast('已切换病人')
+  await load()
+}
+
+function openNewPatient() {
+  newPatientForm.name = ''
+  newPatientForm.wheelchairWeight = ''
+  newPatientForm.rinseBackVolume = ''
+  showNewPatient.value = true
+}
+
+async function onCreatePatient() {
+  if (!newPatientForm.name.trim()) {
+    showToast('请填写姓名')
+    return
+  }
+  const res = await createPatient(
+    newPatientForm.name.trim(),
+    parseNum(newPatientForm.wheelchairWeight) ?? 0,
+    parseNum(newPatientForm.rinseBackVolume) ?? DEFAULT_RINSE_BACK_ML,
+  )
+  if (res.ok && res.data?.patient) {
+    showNewPatient.value = false
+    currentPatientId.value = res.data.patient.id
+    myPatients.value = await listMyPatients()
+    await load()
+    showToast('已创建')
+  } else {
+    showToast(res.data?.error ?? '创建失败')
+  }
+}
+
+async function onMigrate() {
+  try {
+    await showConfirmDialog({ title: '迁移数据', message: '将本机本地数据上传到云端（会在云端新建病人）？' })
+  } catch {
+    return
+  }
+  const res = await migrateLocalToCloud()
+  showToast(res.message)
+  if (res.ok) {
+    myPatients.value = await listMyPatients()
+    await load()
+  }
+}
+
+function goMembers() {
+  router.push('/members')
+}
 
 async function load() {
   const p = await repository.getPatient(currentPatientId.value)
@@ -49,6 +112,11 @@ const currentDry = computed(() => getEffectiveDryWeight(dryWeights.value, todayS
 function calcAgeStr(birthday: string): string {
   const a = calcAge(birthday)
   return a == null ? '—' : `${a} 岁`
+}
+
+function roleLabel(role: string): string {
+  const map: Record<string, string> = { owner: '主人', caregiver: '家属/护工', doctor: '医生', viewer: '只读' }
+  return map[role] ?? role
 }
 
 async function savePatient() {
@@ -196,7 +264,30 @@ function showHelp() {
       <van-button block plain type="primary" @click="exportData">导出全部数据（JSON 备份）</van-button>
       <van-button block plain style="margin-top: 10px" @click="importData">导入数据恢复</van-button>
       <van-button block plain style="margin-top: 10px" @click="showHelp">使用说明</van-button>
+      <van-button v-if="isLoggedIn" block plain style="margin-top: 10px" @click="onMigrate">上传本地数据到云端</van-button>
       <input ref="fileInput" type="file" accept=".json,application/json" style="display: none" @change="onImportFile" />
+    </div>
+
+    <div v-if="isLoggedIn" class="card">
+      <div class="row">
+        <div class="card-title" style="margin: 0">我的病人</div>
+        <van-button size="small" type="primary" plain @click="openNewPatient">＋ 新建</van-button>
+      </div>
+      <div v-if="!myPatients.length" class="muted" style="padding: 10px 0">暂无病人，点「＋ 新建」创建</div>
+      <div
+        v-for="item in myPatients"
+        :key="item.patient.id"
+        class="row"
+        style="padding: 10px 0; border-top: 1px solid #f2f3f5; cursor: pointer"
+        @click="switchPatient(item.patient.id)"
+      >
+        <div>
+          <div class="num">{{ item.patient.name }}</div>
+          <div class="muted">{{ roleLabel(item.role) }}</div>
+        </div>
+        <van-icon v-if="currentPatientId === item.patient.id" name="success" color="#07c160" />
+      </div>
+      <van-button block plain style="margin-top: 10px" @click="goMembers">成员管理</van-button>
     </div>
 
     <div v-if="isLoggedIn" class="card">
@@ -213,6 +304,19 @@ function showHelp() {
         <div style="display: flex; gap: 12px; margin-top: 16px">
           <van-button block @click="showDwForm = false">取消</van-button>
           <van-button block type="primary" @click="saveDw">保存</van-button>
+        </div>
+      </div>
+    </van-popup>
+
+    <van-popup v-model:show="showNewPatient" round position="bottom">
+      <div style="padding: 20px">
+        <div class="card-title">新建病人</div>
+        <van-field v-model="newPatientForm.name" label="姓名" placeholder="请输入姓名" />
+        <van-field v-model="newPatientForm.wheelchairWeight" label="轮椅重量" placeholder="kg" type="number" />
+        <van-field v-model="newPatientForm.rinseBackVolume" label="回水量" placeholder="ml" type="number" />
+        <div style="display: flex; gap: 12px; margin-top: 16px">
+          <van-button block @click="showNewPatient = false">取消</van-button>
+          <van-button block type="primary" @click="onCreatePatient">创建</van-button>
         </div>
       </div>
     </van-popup>

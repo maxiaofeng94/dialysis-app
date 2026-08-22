@@ -5,6 +5,7 @@ import { showToast, showConfirmDialog } from 'vant'
 import { repository } from '../repo'
 import { REACTION_TYPES } from '../constants'
 import { currentPatientId } from '../stores/patient'
+import { isLoggedIn } from '../stores/auth'
 import { todayStr, parseNum, fmt, formatTime, combineDateTime } from '../utils/format'
 import { getEffectiveDryWeight, calcWeights } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
@@ -310,7 +311,7 @@ async function removeSession() {
           </van-button>
         </div>
         <van-field v-model="form.date" label="透析日期" type="date" />
-        <van-field v-model="form.operator" label="记录人" placeholder="谁记录的（可选）" />
+        <van-field v-if="!isLoggedIn" v-model="form.operator" label="记录人" placeholder="谁记录的（可选）" />
       </div>
 
       <!-- 体重与脱水 -->
