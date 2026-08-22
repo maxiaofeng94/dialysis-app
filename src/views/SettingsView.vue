@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from 'vue'
 import { showToast, showConfirmDialog, showDialog } from 'vant'
+import { useRouter } from 'vue-router'
+import { useAuth } from '../stores/auth'
 import { repository } from '../repo'
 import { DEFAULT_PATIENT_ID, DEFAULT_RINSE_BACK_ML } from '../constants'
 import { todayStr, parseNum, fmt, formatDateCN, calcAge } from '../utils/format'
@@ -10,6 +12,13 @@ import type { Patient, DryWeight } from '../types'
 
 const patient = ref<Patient | null>(null)
 const dryWeights = ref<DryWeight[]>([])
+const router = useRouter()
+const { isLoggedIn, logout } = useAuth()
+
+async function onLogout() {
+  await logout()
+  router.replace('/login')
+}
 
 const form = reactive({
   name: '',
@@ -187,6 +196,11 @@ function showHelp() {
       <van-button block plain style="margin-top: 10px" @click="importData">导入数据恢复</van-button>
       <van-button block plain style="margin-top: 10px" @click="showHelp">使用说明</van-button>
       <input ref="fileInput" type="file" accept=".json,application/json" style="display: none" @change="onImportFile" />
+    </div>
+
+    <div v-if="isLoggedIn" class="card">
+      <div class="card-title">账号</div>
+      <van-button block plain type="danger" @click="onLogout">退出登录</van-button>
     </div>
 
     <van-popup v-model:show="showDwForm" round position="bottom">
