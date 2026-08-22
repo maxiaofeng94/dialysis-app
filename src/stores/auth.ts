@@ -2,9 +2,9 @@ import { ref, computed } from 'vue'
 import type { User } from '@supabase/supabase-js'
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY, isCloudConfigured } from '../lib/supabase'
 
-const user = ref<User | null>(null)
-const initialized = ref(false)
-const isLoggedIn = computed(() => isCloudConfigured && !!user.value)
+export const user = ref<User | null>(null)
+export const initialized = ref(false)
+export const isLoggedIn = computed(() => isCloudConfigured && !!user.value)
 
 async function init() {
   if (!isCloudConfigured) {
