@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { repository } from '../repo'
-import { DEFAULT_PATIENT_ID } from '../constants'
+import { currentPatientId } from '../stores/patient'
 import { formatTime } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import BaseChart from '../components/BaseChart.vue'
@@ -16,8 +16,8 @@ const gluTrend = ref<{ time: number; date: string; value: number }[]>([])
 onMounted(load)
 
 async function load() {
-  dryWeights.value = await repository.listDryWeights(DEFAULT_PATIENT_ID)
-  sessions.value = await repository.listSessions(DEFAULT_PATIENT_ID)
+  dryWeights.value = await repository.listDryWeights(currentPatientId.value)
+  sessions.value = await repository.listSessions(currentPatientId.value)
   await loadBpTrend()
   await loadGlucoseTrend()
 }

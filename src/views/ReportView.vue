@@ -6,7 +6,8 @@ import { Capacitor } from '@capacitor/core'
 import { Share } from '@capacitor/share'
 import { Filesystem, Directory } from '@capacitor/filesystem'
 import { repository } from '../repo'
-import { DEFAULT_PATIENT_ID, reactionLabel } from '../constants'
+import { reactionLabel } from '../constants'
+import { currentPatientId } from '../stores/patient'
 import { fmt, formatTime, calcAge } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
@@ -33,8 +34,8 @@ async function load() {
     router.replace('/')
     return
   }
-  patient.value = (await repository.getPatient(DEFAULT_PATIENT_ID)) ?? null
-  dryWeights.value = await repository.listDryWeights(DEFAULT_PATIENT_ID)
+  patient.value = (await repository.getPatient(currentPatientId.value)) ?? null
+  dryWeights.value = await repository.listDryWeights(currentPatientId.value)
   bps.value = await repository.listBloodPressures(sessionId)
   glucoses.value = await repository.listBloodGlucoses(sessionId)
   reactions.value = await repository.listAdverseReactions(sessionId)

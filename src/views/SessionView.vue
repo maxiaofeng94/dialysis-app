@@ -3,7 +3,8 @@ import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
 import { showToast, showConfirmDialog } from 'vant'
 import { repository } from '../repo'
-import { DEFAULT_PATIENT_ID, REACTION_TYPES } from '../constants'
+import { REACTION_TYPES } from '../constants'
+import { currentPatientId } from '../stores/patient'
 import { todayStr, parseNum, fmt, formatTime, combineDateTime } from '../utils/format'
 import { getEffectiveDryWeight, calcWeights } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
@@ -49,8 +50,8 @@ async function load() {
     router.replace('/')
     return
   }
-  patient.value = (await repository.getPatient(DEFAULT_PATIENT_ID)) ?? null
-  dryWeights.value = await repository.listDryWeights(DEFAULT_PATIENT_ID)
+  patient.value = (await repository.getPatient(currentPatientId.value)) ?? null
+  dryWeights.value = await repository.listDryWeights(currentPatientId.value)
   await loadSub()
   form.date = session.value.date
   form.operator = session.value.operator ?? ''

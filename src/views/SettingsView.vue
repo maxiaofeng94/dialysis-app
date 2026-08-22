@@ -4,7 +4,8 @@ import { showToast, showConfirmDialog, showDialog } from 'vant'
 import { useRouter } from 'vue-router'
 import { useAuth } from '../stores/auth'
 import { repository } from '../repo'
-import { DEFAULT_PATIENT_ID, DEFAULT_RINSE_BACK_ML } from '../constants'
+import { DEFAULT_RINSE_BACK_ML } from '../constants'
+import { currentPatientId } from '../stores/patient'
 import { todayStr, parseNum, fmt, formatDateCN, calcAge } from '../utils/format'
 import { getEffectiveDryWeight } from '../utils/calc'
 import { uuid } from '../utils/id'
@@ -34,13 +35,13 @@ const fileInput = ref<HTMLInputElement>()
 onMounted(load)
 
 async function load() {
-  const p = await repository.getPatient(DEFAULT_PATIENT_ID)
+  const p = await repository.getPatient(currentPatientId.value)
   patient.value = p ?? null
   form.name = p?.name ?? ''
   form.birthday = p?.birthday ?? ''
   form.wheelchairWeight = p ? String(p.wheelchairWeight) : ''
   form.rinseBackVolume = p ? String(p.rinseBackVolume) : ''
-  dryWeights.value = await repository.listDryWeights(DEFAULT_PATIENT_ID)
+  dryWeights.value = await repository.listDryWeights(currentPatientId.value)
 }
 
 const currentDry = computed(() => getEffectiveDryWeight(dryWeights.value, todayStr()))
@@ -53,7 +54,7 @@ function calcAgeStr(birthday: string): string {
 async function savePatient() {
   const now = Date.now()
   const p: Patient = {
-    id: DEFAULT_PATIENT_ID,
+    id: currentPatientId.value,
     name: form.name.trim() || '未命名',
     birthday: form.birthday,
     wheelchairWeight: parseNum(form.wheelchairWeight) ?? 0,
@@ -81,7 +82,7 @@ async function saveDw() {
   }
   const d: DryWeight = {
     id: uuid(),
-    patientId: DEFAULT_PATIENT_ID,
+    patientId: currentPatientId.value,
     value: v,
     effectiveDate: dwForm.effectiveDate || todayStr(),
     note: dwForm.note.trim() || null,

@@ -3,7 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { repository } from '../repo'
-import { DEFAULT_PATIENT_ID } from '../constants'
+import { currentPatientId } from '../stores/patient'
 import { todayStr, formatDateCN, fmt, calcAge } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import { uuid } from '../utils/id'
@@ -20,9 +20,9 @@ const showNewDialog = ref(false)
 onMounted(refresh)
 
 async function refresh() {
-  patient.value = (await repository.getPatient(DEFAULT_PATIENT_ID)) ?? null
-  dryWeights.value = await repository.listDryWeights(DEFAULT_PATIENT_ID)
-  sessions.value = await repository.listSessions(DEFAULT_PATIENT_ID)
+  patient.value = (await repository.getPatient(currentPatientId.value)) ?? null
+  dryWeights.value = await repository.listDryWeights(currentPatientId.value)
+  sessions.value = await repository.listSessions(currentPatientId.value)
   loading.value = false
 }
 
@@ -78,7 +78,7 @@ async function createSession(preWeight: number | null) {
   }
   const s: DialysisSession = {
     id: uuid(),
-    patientId: DEFAULT_PATIENT_ID,
+    patientId: currentPatientId.value,
     date: todayStr(),
     preWeightMeasured: preWeight,
     postWeightMeasured: null,
