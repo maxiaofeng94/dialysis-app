@@ -1,0 +1,108 @@
+:root {
+  --van-primary-color: #07c160;
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+html {
+  -webkit-text-size-adjust: 100%;
+}
+body {
+  background: #f2f3f5;
+  color: #323233;
+  font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+    sans-serif;
+}
+#app {
+  min-height: 100vh;
+}
+.app-shell {
+  max-width: 560px;
+  margin: 0 auto;
+  min-height: 100vh;
+  background: #f2f3f5;
+}
+.page {
+  padding: 12px;
+  padding-bottom: 80px;
+}
+.page .van-nav-bar {
+  margin-bottom: 14px;
+}
+.card {
+  background: #fff;
+  border-radius: 14px;
+  padding: 14px;
+  margin-bottom: 12px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.04);
+}
+.card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #969799;
+  margin-bottom: 10px;
+}
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.muted {
+  color: #969799;
+  font-size: 13px;
+}
+.num {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.chip {
+  display: inline-block;
+  padding: 6px 14px;
+  margin: 4px 6px 4px 0;
+  border-radius: 16px;
+  border: 1px solid #ebedf0;
+  background: #f7f8fa;
+  font-size: 14px;
+  color: #323233;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s;
+}
+.chip.active {
+  background: #07c160;
+  border-color: #07c160;
+  color: #fff;
+  box-shadow: 0 2px 6px rgba(7, 193, 96, 0.3);
+}
+.kv {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  font-size: 14px;
+}
+.kv .k {
+  color: #646566;
+}
+.kv .v {
+  font-weight: 600;
+}
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #fff;
+  }
+  .app-shell {
+    max-width: none;
+  }
+  .page {
+    padding: 0;
+  }
+}
