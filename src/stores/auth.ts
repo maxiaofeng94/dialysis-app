@@ -32,18 +32,21 @@ async function callFunction(name: string, body: unknown) {
   return { ok: res.ok, data }
 }
 
-async function sendCode(phone: string): Promise<{ ok: boolean; message: string }> {
-  const { ok, data } = await callFunction('send-otp', { phone })
-  return { ok, message: data?.error ?? data?.message ?? '发送成功' }
+function phoneToEmail(phone: string): string {
+  return `${phone}@phone.local`
 }
 
-async function verifyAndLogin(phone: string, code: string): Promise<{ ok: boolean; message: string }> {
-  const { ok, data } = await callFunction('verify-otp', { phone, code })
-  if (!ok || !data?.success) return { ok: false, message: data?.error ?? '验证失败' }
-  // 用本次验证码作为密码换取会话（伪邮箱规则与 verify-otp 一致）
+/** 注册（服务端 createUser，伪邮箱 + 密码） */
+async function register(phone: string, password: string): Promise<{ ok: boolean; message: string }> {
+  const { ok, data } = await callFunction('register', { phone, password })
+  return { ok, message: data?.error ?? '注册成功' }
+}
+
+/** 登录：手机号 + 密码 */
+async function login(phone: string, password: string): Promise<{ ok: boolean; message: string }> {
   const { error } = await supabase!.auth.signInWithPassword({
-    email: `${phone}@phone.local`,
-    password: code,
+    email: phoneToEmail(phone),
+    password,
   })
   if (error) return { ok: false, message: error.message }
   return { ok: true, message: '登录成功' }
@@ -55,5 +58,5 @@ async function logout() {
 }
 
 export function useAuth() {
-  return { user, initialized, isLoggedIn, init, sendCode, verifyAndLogin, logout }
+  return { user, initialized, isLoggedIn, init, register, login, logout }
 }

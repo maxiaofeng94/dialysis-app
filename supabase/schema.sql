@@ -84,18 +84,7 @@ create table if not exists public.patient_members (
   unique (patient_id, user_id)
 );
 
--- ---------- 3. 短信验证码（仅服务端 Edge Function 访问）----------
-
-create table if not exists public.otp_codes (
-  id uuid primary key default gen_random_uuid(),
-  phone text not null,
-  code text not null,
-  expires_at timestamptz not null,
-  used boolean not null default false,
-  created_at timestamptz not null default now()
-);
-
--- ---------- 4. 索引 ----------
+-- ---------- 3. 索引 ----------
 
 create index if not exists idx_dry_weights_patient on public.dry_weights(patient_id, effective_date);
 create index if not exists idx_sessions_patient_date on public.sessions(patient_id, date);
@@ -105,7 +94,6 @@ create index if not exists idx_bg_session on public.blood_glucoses(session_id);
 create index if not exists idx_ar_session on public.adverse_reactions(session_id);
 create index if not exists idx_members_patient on public.patient_members(patient_id);
 create index if not exists idx_members_user on public.patient_members(user_id);
-create index if not exists idx_otp_phone on public.otp_codes(phone, created_at);
 
 -- ---------- 5. 注册用户时自动写入 users 表 ----------
 
@@ -232,6 +220,3 @@ create policy users_select on public.users for select using (
   )
 );
 create policy users_update on public.users for update using (id = auth.uid());
-
--- 验证码表：不建任何策略（客户端完全不可直接访问，仅 Edge Function 用服务端密钥操作）
-alter table public.otp_codes enable row level security;
