@@ -78,7 +78,7 @@ create table if not exists public.users (
 create table if not exists public.patient_members (
   id uuid primary key default gen_random_uuid(),
   patient_id uuid not null references public.patients(id) on delete cascade,
-  user_id uuid not null references auth.users(id) on delete cascade,
+  user_id uuid not null references public.users(id) on delete cascade,
   role text not null default 'caregiver',  -- owner / caregiver / doctor / viewer
   created_at timestamptz not null default now(),
   unique (patient_id, user_id)
@@ -221,9 +221,16 @@ create policy pm_insert on public.patient_members for insert with check (public.
 create policy pm_update on public.patient_members for update using (public.is_member(patient_id, array['owner']));
 create policy pm_delete on public.patient_members for delete using (public.is_member(patient_id, array['owner']));
 
--- 用户资料表：仅本人可读改
+-- 用户资料表：本人可读写；同一病人的成员可互相查看（成员列表显示姓名/手机号用）
 alter table public.users enable row level security;
-create policy users_select on public.users for select using (id = auth.uid());
+create policy users_select on public.users for select using (
+  id = auth.uid()
+  or exists (
+    select 1 from public.patient_members pm
+    where pm.user_id = id
+      and public.is_member(pm.patient_id)
+  )
+);
 create policy users_update on public.users for update using (id = auth.uid());
 
 -- 验证码表：不建任何策略（客户端完全不可直接访问，仅 Edge Function 用服务端密钥操作）
