@@ -107,6 +107,12 @@ function onPostWeightInput(e: Event) {
   form.postWeight = v
   el.value = v
 }
+function onDoctorUfInput(e: Event) {
+  const el = e.target as HTMLInputElement
+  const v = sanitizeDecimal(el.value)
+  form.doctorUf = v
+  el.value = v
+}
 
 watch(form, () => {
   if (!loaded) return
@@ -380,9 +386,14 @@ async function removeSession() {
               <span class="weight-unit">kg</span>
             </div>
           </div>
+          <div class="weight-field">
+            <div class="weight-label">医生设定脱水量</div>
+            <div class="weight-input-wrap">
+              <input :value="form.doctorUf" type="text" inputmode="decimal" placeholder="0" class="weight-input" @input="onDoctorUfInput" />
+              <span class="weight-unit">ml</span>
+            </div>
+          </div>
         </div>
-
-        <van-field v-model="form.doctorUf" label="医生设定脱水量" placeholder="ml（医生设定，可选）" type="number" />
 
         <div class="flow">
           <div class="flow-node">
