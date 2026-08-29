@@ -74,7 +74,7 @@ const summaryText = computed(() => {
   return (
     `透析报告 ${name} ${date}\n` +
     `上机前 ${fmt(c?.preWeightActual)}kg，下机后 ${fmt(c?.postWeightActual)}kg，干体重 ${fmt(c?.effectiveDryWeight)}kg\n` +
-    `医生设定脱水 ${fmt(session.value?.doctorUf)}L，计划脱水 ${fmt(c?.planUf)}L，实际脱水 ${fmt(c?.actualUf)}L，回水 ${c?.rinseBackMl ?? ''}ml\n` +
+    `医生设定脱水 ${fmt(session.value?.doctorUf)}ml，计划脱水 ${fmt(c?.planUf)}L，实际脱水 ${fmt(c?.actualUf)}L，回水 ${c?.rinseBackMl ?? ''}ml\n` +
     `不良反应：${reactionText.value}`
   )
 })
@@ -174,7 +174,7 @@ async function share() {
         </div>
       </div>
       <div class="report-uf">
-        <div class="ruf"><span>医生设定脱水量</span><b>{{ fmt(session?.doctorUf) }} L</b></div>
+        <div class="ruf"><span>医生设定脱水量</span><b>{{ fmt(session?.doctorUf) }} ml</b></div>
         <div class="ruf"><span>计划脱水量</span><b>{{ fmt(comp?.planUf) }} L</b></div>
         <div class="ruf"><span>实际脱水量</span><b>{{ fmt(comp?.actualUf) }} L</b></div>
       </div>

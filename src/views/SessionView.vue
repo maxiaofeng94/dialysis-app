@@ -382,7 +382,7 @@ async function removeSession() {
           </div>
         </div>
 
-        <van-field v-model="form.doctorUf" label="医生设定脱水量" placeholder="L（医生设定，可选）" type="number" />
+        <van-field v-model="form.doctorUf" label="医生设定脱水量" placeholder="ml（医生设定，可选）" type="number" />
 
         <div class="flow">
           <div class="flow-node">
