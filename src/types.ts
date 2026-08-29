@@ -30,6 +30,7 @@ export interface DialysisSession {
   wheelchairWeightUsed: number
   rinseBackVolumeUsed: number
   operator: string | null
+  doctorUf: number | null
   status: SessionStatus
   notes: string | null
   createdAt: number
@@ -46,6 +47,14 @@ export interface BloodPressure {
 }
 
 export interface BloodGlucose {
+  id: string
+  sessionId: string
+  measuredAt: number
+  value: number
+  note: string | null
+}
+
+export interface BloodFlow {
   id: string
   sessionId: string
   measuredAt: number

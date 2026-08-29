@@ -11,7 +11,7 @@ import { fmt, formatTime, calcAge } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
 import BaseChart from '../components/BaseChart.vue'
-import type { DialysisSession, Patient, DryWeight, BloodPressure, BloodGlucose, AdverseReaction } from '../types'
+import type { DialysisSession, Patient, DryWeight, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
 
 const route = useRoute()
 const router = useRouter()
@@ -22,6 +22,7 @@ const patient = ref<Patient | null>(null)
 const dryWeights = ref<DryWeight[]>([])
 const bps = ref<BloodPressure[]>([])
 const glucoses = ref<BloodGlucose[]>([])
+const flows = ref<BloodFlow[]>([])
 const reactions = ref<AdverseReaction[]>([])
 const reportEl = ref<HTMLDivElement>()
 
@@ -37,6 +38,7 @@ async function load() {
   dryWeights.value = await repository.listDryWeights(DEFAULT_PATIENT_ID)
   bps.value = await repository.listBloodPressures(sessionId)
   glucoses.value = await repository.listBloodGlucoses(sessionId)
+  flows.value = await repository.listBloodFlows(sessionId)
   reactions.value = await repository.listAdverseReactions(sessionId)
 }
 
@@ -72,7 +74,7 @@ const summaryText = computed(() => {
   return (
     `透析报告 ${name} ${date}\n` +
     `上机前 ${fmt(c?.preWeightActual)}kg，下机后 ${fmt(c?.postWeightActual)}kg，干体重 ${fmt(c?.effectiveDryWeight)}kg\n` +
-    `计划脱水 ${fmt(c?.planUf)}L，实际脱水 ${fmt(c?.actualUf)}L，回水 ${c?.rinseBackMl ?? ''}ml\n` +
+    `医生设定脱水 ${fmt(session.value?.doctorUf)}L，计划脱水 ${fmt(c?.planUf)}L，实际脱水 ${fmt(c?.actualUf)}L，回水 ${c?.rinseBackMl ?? ''}ml\n` +
     `不良反应：${reactionText.value}`
   )
 })
@@ -172,6 +174,7 @@ async function share() {
         </div>
       </div>
       <div class="report-uf">
+        <div class="ruf"><span>医生设定脱水量</span><b>{{ fmt(session?.doctorUf) }} L</b></div>
         <div class="ruf"><span>计划脱水量</span><b>{{ fmt(comp?.planUf) }} L</b></div>
         <div class="ruf"><span>实际脱水量</span><b>{{ fmt(comp?.actualUf) }} L</b></div>
       </div>
@@ -196,6 +199,13 @@ async function share() {
         <span class="v">{{ glucoses.length ? `${fmt(glucoses[0].value)} mmol/L` : '—' }}
           <van-tag v-if="glucoses.length" :type="assessGlucose(glucoses[0].value).color" style="margin-left: 6px">{{ assessGlucose(glucoses[0].value).text }}</van-tag>
         </span>
+      </div>
+      <div v-if="flows.length" style="margin: 8px 0 0">
+        <div class="muted" style="margin-bottom: 4px">血流量</div>
+        <div v-for="f in flows" :key="f.id" class="kv">
+          <span class="k">{{ formatTime(f.measuredAt) }}</span>
+          <span class="v">{{ f.value }} ml/min</span>
+        </div>
       </div>
       <div class="kv">
         <span class="k">不良反应</span>

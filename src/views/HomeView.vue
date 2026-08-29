@@ -85,6 +85,7 @@ async function createSession(preWeight: number | null) {
     wheelchairWeightUsed: patient.value.wheelchairWeight,
     rinseBackVolumeUsed: patient.value.rinseBackVolume,
     operator: null,
+    doctorUf: null,
     status: 'ongoing',
     notes: null,
     createdAt: Date.now(),

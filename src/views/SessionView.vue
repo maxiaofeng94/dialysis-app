@@ -8,7 +8,7 @@ import { todayStr, parseNum, fmt, formatTime, combineDateTime } from '../utils/f
 import { getEffectiveDryWeight, calcWeights } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
 import { uuid } from '../utils/id'
-import type { DialysisSession, Patient, DryWeight, BloodPressure, BloodGlucose, AdverseReaction } from '../types'
+import type { DialysisSession, Patient, DryWeight, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
 
 const route = useRoute()
 const router = useRouter()
@@ -19,6 +19,7 @@ const patient = ref<Patient | null>(null)
 const dryWeights = ref<DryWeight[]>([])
 const bps = ref<BloodPressure[]>([])
 const glucoses = ref<BloodGlucose[]>([])
+const flows = ref<BloodFlow[]>([])
 const reactions = ref<AdverseReaction[]>([])
 
 const form = reactive({
@@ -27,6 +28,7 @@ const form = reactive({
   notes: '',
   preWeight: '',
   postWeight: '',
+  doctorUf: '',
 })
 
 const showBp = ref(false)
@@ -35,6 +37,9 @@ const editingBpId = ref<string | null>(null)
 const showGlu = ref(false)
 const gluForm = reactive({ time: '', value: '' })
 const editingGluId = ref<string | null>(null)
+const showFlow = ref(false)
+const flowForm = reactive({ time: '', value: '' })
+const editingFlowId = ref<string | null>(null)
 const selectedReactions = ref<string[]>([])
 const otherDetail = ref('')
 
@@ -57,6 +62,7 @@ async function load() {
   form.notes = session.value.notes ?? ''
   form.preWeight = session.value.preWeightMeasured != null ? String(session.value.preWeightMeasured) : ''
   form.postWeight = session.value.postWeightMeasured != null ? String(session.value.postWeightMeasured) : ''
+  form.doctorUf = session.value.doctorUf != null ? String(session.value.doctorUf) : ''
   selectedReactions.value = reactions.value.map((r) => r.type)
   otherDetail.value = reactions.value.find((r) => r.type === 'other')?.detail ?? ''
   loaded = true
@@ -65,6 +71,7 @@ async function load() {
 async function loadSub() {
   bps.value = await repository.listBloodPressures(sessionId)
   glucoses.value = await repository.listBloodGlucoses(sessionId)
+  flows.value = await repository.listBloodFlows(sessionId)
   reactions.value = await repository.listAdverseReactions(sessionId)
 }
 
@@ -114,6 +121,7 @@ function persistSession(): Promise<void> {
   session.value.notes = form.notes.trim() || null
   session.value.preWeightMeasured = parseNum(form.preWeight)
   session.value.postWeightMeasured = parseNum(form.postWeight)
+  session.value.doctorUf = parseNum(form.doctorUf)
   session.value.updatedAt = Date.now()
   return repository.saveSession(session.value)
 }
@@ -239,6 +247,47 @@ async function removeGlu(g: BloodGlucose) {
   await loadSub()
 }
 
+function openFlow() {
+  editingFlowId.value = null
+  flowForm.time = formatTime(Date.now())
+  flowForm.value = ''
+  showFlow.value = true
+}
+function editFlow(f: BloodFlow) {
+  editingFlowId.value = f.id
+  flowForm.time = formatTime(f.measuredAt)
+  flowForm.value = String(f.value)
+  showFlow.value = true
+}
+async function saveFlow() {
+  const v = parseNum(flowForm.value)
+  if (v == null) {
+    showToast('请填写血流量')
+    return
+  }
+  const val = Math.round(v)
+  await repository.saveBloodFlow({
+    id: editingFlowId.value ?? uuid(),
+    sessionId,
+    measuredAt: combineDateTime(form.date, flowForm.time),
+    value: val,
+    note: null,
+  })
+  showFlow.value = false
+  editingFlowId.value = null
+  await loadSub()
+  showToast(`已保存：血流量 ${val} ml/min`)
+}
+async function removeFlow(f: BloodFlow) {
+  try {
+    await showConfirmDialog({ title: '删除', message: `删除 ${formatTime(f.measuredAt)} 的血流量记录？` })
+  } catch {
+    return
+  }
+  await repository.deleteBloodFlow(f.id)
+  await loadSub()
+}
+
 function toggleReaction(key: string) {
   const i = selectedReactions.value.indexOf(key)
   if (i >= 0) selectedReactions.value.splice(i, 1)
@@ -333,6 +382,8 @@ async function removeSession() {
           </div>
         </div>
 
+        <van-field v-model="form.doctorUf" label="医生设定脱水量" placeholder="L（医生设定，可选）" type="number" />
+
         <div class="flow">
           <div class="flow-node">
             <div class="flow-label">上机前实际</div>
@@ -402,6 +453,25 @@ async function removeSession() {
         </div>
       </div>
 
+      <!-- 血流量 -->
+      <div class="card">
+        <div class="row">
+          <div class="card-title" style="margin: 0">血流量 ({{ flows.length }})</div>
+          <van-button size="small" type="primary" plain @click="openFlow">＋ 记录</van-button>
+        </div>
+        <div v-if="!flows.length" class="muted" style="padding: 10px 0">暂无血流量记录</div>
+        <div v-for="f in flows" :key="f.id" class="row" style="padding: 8px 0; border-top: 1px solid #f2f3f5">
+          <div class="row" style="gap: 10px">
+            <span class="muted">{{ formatTime(f.measuredAt) }}</span>
+            <span class="num">{{ f.value }} <span class="muted">ml/min</span></span>
+          </div>
+          <div class="row" style="gap: 10px">
+            <van-icon name="edit" color="#1989fa" style="cursor: pointer" @click="editFlow(f)" />
+            <van-icon name="delete-o" color="#ee0a24" style="cursor: pointer" @click="removeFlow(f)" />
+          </div>
+        </div>
+      </div>
+
       <!-- 不良反应 -->
       <div class="card">
         <div class="card-title">不良反应</div>
@@ -451,6 +521,19 @@ async function removeSession() {
         <div style="display: flex; gap: 12px; margin-top: 16px">
           <van-button block @click="showGlu = false">取消</van-button>
           <van-button block type="primary" @click="saveGlu">保存</van-button>
+        </div>
+      </div>
+    </van-popup>
+
+    <!-- 血流量弹窗 -->
+    <van-popup v-model:show="showFlow" round position="bottom">
+      <div style="padding: 20px">
+        <div class="card-title">{{ editingFlowId ? '编辑血流量' : '记录血流量' }}</div>
+        <van-field v-model="flowForm.time" label="测量时间" type="time" />
+        <van-field v-model="flowForm.value" label="血流量" placeholder="ml/min" type="number" />
+        <div style="display: flex; gap: 12px; margin-top: 16px">
+          <van-button block @click="showFlow = false">取消</van-button>
+          <van-button block type="primary" @click="saveFlow">保存</van-button>
         </div>
       </div>
     </van-popup>
