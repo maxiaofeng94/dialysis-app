@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from 'vue'
 import { showToast, showConfirmDialog, showDialog } from 'vant'
+import { Capacitor } from '@capacitor/core'
+import { Filesystem, Directory, Encoding } from '@capacitor/filesystem'
+import { Share } from '@capacitor/share'
 import { repository } from '../repo'
 import { DEFAULT_PATIENT_ID, DEFAULT_RINSE_BACK_ML } from '../constants'
 import { todayStr, parseNum, fmt, formatDateCN, calcAge } from '../utils/format'
@@ -106,9 +109,24 @@ function downloadBlob(blob: Blob, filename: string) {
 
 async function exportData() {
   const json = await repository.exportAll()
-  const blob = new Blob([json], { type: 'application/json' })
-  downloadBlob(blob, `透析记录备份-${todayStr()}.json`)
-  showToast('已导出')
+  if (Capacitor.isNativePlatform()) {
+    // APK：写入缓存并调起系统分享面板（可保存到文件 / 发送微信等）
+    const name = `透析记录备份-${todayStr()}.json`
+    const res = await Filesystem.writeFile({
+      path: name,
+      data: json,
+      directory: Directory.Cache,
+      recursive: true,
+      encoding: Encoding.UTF8,
+    })
+    await Share.share({ title: '透析记录备份', url: res.uri, files: [res.uri] })
+    showToast('已生成备份，请选择保存或发送')
+  } else {
+    // 浏览器：直接下载到下载目录
+    const blob = new Blob([json], { type: 'application/json' })
+    downloadBlob(blob, `透析记录备份-${todayStr()}.json`)
+    showToast('已导出')
+  }
 }
 
 function importData() {
