@@ -46,6 +46,18 @@ export function combineDateTime(date: string, time: string): number {
   return isNaN(ts) ? Date.now() : ts
 }
 
+/** 时间戳 → YYYY-MM-DD */
+export function dateStr(ts: number): string {
+  const d = new Date(ts)
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+/** 时间戳 → YYYY-MM-DD HH:mm */
+export function formatDateTimeCN(ts: number): string {
+  const d = new Date(ts)
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 export function parseNum(s: string): number | null {
   if (s == null || s.trim() === '') return null
   const n = Number(s)

@@ -3,7 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { repository } from '../repo'
-import { DEFAULT_PATIENT_ID } from '../constants'
+import { DEFAULT_PATIENT_ID, SESSION_STATUS_LABEL, SESSION_STATUS_TAG, abortText } from '../constants'
 import { todayStr, formatDateCN, fmt, calcAge } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import { uuid } from '../utils/id'
@@ -87,6 +87,9 @@ async function createSession(preWeight: number | null) {
     operator: null,
     doctorUf: null,
     status: 'ongoing',
+    abortedAt: null,
+    abortTags: [],
+    abortReason: null,
     notes: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -207,9 +210,7 @@ async function doNewBlank() {
         >
           <div class="row">
             <span class="num">{{ formatDateCN(s.date) }}</span>
-            <van-tag :type="s.status === 'completed' ? 'success' : 'warning'">
-              {{ s.status === 'completed' ? '已完成' : '进行中' }}
-            </van-tag>
+            <van-tag :type="SESSION_STATUS_TAG[s.status]">{{ SESSION_STATUS_LABEL[s.status] }}</van-tag>
           </div>
           <div class="muted" style="margin-top: 4px">
             上机前实际 <span class="num">{{ fmt(summary(s).preWeightActual) }}</span> kg
@@ -217,6 +218,9 @@ async function doNewBlank() {
               · 计划脱水 <span class="num">{{ fmt(summary(s).planUf) }}</span> L
             </template>
             <template v-if="s.operator"> · {{ s.operator }}</template>
+          </div>
+          <div v-if="s.status === 'aborted'" class="muted abort-line">
+            中止：{{ abortText(s.abortTags, s.abortReason) || '未填写原因' }}
           </div>
         </div>
       </div>
@@ -412,5 +416,12 @@ async function doNewBlank() {
   font-size: 13px;
   color: #969799;
   margin-top: 8px;
+}
+.abort-line {
+  margin-top: 2px;
+  color: #ee0a24;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

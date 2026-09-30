@@ -6,8 +6,8 @@ import { Capacitor } from '@capacitor/core'
 import { Share } from '@capacitor/share'
 import { Filesystem, Directory } from '@capacitor/filesystem'
 import { repository } from '../repo'
-import { DEFAULT_PATIENT_ID, reactionLabel } from '../constants'
-import { fmt, formatTime, calcAge } from '../utils/format'
+import { DEFAULT_PATIENT_ID, reactionLabel, SESSION_STATUS_LABEL, abortText } from '../constants'
+import { fmt, formatTime, calcAge, formatDateTimeCN } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
 import BaseChart from '../components/BaseChart.vue'
@@ -70,15 +70,25 @@ const bpOption = computed(() => ({
   ],
 }))
 
+const abortSummary = computed(() => abortText(session.value?.abortTags, session.value?.abortReason))
+
 const summaryText = computed(() => {
   const c = comp.value
   const name = patient.value?.name ?? ''
   const date = session.value?.date ?? ''
+  const status = session.value ? SESSION_STATUS_LABEL[session.value.status] : ''
+  const abort =
+    session.value?.status === 'aborted'
+      ? `\n状态：已中止${session.value.abortedAt ? `（${formatDateTimeCN(session.value.abortedAt)}）` : ''}，中止原因：${
+          abortSummary.value || '未填写'
+        }`
+      : ''
   return (
-    `透析报告 ${name} ${date}\n` +
+    `透析报告 ${name} ${date}（${status}）\n` +
     `上机前 ${fmt(c?.preWeightActual)}kg，下机后 ${fmt(c?.postWeightActual)}kg，干体重 ${fmt(c?.effectiveDryWeight)}kg\n` +
     `医生设定脱水 ${fmt(doctorUfL.value)}L，计划脱水 ${fmt(c?.planUf)}L，实际脱水 ${fmt(c?.actualUf)}L，回水 ${c?.rinseBackMl ?? ''}ml\n` +
-    `不良反应：${reactionText.value}`
+    `不良反应：${reactionText.value}` +
+    abort
   )
 })
 
@@ -160,6 +170,15 @@ async function share() {
         <div v-if="patient?.birthday" class="muted">
           年龄约 {{ calcAge(patient.birthday) ?? '—' }} 岁
         </div>
+        <div v-if="session" class="report-status" :class="session.status">
+          {{ SESSION_STATUS_LABEL[session.status] }}
+        </div>
+      </div>
+
+      <div v-if="session?.status === 'aborted'" class="report-abort">
+        <div class="report-abort-title">本次透析已中止</div>
+        <div v-if="session.abortedAt">中止时间：{{ formatDateTimeCN(session.abortedAt) }}</div>
+        <div>中止原因：{{ abortSummary || '未填写' }}</div>
       </div>
 
       <div class="report-flow">
@@ -289,5 +308,39 @@ async function share() {
   font-size: 12px;
   color: #969799;
   text-align: center;
+}
+.report-status {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.report-status.ongoing {
+  color: #ed6a0c;
+  background: #fff4e8;
+}
+.report-status.completed {
+  color: #07c160;
+  background: #e8f7ef;
+}
+.report-status.aborted {
+  color: #ee0a24;
+  background: #ffecec;
+}
+.report-abort {
+  background: #fff5f5;
+  border: 1px solid #ffd9d9;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: #323233;
+  line-height: 1.6;
+}
+.report-abort-title {
+  font-weight: 700;
+  color: #ee0a24;
 }
 </style>
