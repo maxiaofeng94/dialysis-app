@@ -15,7 +15,8 @@
 - **报告**：汇总页、导出图片 / PDF、分享给医生
 - **趋势**：体重、血压历史曲线
 - **干体重历史**：按日期取「当时有效干体重」，历史记录稳定
-- **数据**：手机本地存储（IndexedDB）、JSON 备份 / 恢复、记录人字段
+- **数据**：本地 IndexedDB 存储、JSON 备份 / 恢复、记录人字段
+- **多人协作（可选）**：配置 Supabase 后可手机号 + 密码登录，多端同步、邀请家属/医生共同记录；不配置则保持纯本地单机模式
 
 ## 技术栈
 
@@ -60,17 +61,25 @@ src/
   constants.ts        常量与不良反应字典
   utils/              计算、格式化、id
   db/database.ts      IndexedDB(Dexie) 表结构
-  repo/               数据访问抽象(本地实现 + 接口)
-  router/             路由
+  repo/               数据访问抽象（本地实现 + 接口，运行时按登录态切换云端）
+  lib/                Supabase 客户端 / 云端仓储 / 成员管理 / 本地→云端迁移
+  stores/             登录态、当前病人
+  router/             路由 + 登录守卫
   components/         BaseChart 图表封装
-  views/              Home/Session/Report/Trend/Settings
-docs/需求与设计文档.md  完整需求与设计文档
+  views/              Home/Session/Report/Trend/Settings/Login/Members
+supabase/             多人版后端：schema.sql + Edge Functions
+docs/                 需求与设计文档、多人版部署指南
 ```
 
 ## 设计文档
 
 完整需求、页面原型、数据库设计（含未来多人扩展）见 `docs/需求与设计文档.md`。
 
-## 未来扩展（多人 / 多设备）
+## 多人 / 多设备（可选）
 
-当前为本地单人版；数据访问走 `Repository` 接口。未来加 `users`、`patientMembers` 表 + 登录 + 行级权限（RLS），前端业务逻辑与计算公式无需改动。详见设计文档。
+同一套代码支持两种模式，由是否配置云端决定：
+
+- **单机模式**（默认）：不配 `.env`，数据只存在手机本地，无需注册登录；
+- **多人模式**：按 `docs/多人版部署指南.md` 配好 Supabase，注册登录后数据存云端，可创建/切换多个病人、按手机号邀请家属或医生（owner / caregiver / doctor / viewer 四种角色，由数据库 RLS 行级权限控制），记录自动带出记录人。
+
+两种模式共用同一套页面与计算公式，数据访问经 `Repository` 接口动态切换。设计细节见 `docs/需求与设计文档.md` 第 10 章。

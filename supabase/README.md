@@ -1,11 +1,15 @@
 # Supabase 多人版后端 — 部署说明
 
 本目录是多人版后端代码：
-- `schema.sql` — 建表 + RLS 权限 + 辅助函数
+- `schema.sql` — 建表 + RLS 权限 + 辅助函数（**可重复执行**，重复跑只补缺的部分）
 - `functions/register/` — 注册（手机号 + 密码，服务端建号）
 - `functions/create-patient/` — 创建病人（建病人 + owner 成员）
 - `functions/invite-member/` — 按手机号邀请成员
 - `deploy-functions.ps1` — 一键部署脚本
+
+数据表：`users`、`patients`、`dry_weights`、`sessions`（含医生设定脱水量、中止时间/原因）、`blood_pressures`、`blood_glucoses`、`blood_flows`、`adverse_reactions`、`patient_members`。
+
+> 记录人姓名靠 `sessions.operator_id → public.users` 关联带出，所以该外键必须指向 `public.users`（旧版指向 `auth.users`，重跑一次 `schema.sql` 即可修正）。
 
 ## 登录方式：手机号 + 密码
 
