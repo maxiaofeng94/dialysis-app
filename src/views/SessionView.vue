@@ -3,14 +3,14 @@ import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
 import { showToast, showConfirmDialog } from 'vant'
 import { repository } from '../repo'
-import { REACTION_TYPES } from '../constants'
+import { REACTION_TYPES, ABORT_REASONS, SESSION_STATUS_LABEL, abortText } from '../constants'
 import { currentPatientId } from '../stores/patient'
 import { isLoggedIn } from '../stores/auth'
-import { todayStr, parseNum, fmt, formatTime, combineDateTime } from '../utils/format'
+import { todayStr, parseNum, fmt, formatTime, combineDateTime, dateStr, formatDateTimeCN } from '../utils/format'
 import { getEffectiveDryWeight, calcWeights } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
 import { uuid } from '../utils/id'
-import type { DialysisSession, Patient, DryWeight, BloodPressure, BloodGlucose, AdverseReaction } from '../types'
+import type { DialysisSession, Patient, DryWeight, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
 
 const route = useRoute()
 const router = useRouter()
@@ -21,6 +21,7 @@ const patient = ref<Patient | null>(null)
 const dryWeights = ref<DryWeight[]>([])
 const bps = ref<BloodPressure[]>([])
 const glucoses = ref<BloodGlucose[]>([])
+const flows = ref<BloodFlow[]>([])
 const reactions = ref<AdverseReaction[]>([])
 
 const form = reactive({
@@ -29,6 +30,7 @@ const form = reactive({
   notes: '',
   preWeight: '',
   postWeight: '',
+  doctorUf: '',
 })
 
 const showBp = ref(false)
@@ -37,8 +39,15 @@ const editingBpId = ref<string | null>(null)
 const showGlu = ref(false)
 const gluForm = reactive({ time: '', value: '' })
 const editingGluId = ref<string | null>(null)
+const showFlow = ref(false)
+const flowForm = reactive({ time: '', value: '' })
+const editingFlowId = ref<string | null>(null)
 const selectedReactions = ref<string[]>([])
 const otherDetail = ref('')
+
+// 中止透析
+const showAbort = ref(false)
+const abortForm = reactive({ date: '', time: '', tags: [] as string[], reason: '' })
 
 let loaded = false
 let timer: ReturnType<typeof setTimeout> | null = null
@@ -59,6 +68,7 @@ async function load() {
   form.notes = session.value.notes ?? ''
   form.preWeight = session.value.preWeightMeasured != null ? String(session.value.preWeightMeasured) : ''
   form.postWeight = session.value.postWeightMeasured != null ? String(session.value.postWeightMeasured) : ''
+  form.doctorUf = session.value.doctorUf != null ? String(session.value.doctorUf) : ''
   selectedReactions.value = reactions.value.map((r) => r.type)
   otherDetail.value = reactions.value.find((r) => r.type === 'other')?.detail ?? ''
   loaded = true
@@ -67,6 +77,7 @@ async function load() {
 async function loadSub() {
   bps.value = await repository.listBloodPressures(sessionId)
   glucoses.value = await repository.listBloodGlucoses(sessionId)
+  flows.value = await repository.listBloodFlows(sessionId)
   reactions.value = await repository.listAdverseReactions(sessionId)
 }
 
@@ -102,6 +113,12 @@ function onPostWeightInput(e: Event) {
   form.postWeight = v
   el.value = v
 }
+function onDoctorUfInput(e: Event) {
+  const el = e.target as HTMLInputElement
+  const v = sanitizeDecimal(el.value)
+  form.doctorUf = v
+  el.value = v
+}
 
 watch(form, () => {
   if (!loaded) return
@@ -116,6 +133,7 @@ function persistSession(): Promise<void> {
   session.value.notes = form.notes.trim() || null
   session.value.preWeightMeasured = parseNum(form.preWeight)
   session.value.postWeightMeasured = parseNum(form.postWeight)
+  session.value.doctorUf = parseNum(form.doctorUf)
   session.value.updatedAt = Date.now()
   return repository.saveSession(session.value)
 }
@@ -133,26 +151,71 @@ onBeforeRouteLeave(async () => {
   }
 })
 
-async function toggleStatus() {
+const abortSummary = computed(() => abortText(session.value?.abortTags, session.value?.abortReason))
+
+async function persistStatus(status: DialysisSession['status'], tip: string) {
   if (!session.value) return
-  if (session.value.status === 'ongoing') {
-    const post = parseNum(form.postWeight)
-    if (post == null) {
-      await showConfirmDialog({
-        title: '提示',
-        message: '请先填写下机后体重，才能标记完成',
-        showCancelButton: false,
-        confirmButtonText: '知道了',
-        confirmButtonColor: '#07c160',
-        messageAlign: 'center',
-      })
-      return
-    }
-  }
-  session.value.status = session.value.status === 'completed' ? 'ongoing' : 'completed'
+  session.value.status = status
   session.value.updatedAt = Date.now()
   await repository.saveSession(session.value)
-  showToast(session.value.status === 'completed' ? '已标记完成' : '已改为进行中')
+  showToast(tip)
+}
+
+async function toggleStatus() {
+  if (!session.value) return
+  if (session.value.status === 'completed') {
+    await persistStatus('ongoing', '已改为进行中')
+    return
+  }
+  const post = parseNum(form.postWeight)
+  if (post == null) {
+    await showConfirmDialog({
+      title: '提示',
+      message: '请先填写下机后体重，才能标记完成；若本次未完成，请用「中止透析」',
+      showCancelButton: false,
+      confirmButtonText: '知道了',
+      confirmButtonColor: '#07c160',
+      messageAlign: 'center',
+    })
+    return
+  }
+  await persistStatus('completed', '已标记完成')
+}
+
+async function resumeSession() {
+  await persistStatus('ongoing', '已改为进行中')
+}
+
+/** 打开中止弹窗：已有中止记录时回填；历史记录默认取该次透析日期的当前时刻，便于补录 */
+function openAbort() {
+  if (!session.value) return
+  const now = Date.now()
+  const fallback =
+    session.value.date && session.value.date !== todayStr() ? combineDateTime(session.value.date, formatTime(now)) : now
+  const ts = session.value.abortedAt ?? fallback
+  abortForm.date = dateStr(ts)
+  abortForm.time = formatTime(ts)
+  abortForm.tags = [...(session.value.abortTags ?? [])]
+  abortForm.reason = session.value.abortReason ?? ''
+  showAbort.value = true
+}
+
+function toggleAbortTag(key: string) {
+  const i = abortForm.tags.indexOf(key)
+  if (i >= 0) abortForm.tags.splice(i, 1)
+  else abortForm.tags.push(key)
+}
+
+async function confirmAbort() {
+  if (!session.value) return
+  session.value.abortedAt = combineDateTime(abortForm.date, abortForm.time)
+  session.value.abortTags = [...abortForm.tags]
+  session.value.abortReason = abortForm.reason.trim() || null
+  session.value.status = 'aborted'
+  session.value.updatedAt = Date.now()
+  await repository.saveSession(session.value)
+  showAbort.value = false
+  showToast('已标记中止')
 }
 
 function openBp() {
@@ -241,6 +304,47 @@ async function removeGlu(g: BloodGlucose) {
   await loadSub()
 }
 
+function openFlow() {
+  editingFlowId.value = null
+  flowForm.time = formatTime(Date.now())
+  flowForm.value = ''
+  showFlow.value = true
+}
+function editFlow(f: BloodFlow) {
+  editingFlowId.value = f.id
+  flowForm.time = formatTime(f.measuredAt)
+  flowForm.value = String(f.value)
+  showFlow.value = true
+}
+async function saveFlow() {
+  const v = parseNum(flowForm.value)
+  if (v == null) {
+    showToast('请填写血流量')
+    return
+  }
+  const val = Math.round(v)
+  await repository.saveBloodFlow({
+    id: editingFlowId.value ?? uuid(),
+    sessionId,
+    measuredAt: combineDateTime(form.date, flowForm.time),
+    value: val,
+    note: null,
+  })
+  showFlow.value = false
+  editingFlowId.value = null
+  await loadSub()
+  showToast(`已保存：血流量 ${val} ml/min`)
+}
+async function removeFlow(f: BloodFlow) {
+  try {
+    await showConfirmDialog({ title: '删除', message: `删除 ${formatTime(f.measuredAt)} 的血流量记录？` })
+  } catch {
+    return
+  }
+  await repository.deleteBloodFlow(f.id)
+  await loadSub()
+}
+
 function toggleReaction(key: string) {
   const i = selectedReactions.value.indexOf(key)
   if (i >= 0) selectedReactions.value.splice(i, 1)
@@ -298,17 +402,38 @@ async function removeSession() {
         <div class="status-row">
           <div class="status-badge" :class="session.status">
             <span class="dot"></span>
-            {{ session.status === 'completed' ? '已完成' : '进行中' }}
+            {{ SESSION_STATUS_LABEL[session.status] }}
           </div>
-          <van-button
-            size="small"
-            round
-            :type="session.status === 'completed' ? 'default' : 'success'"
-            :icon="session.status === 'completed' ? 'replay' : 'checked'"
-            @click="toggleStatus"
-          >
-            {{ session.status === 'completed' ? '改为进行中' : '标记完成' }}
-          </van-button>
+          <div class="status-actions">
+            <template v-if="session.status === 'ongoing'">
+              <van-button size="small" round type="success" icon="checked" @click="toggleStatus">标记完成</van-button>
+              <van-button size="small" round type="danger" plain icon="close" @click="openAbort">中止透析</van-button>
+            </template>
+            <template v-else-if="session.status === 'completed'">
+              <van-button size="small" round type="default" icon="replay" @click="resumeSession">改为进行中</van-button>
+              <van-button size="small" round type="danger" plain icon="close" @click="openAbort">标记中止</van-button>
+            </template>
+            <van-button v-else size="small" round type="default" icon="replay" @click="resumeSession">
+              改为进行中
+            </van-button>
+          </div>
+        </div>
+
+        <div v-if="session.status === 'aborted'" class="abort-box">
+          <div class="row">
+            <div class="abort-title">本次透析已中止</div>
+            <van-button size="mini" round type="primary" plain @click="openAbort">
+              {{ abortSummary ? '修改中止信息' : '补充中止原因' }}
+            </van-button>
+          </div>
+          <div class="abort-line">
+            <span class="abort-k">中止时间</span>
+            <span class="num">{{ session.abortedAt ? formatDateTimeCN(session.abortedAt) : '未记录' }}</span>
+          </div>
+          <div class="abort-line">
+            <span class="abort-k">中止原因</span>
+            <span class="abort-v">{{ abortSummary || '未填写' }}</span>
+          </div>
         </div>
         <van-field v-model="form.date" label="透析日期" type="date" />
         <van-field v-if="!isLoggedIn" v-model="form.operator" label="记录人" placeholder="谁记录的（可选）" />
@@ -331,6 +456,13 @@ async function removeSession() {
             <div class="weight-input-wrap">
               <input :value="form.postWeight" type="text" inputmode="decimal" placeholder="0.0" class="weight-input" @input="onPostWeightInput" />
               <span class="weight-unit">kg</span>
+            </div>
+          </div>
+          <div class="weight-field">
+            <div class="weight-label">医生设定脱水量</div>
+            <div class="weight-input-wrap">
+              <input :value="form.doctorUf" type="text" inputmode="decimal" placeholder="0" class="weight-input" @input="onDoctorUfInput" />
+              <span class="weight-unit">ml</span>
             </div>
           </div>
         </div>
@@ -362,6 +494,9 @@ async function removeSession() {
         </div>
 
         <div class="uf-meta">当日干体重 {{ fmt(comp?.effectiveDryWeight) }}kg · 回水 {{ comp?.rinseBackMl ?? '—' }}ml · 机器超滤 {{ fmt(comp?.machineUf) }}L</div>
+        <div v-if="session.status === 'aborted' && comp?.postWeightActual == null" class="abort-hint">
+          本次透析中止且未记录下机后体重，补录称重后会自动算出实际脱水量
+        </div>
       </div>
 
       <!-- 血压 -->
@@ -400,6 +535,25 @@ async function removeSession() {
           <div class="row" style="gap: 10px">
             <van-icon name="edit" color="#1989fa" style="cursor: pointer" @click="editGlu(g)" />
             <van-icon name="delete-o" color="#ee0a24" style="cursor: pointer" @click="removeGlu(g)" />
+          </div>
+        </div>
+      </div>
+
+      <!-- 血流量 -->
+      <div class="card">
+        <div class="row">
+          <div class="card-title" style="margin: 0">血流量 ({{ flows.length }})</div>
+          <van-button size="small" type="primary" plain @click="openFlow">＋ 记录</van-button>
+        </div>
+        <div v-if="!flows.length" class="muted" style="padding: 10px 0">暂无血流量记录</div>
+        <div v-for="f in flows" :key="f.id" class="row" style="padding: 8px 0; border-top: 1px solid #f2f3f5">
+          <div class="row" style="gap: 10px">
+            <span class="muted">{{ formatTime(f.measuredAt) }}</span>
+            <span class="num">{{ f.value }} <span class="muted">ml/min</span></span>
+          </div>
+          <div class="row" style="gap: 10px">
+            <van-icon name="edit" color="#1989fa" style="cursor: pointer" @click="editFlow(f)" />
+            <van-icon name="delete-o" color="#ee0a24" style="cursor: pointer" @click="removeFlow(f)" />
           </div>
         </div>
       </div>
@@ -456,6 +610,55 @@ async function removeSession() {
         </div>
       </div>
     </van-popup>
+
+    <!-- 血流量弹窗 -->
+    <van-popup v-model:show="showFlow" round position="bottom">
+      <div style="padding: 20px">
+        <div class="card-title">{{ editingFlowId ? '编辑血流量' : '记录血流量' }}</div>
+        <van-field v-model="flowForm.time" label="测量时间" type="time" />
+        <van-field v-model="flowForm.value" label="血流量" placeholder="ml/min" type="number" />
+        <div style="display: flex; gap: 12px; margin-top: 16px">
+          <van-button block @click="showFlow = false">取消</van-button>
+          <van-button block type="primary" @click="saveFlow">保存</van-button>
+        </div>
+      </div>
+    </van-popup>
+
+    <!-- 中止弹窗 -->
+    <van-popup v-model:show="showAbort" round position="bottom">
+      <div style="padding: 20px">
+        <div class="card-title">{{ session?.status === 'aborted' ? '修改中止信息' : '中止本次透析' }}</div>
+        <div class="muted" style="margin: 0 0 10px">
+          记录中止时间与原因，便于回顾本次未完成的原因（可留空；历史记录也可在此补录）
+        </div>
+        <van-field v-model="abortForm.date" label="中止日期" type="date" />
+        <van-field v-model="abortForm.time" label="中止时间" type="time" />
+        <div class="abort-field-label">常用原因（可多选）</div>
+        <div>
+          <span
+            v-for="r in ABORT_REASONS"
+            :key="r.key"
+            class="chip"
+            :class="{ active: abortForm.tags.includes(r.key) }"
+            @click="toggleAbortTag(r.key)"
+          >
+            {{ r.label }}
+          </span>
+        </div>
+        <van-field
+          v-model="abortForm.reason"
+          label="补充描述"
+          type="textarea"
+          rows="2"
+          autosize
+          placeholder="具体情况（可选）"
+        />
+        <div style="display: flex; gap: 12px; margin-top: 16px">
+          <van-button block @click="showAbort = false">取消</van-button>
+          <van-button block type="danger" @click="confirmAbort">确认中止</van-button>
+        </div>
+      </div>
+    </van-popup>
   </div>
 </template>
 
@@ -491,6 +694,48 @@ async function removeSession() {
 .status-badge.completed {
   color: #07c160;
   background: #e8f7ef;
+}
+.status-badge.aborted {
+  color: #ee0a24;
+  background: #ffecec;
+}
+.status-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.abort-box {
+  background: #fff5f5;
+  border: 1px solid #ffd9d9;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.abort-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #ee0a24;
+}
+.abort-line {
+  display: flex;
+  gap: 8px;
+  font-size: 13px;
+  color: #323233;
+  margin-top: 6px;
+}
+.abort-k {
+  color: #969799;
+  flex-shrink: 0;
+}
+.abort-v {
+  flex: 1;
+  word-break: break-all;
+}
+.abort-field-label {
+  font-size: 13px;
+  color: #646566;
+  margin: 10px 0 2px;
 }
 .sticky-nav {
   position: sticky;
@@ -614,5 +859,11 @@ async function removeSession() {
   font-size: 12px;
   color: #969799;
   text-align: center;
+}
+.abort-hint {
+  font-size: 12px;
+  color: #ee0a24;
+  text-align: center;
+  margin-top: 8px;
 }
 </style>

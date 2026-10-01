@@ -1,6 +1,17 @@
 import { db } from '../db/database'
 import type { Repository } from './repository'
-import type { Patient, DryWeight, DialysisSession, BloodPressure, BloodGlucose, AdverseReaction } from '../types'
+import type { Patient, DryWeight, DialysisSession, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
+
+/** 兼容旧数据（旧版本无中止相关字段）与外部导入数据 */
+function normalizeSession(s: DialysisSession): DialysisSession {
+  return {
+    ...s,
+    status: s.status ?? 'ongoing',
+    abortedAt: s.abortedAt ?? null,
+    abortTags: Array.isArray(s.abortTags) ? [...s.abortTags] : [],
+    abortReason: s.abortReason ?? null,
+  }
+}
 
 class LocalRepository implements Repository {
   getPatient(id: string) {
@@ -24,22 +35,24 @@ class LocalRepository implements Repository {
   }
 
   async listSessions(patientId: string) {
-    const list = await db.sessions.where('patientId').equals(patientId).toArray()
+    const list = (await db.sessions.where('patientId').equals(patientId).toArray()).map(normalizeSession)
     return list.sort((a, b) => {
       if (a.date !== b.date) return a.date < b.date ? 1 : -1
       return b.createdAt - a.createdAt
     })
   }
-  getSession(id: string) {
-    return db.sessions.get(id)
+  async getSession(id: string) {
+    const s = await db.sessions.get(id)
+    return s ? normalizeSession(s) : undefined
   }
   async saveSession(session: DialysisSession) {
-    await db.sessions.put({ ...session })
+    await db.sessions.put({ ...normalizeSession(session) })
   }
   async deleteSession(id: string) {
-    await db.transaction('rw', db.sessions, db.bloodPressures, db.bloodGlucoses, db.adverseReactions, async () => {
+    await db.transaction('rw', db.sessions, db.bloodPressures, db.bloodGlucoses, db.bloodFlows, db.adverseReactions, async () => {
       await db.bloodPressures.where('sessionId').equals(id).delete()
       await db.bloodGlucoses.where('sessionId').equals(id).delete()
+      await db.bloodFlows.where('sessionId').equals(id).delete()
       await db.adverseReactions.where('sessionId').equals(id).delete()
       await db.sessions.delete(id)
     })
@@ -67,6 +80,17 @@ class LocalRepository implements Repository {
     await db.bloodGlucoses.delete(id)
   }
 
+  async listBloodFlows(sessionId: string) {
+    const list = await db.bloodFlows.where('sessionId').equals(sessionId).toArray()
+    return list.sort((a, b) => a.measuredAt - b.measuredAt)
+  }
+  async saveBloodFlow(flow: BloodFlow) {
+    await db.bloodFlows.put({ ...flow })
+  }
+  async deleteBloodFlow(id: string) {
+    await db.bloodFlows.delete(id)
+  }
+
   async listAdverseReactions(sessionId: string) {
     const list = await db.adverseReactions.where('sessionId').equals(sessionId).toArray()
     return list.sort((a, b) => a.recordedAt - b.recordedAt)
@@ -84,9 +108,10 @@ class LocalRepository implements Repository {
       exportedAt: Date.now(),
       patients: await db.patients.toArray(),
       dryWeights: await db.dryWeights.toArray(),
-      sessions: await db.sessions.toArray(),
+      sessions: (await db.sessions.toArray()).map(normalizeSession),
       bloodPressures: await db.bloodPressures.toArray(),
       bloodGlucoses: await db.bloodGlucoses.toArray(),
+      bloodFlows: await db.bloodFlows.toArray(),
       adverseReactions: await db.adverseReactions.toArray(),
     }
     return JSON.stringify(data, null, 2)
@@ -98,6 +123,7 @@ class LocalRepository implements Repository {
       sessions?: DialysisSession[]
       bloodPressures?: BloodPressure[]
       bloodGlucoses?: BloodGlucose[]
+      bloodFlows?: BloodFlow[]
       adverseReactions?: AdverseReaction[]
     }
     await db.patients.clear()
@@ -105,12 +131,14 @@ class LocalRepository implements Repository {
     await db.sessions.clear()
     await db.bloodPressures.clear()
     await db.bloodGlucoses.clear()
+    await db.bloodFlows.clear()
     await db.adverseReactions.clear()
     await db.patients.bulkPut(data.patients ?? [])
     await db.dryWeights.bulkPut(data.dryWeights ?? [])
-    await db.sessions.bulkPut(data.sessions ?? [])
+    await db.sessions.bulkPut((data.sessions ?? []).map(normalizeSession))
     await db.bloodPressures.bulkPut(data.bloodPressures ?? [])
     await db.bloodGlucoses.bulkPut(data.bloodGlucoses ?? [])
+    await db.bloodFlows.bulkPut(data.bloodFlows ?? [])
     await db.adverseReactions.bulkPut(data.adverseReactions ?? [])
   }
 }

@@ -1,4 +1,4 @@
-export type SessionStatus = 'ongoing' | 'completed'
+export type SessionStatus = 'ongoing' | 'completed' | 'aborted'
 export type ReactionSeverity = 'mild' | 'moderate' | 'severe'
 
 export interface Patient {
@@ -30,7 +30,14 @@ export interface DialysisSession {
   wheelchairWeightUsed: number
   rinseBackVolumeUsed: number
   operator: string | null
+  doctorUf: number | null
   status: SessionStatus
+  /** 中止时间（毫秒时间戳），status === 'aborted' 时有效 */
+  abortedAt: number | null
+  /** 中止原因快捷标签（ABORT_REASONS 的 key） */
+  abortTags: string[]
+  /** 中止原因补充描述 */
+  abortReason: string | null
   notes: string | null
   createdAt: number
   updatedAt: number
@@ -46,6 +53,14 @@ export interface BloodPressure {
 }
 
 export interface BloodGlucose {
+  id: string
+  sessionId: string
+  measuredAt: number
+  value: number
+  note: string | null
+}
+
+export interface BloodFlow {
   id: string
   sessionId: string
   measuredAt: number

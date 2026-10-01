@@ -1,4 +1,4 @@
-import type { Patient, DryWeight, DialysisSession, BloodPressure, BloodGlucose, AdverseReaction } from '../types'
+import type { Patient, DryWeight, DialysisSession, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
 
 export interface Repository {
   getPatient(id: string): Promise<Patient | undefined>
@@ -20,6 +20,10 @@ export interface Repository {
   listBloodGlucoses(sessionId: string): Promise<BloodGlucose[]>
   saveBloodGlucose(glucose: BloodGlucose): Promise<void>
   deleteBloodGlucose(id: string): Promise<void>
+
+  listBloodFlows(sessionId: string): Promise<BloodFlow[]>
+  saveBloodFlow(flow: BloodFlow): Promise<void>
+  deleteBloodFlow(id: string): Promise<void>
 
   listAdverseReactions(sessionId: string): Promise<AdverseReaction[]>
   replaceAdverseReactions(sessionId: string, reactions: AdverseReaction[]): Promise<void>

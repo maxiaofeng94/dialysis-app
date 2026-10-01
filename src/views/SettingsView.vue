@@ -3,6 +3,9 @@ import { ref, reactive, computed, onMounted } from 'vue'
 import { showToast, showConfirmDialog, showDialog } from 'vant'
 import { useRouter } from 'vue-router'
 import { useAuth } from '../stores/auth'
+import { Capacitor } from '@capacitor/core'
+import { Filesystem, Directory, Encoding } from '@capacitor/filesystem'
+import { Share } from '@capacitor/share'
 import { repository } from '../repo'
 import { DEFAULT_RINSE_BACK_ML } from '../constants'
 import { currentPatientId } from '../stores/patient'
@@ -184,9 +187,24 @@ function downloadBlob(blob: Blob, filename: string) {
 
 async function exportData() {
   const json = await repository.exportAll()
-  const blob = new Blob([json], { type: 'application/json' })
-  downloadBlob(blob, `透析记录备份-${todayStr()}.json`)
-  showToast('已导出')
+  if (Capacitor.isNativePlatform()) {
+    // APK：写入缓存并调起系统分享面板（可保存到文件 / 发送微信等）
+    const name = `透析记录备份-${todayStr()}.json`
+    const res = await Filesystem.writeFile({
+      path: name,
+      data: json,
+      directory: Directory.Cache,
+      recursive: true,
+      encoding: Encoding.UTF8,
+    })
+    await Share.share({ title: '透析记录备份', url: res.uri, files: [res.uri] })
+    showToast('已生成备份，请选择保存或发送')
+  } else {
+    // 浏览器：直接下载到下载目录
+    const blob = new Blob([json], { type: 'application/json' })
+    downloadBlob(blob, `透析记录备份-${todayStr()}.json`)
+    showToast('已导出')
+  }
 }
 
 function importData() {
@@ -216,8 +234,9 @@ function showHelp() {
       '1. 先在「设置」建立病人档案（姓名、生日、轮椅重量、回水量），并添加当前干体重。\n' +
       '2. 在「记录」页用「快速创建」填入上机前体重（含轮椅）快速建记录。\n' +
       '3. 进入记录详情填写下机后体重、血压、血糖、不良反应。\n' +
-      '4. 完成后点「标记完成」，在报告页导出图片/PDF 发给医生。\n' +
-      '5. 轮椅重量、回水量会快照到每次记录；干体重按日期取当时有效值。',
+      '4. 完成后点「标记完成」；若因血管条件差等原因没做完，点「中止透析」记录中止时间与原因。\n' +
+      '5. 在报告页导出图片发给医生（报告会显示本次状态与中止原因）。\n' +
+      '6. 轮椅重量、回水量会快照到每次记录；干体重按日期取当时有效值。',
   })
 }
 </script>
