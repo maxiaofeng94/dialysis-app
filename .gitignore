@@ -31,3 +31,7 @@ supabase/.branches
 *.njsproj
 *.sln
 *.sw?
+
+# 打包产物
+*.apk
+*.zip
