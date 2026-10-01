@@ -14,8 +14,8 @@ dist-ssr
 
 # 环境变量（含 Supabase 项目配置，勿提交）
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Supabase CLI 临时文件
 supabase/.temp
