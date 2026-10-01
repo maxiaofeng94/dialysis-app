@@ -38,8 +38,12 @@ Deno.serve(async (req) => {
       return json({ error: '角色不正确' }, 400)
     }
 
-    const uid = (await supabase.auth.getUser()).data.user?.id
-    if (!uid) return json({ error: '未登录' }, 401)
+    // 识别调用者：service 客户端自身没有 session，必须显式传入请求头里的用户 access token
+    const token = (req.headers.get('Authorization') ?? '').replace(/^Bearer\s+/i, '')
+    if (!token) return json({ error: '未登录' }, 401)
+    const { data: authData } = await supabase.auth.getUser(token)
+    const uid = authData.user?.id
+    if (!uid) return json({ error: '登录已过期，请重新登录' }, 401)
 
     // 校验调用者是该病人的 owner
     const { data: caller } = await supabase

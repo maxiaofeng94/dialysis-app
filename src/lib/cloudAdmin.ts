@@ -25,6 +25,21 @@ async function currentUid(): Promise<string | null> {
   return data.user?.id ?? null
 }
 
+/**
+ * 调用 Edge Function 的请求头：
+ * - Authorization 必须是当前登录用户的 access token（函数靠它识别调用者）；
+ * - apikey 带上项目 key，供函数网关识别项目。
+ */
+async function edgeHeaders(): Promise<Record<string, string>> {
+  const { data } = await supabase!.auth.getSession()
+  const token = data.session?.access_token || SUPABASE_ANON_KEY
+  return {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${token}`,
+    apikey: SUPABASE_ANON_KEY,
+  }
+}
+
 /** 当前用户可访问的病人列表（含角色） */
 export async function listMyPatients(): Promise<{ patient: Patient; role: string }[]> {
   const uid = await currentUid()
@@ -67,26 +82,20 @@ export async function updateMyName(name: string) {
 export async function createPatient(name: string, wheelchairWeight = 0, rinseBackVolume = 300) {
   const res = await fetch(`${SUPABASE_URL}/functions/v1/create-patient`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-    },
+    headers: await edgeHeaders(),
     body: JSON.stringify({ name, wheelchairWeight, rinseBackVolume }),
   })
-  return { ok: res.ok, data: await res.json() }
+  return { ok: res.ok, data: await res.json().catch(() => ({})) }
 }
 
 /** 按手机号邀请成员（Edge Function，仅 owner） */
 export async function inviteMember(patientId: string, phone: string, role: string) {
   const res = await fetch(`${SUPABASE_URL}/functions/v1/invite-member`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-    },
+    headers: await edgeHeaders(),
     body: JSON.stringify({ patientId, phone, role }),
   })
-  const data = await res.json()
+  const data = await res.json().catch(() => ({}))
   return { ok: res.ok, error: data?.error }
 }
 

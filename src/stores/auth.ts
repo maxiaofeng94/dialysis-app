@@ -20,11 +20,13 @@ async function init() {
 }
 
 async function callFunction(name: string, body: unknown) {
+  // 注册接口无需登录：带上项目 key 即可（该函数部署为免 JWT 校验）
   const res = await fetch(`${SUPABASE_URL}/functions/v1/${name}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      apikey: SUPABASE_ANON_KEY,
     },
     body: JSON.stringify(body),
   })
