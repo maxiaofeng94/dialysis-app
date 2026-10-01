@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { repository } from '../repo'
 import { currentPatientId } from '../stores/patient'
+import { cacheVersion } from '../lib/cloudCache'
 import { formatTime } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import BaseChart from '../components/BaseChart.vue'
@@ -15,35 +16,42 @@ const gluTrend = ref<{ time: number; date: string; value: number }[]>([])
 
 onMounted(load)
 
+// 纯展示页：缓存后台刷新完成后自动重读
+watch(cacheVersion, () => {
+  void load()
+})
+
 async function load() {
-  dryWeights.value = await repository.listDryWeights(currentPatientId.value)
-  sessions.value = await repository.listSessions(currentPatientId.value)
-  await loadBpTrend()
-  await loadGlucoseTrend()
+  const pid = currentPatientId.value
+  const [dw, ss] = await Promise.all([repository.listDryWeights(pid), repository.listSessions(pid)])
+  dryWeights.value = dw
+  sessions.value = ss
+  await Promise.all([loadBpTrend(), loadGlucoseTrend()])
 }
 
 async function loadBpTrend() {
   const recent = sessions.value.slice(0, 30)
+  // 原来是每条记录串行拉一次血压（30 条 = 30 次往返），改成全部并行
+  const lists = await Promise.all(recent.map((s) => repository.listBloodPressures(s.id)))
   const all: { time: number; date: string; systolic: number; diastolic: number }[] = []
-  for (const s of recent) {
-    const list = await repository.listBloodPressures(s.id)
-    for (const bp of list) {
+  recent.forEach((s, i) => {
+    for (const bp of lists[i]) {
       all.push({ time: bp.measuredAt, date: s.date, systolic: bp.systolic, diastolic: bp.diastolic })
     }
-  }
+  })
   all.sort((a, b) => a.time - b.time)
   bpTrend.value = all
 }
 
 async function loadGlucoseTrend() {
   const recent = sessions.value.slice(0, 30)
+  const lists = await Promise.all(recent.map((s) => repository.listBloodGlucoses(s.id)))
   const all: { time: number; date: string; value: number }[] = []
-  for (const s of recent) {
-    const list = await repository.listBloodGlucoses(s.id)
-    for (const g of list) {
+  recent.forEach((s, i) => {
+    for (const g of lists[i]) {
       all.push({ time: g.measuredAt, date: s.date, value: g.value })
     }
-  }
+  })
   all.sort((a, b) => a.time - b.time)
   gluTrend.value = all
 }

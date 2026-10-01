@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import html2canvas from 'html2canvas'
 import { Capacitor } from '@capacitor/core'
@@ -8,6 +8,7 @@ import { Filesystem, Directory } from '@capacitor/filesystem'
 import { repository } from '../repo'
 import { reactionLabel, SESSION_STATUS_LABEL, abortText } from '../constants'
 import { currentPatientId } from '../stores/patient'
+import { cacheVersion } from '../lib/cloudCache'
 import { fmt, formatTime, calcAge, formatDateTimeCN } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
@@ -29,18 +30,34 @@ const reportEl = ref<HTMLDivElement>()
 
 onMounted(load)
 
+// 报告页是纯展示页，缓存后台刷新完成后自动重读，无需用户手动刷新
+watch(cacheVersion, () => {
+  void load()
+})
+
 async function load() {
-  session.value = (await repository.getSession(sessionId)) ?? null
+  const pid = currentPatientId.value
+  // 七个请求并行发出（原来串行，要等七次网络往返）
+  const [s, p, dw, bp, bg, bf, ar] = await Promise.all([
+    repository.getSession(sessionId),
+    repository.getPatient(pid),
+    repository.listDryWeights(pid),
+    repository.listBloodPressures(sessionId),
+    repository.listBloodGlucoses(sessionId),
+    repository.listBloodFlows(sessionId),
+    repository.listAdverseReactions(sessionId),
+  ])
+  session.value = s ?? null
   if (!session.value) {
     router.replace('/')
     return
   }
-  patient.value = (await repository.getPatient(currentPatientId.value)) ?? null
-  dryWeights.value = await repository.listDryWeights(currentPatientId.value)
-  bps.value = await repository.listBloodPressures(sessionId)
-  glucoses.value = await repository.listBloodGlucoses(sessionId)
-  flows.value = await repository.listBloodFlows(sessionId)
-  reactions.value = await repository.listAdverseReactions(sessionId)
+  patient.value = p ?? null
+  dryWeights.value = dw
+  bps.value = bp
+  glucoses.value = bg
+  flows.value = bf
+  reactions.value = ar
 }
 
 const comp = computed(() => {

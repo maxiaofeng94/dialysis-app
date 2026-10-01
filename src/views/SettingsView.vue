@@ -111,13 +111,14 @@ function goMembers() {
 }
 
 async function load() {
-  const p = await repository.getPatient(currentPatientId.value)
+  const pid = currentPatientId.value
+  const [p, dw] = await Promise.all([repository.getPatient(pid), repository.listDryWeights(pid)])
   patient.value = p ?? null
   form.name = p?.name ?? ''
   form.birthday = p?.birthday ?? ''
   form.wheelchairWeight = p ? String(p.wheelchairWeight) : ''
   form.rinseBackVolume = p ? String(p.rinseBackVolume) : ''
-  dryWeights.value = await repository.listDryWeights(currentPatientId.value)
+  dryWeights.value = dw
 }
 
 const currentDry = computed(() => getEffectiveDryWeight(dryWeights.value, todayStr()))

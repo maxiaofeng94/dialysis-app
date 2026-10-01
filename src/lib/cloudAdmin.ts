@@ -1,4 +1,5 @@
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from './supabase'
+import { cacheGet, cacheSet, cacheVersion } from './cloudCache'
 import type { Patient } from '../types'
 
 export interface MemberInfo {
@@ -40,26 +41,59 @@ async function edgeHeaders(): Promise<Record<string, string>> {
   }
 }
 
-/** 当前用户可访问的病人列表（含角色） */
+/** 当前用户可访问的病人列表（含角色）—— 带本地缓存，先显示再后台刷新 */
 export async function listMyPatients(): Promise<{ patient: Patient; role: string }[]> {
   const uid = await currentUid()
   if (!uid) return []
-  const { data } = await supabase!.from('patient_members').select('role, patients(*)').eq('user_id', uid)
-  return (data ?? []).map((r: any) => ({
-    patient: patientFromRow(r.patients),
-    role: r.role,
-  }))
+  const key = `myPatients:${uid}`
+  const load = async () => {
+    const { data } = await supabase!.from('patient_members').select('role, patients(*)').eq('user_id', uid)
+    const list = (data ?? []).map((r: any) => ({
+      patient: patientFromRow(r.patients),
+      role: r.role,
+    }))
+    await cacheSet(key, list)
+    return list
+  }
+  const cached = await cacheGet<{ patient: Patient; role: string }[]>(key)
+  if (cached) {
+    void load()
+      .then(() => {
+        cacheVersion.value++
+      })
+      .catch(() => {})
+    return cached.value
+  }
+  return load()
 }
 
-/** 某病人的成员列表 */
+/** 某病人的成员列表 —— 带本地缓存，先显示再后台刷新 */
 export async function listMembers(patientId: string): Promise<MemberInfo[]> {
-  const { data } = await supabase!.from('patient_members').select('user_id, role, users(name, phone)').eq('patient_id', patientId)
-  return (data ?? []).map((r: any) => ({
-    userId: r.user_id,
-    name: r.users?.name ?? null,
-    phone: r.users?.phone ?? null,
-    role: r.role,
-  }))
+  const key = `members:${patientId}`
+  const load = async () => {
+    const { data } = await supabase!
+      .from('patient_members')
+      .select('user_id, role, users(name, phone)')
+      .eq('patient_id', patientId)
+    const list = (data ?? []).map((r: any) => ({
+      userId: r.user_id,
+      name: r.users?.name ?? null,
+      phone: r.users?.phone ?? null,
+      role: r.role,
+    }))
+    await cacheSet(key, list)
+    return list
+  }
+  const cached = await cacheGet<MemberInfo[]>(key)
+  if (cached) {
+    void load()
+      .then(() => {
+        cacheVersion.value++
+      })
+      .catch(() => {})
+    return cached.value
+  }
+  return load()
 }
 
 /** 我的资料（public.users）—— 记录人显示用 */

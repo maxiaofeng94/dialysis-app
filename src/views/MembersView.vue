@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast, showConfirmDialog } from 'vant'
 import { listMembers, inviteMember, setMemberRole, removeMember, type MemberInfo } from '../lib/cloudAdmin'
 import { currentPatientId } from '../stores/patient'
+import { cacheVersion } from '../lib/cloudCache'
 
 const router = useRouter()
 const members = ref<MemberInfo[]>([])
@@ -19,6 +20,11 @@ const ROLE_LABELS: Record<string, string> = {
 }
 
 onMounted(load)
+
+// 缓存后台刷新完成后自动重读
+watch(cacheVersion, () => {
+  void load()
+})
 
 async function load() {
   members.value = await listMembers(currentPatientId.value)

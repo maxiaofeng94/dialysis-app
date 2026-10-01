@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { repository } from '../repo'
 import { SESSION_STATUS_LABEL, SESSION_STATUS_TAG, abortText } from '../constants'
 import { currentPatientId, hasNoCloudPatient } from '../stores/patient'
 import { isLoggedIn } from '../stores/auth'
+import { cacheVersion } from '../lib/cloudCache'
 import { todayStr, formatDateCN, fmt, calcAge } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import { uuid } from '../utils/id'
@@ -22,10 +23,22 @@ const noCloudPatient = ref(false)
 
 onMounted(refresh)
 
+// 后台静默刷新的数据写回缓存后会自增 cacheVersion，这里自动重读一次（命中新缓存，无需等网络）
+watch(cacheVersion, () => {
+  void refresh()
+})
+
 async function refresh() {
-  patient.value = (await repository.getPatient(currentPatientId.value)) ?? null
-  dryWeights.value = await repository.listDryWeights(currentPatientId.value)
-  sessions.value = await repository.listSessions(currentPatientId.value)
+  const pid = currentPatientId.value
+  // 三个请求并行发出：总耗时约等于最慢的那个，而不是三次网络往返相加
+  const [p, dw, ss] = await Promise.all([
+    repository.getPatient(pid),
+    repository.listDryWeights(pid),
+    repository.listSessions(pid),
+  ])
+  patient.value = p ?? null
+  dryWeights.value = dw
+  sessions.value = ss
   loading.value = false
   // 云端账号下还没有任何病人 → 首页给出更明确的引导
   noCloudPatient.value = !patient.value && isLoggedIn.value ? await hasNoCloudPatient() : false
@@ -144,6 +157,11 @@ async function doNewBlank() {
         <van-button size="small" type="primary" plain @click="onNewBlank">＋ 新建</van-button>
       </template>
     </van-nav-bar>
+
+    <!-- 首次在本机打开（还没有缓存）时先显示骨架，避免白屏干等 -->
+    <div v-if="loading" class="card" style="margin-top: 12px">
+      <van-skeleton title :row="4" />
+    </div>
 
     <div v-if="patient" class="card patient-card">
       <div class="patient-head">

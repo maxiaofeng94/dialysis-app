@@ -1,6 +1,7 @@
 import { ref, computed } from 'vue'
 import type { User } from '@supabase/supabase-js'
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY, isCloudConfigured } from '../lib/supabase'
+import { cacheClear } from '../lib/cloudCache'
 
 export const user = ref<User | null>(null)
 export const initialized = ref(false)
@@ -57,6 +58,8 @@ async function login(phone: string, password: string): Promise<{ ok: boolean; me
 async function logout() {
   await supabase?.auth.signOut()
   user.value = null
+  // 清掉云端数据缓存：否则换账号登录会先看到上一个账号的数据
+  await cacheClear()
 }
 
 export function useAuth() {

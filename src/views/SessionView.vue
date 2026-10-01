@@ -55,13 +55,20 @@ let timer: ReturnType<typeof setTimeout> | null = null
 onMounted(load)
 
 async function load() {
-  session.value = (await repository.getSession(sessionId)) ?? null
+  const pid = currentPatientId.value
+  // 并行拉取，避免 7 次网络往返串行叠加
+  const [s, p, dw] = await Promise.all([
+    repository.getSession(sessionId),
+    repository.getPatient(pid),
+    repository.listDryWeights(pid),
+  ])
+  session.value = s ?? null
   if (!session.value) {
     router.replace('/')
     return
   }
-  patient.value = (await repository.getPatient(currentPatientId.value)) ?? null
-  dryWeights.value = await repository.listDryWeights(currentPatientId.value)
+  patient.value = p ?? null
+  dryWeights.value = dw
   await loadSub()
   form.date = session.value.date
   form.operator = session.value.operator ?? ''
@@ -75,10 +82,17 @@ async function load() {
 }
 
 async function loadSub() {
-  bps.value = await repository.listBloodPressures(sessionId)
-  glucoses.value = await repository.listBloodGlucoses(sessionId)
-  flows.value = await repository.listBloodFlows(sessionId)
-  reactions.value = await repository.listAdverseReactions(sessionId)
+  // 四个子表并行拉取
+  const [bp, bg, bf, ar] = await Promise.all([
+    repository.listBloodPressures(sessionId),
+    repository.listBloodGlucoses(sessionId),
+    repository.listBloodFlows(sessionId),
+    repository.listAdverseReactions(sessionId),
+  ])
+  bps.value = bp
+  glucoses.value = bg
+  flows.value = bf
+  reactions.value = ar
 }
 
 const effectiveDry = computed(() => getEffectiveDryWeight(dryWeights.value, form.date || todayStr()))
