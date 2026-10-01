@@ -1,0 +1,49 @@
+name: Deploy to Cloudflare Pages
+
+# 推送 main 分支即自动构建并部署到 Cloudflare Pages
+# 需要在仓库 Settings → Secrets and variables → Actions 配置：
+#   CLOUDFLARE_API_TOKEN   （Cloudflare API Token，权限：Account · Cloudflare Pages · Edit）
+#   CLOUDFLARE_ACCOUNT_ID  （Cloudflare 账号 ID）
+#   VITE_SUPABASE_URL       （生产库 Project URL）
+#   VITE_SUPABASE_ANON_KEY  （生产库 anon public key）
+# 未配置 Cloudflare 相关 secret 时会跳过部署步骤，不会让构建失败。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: |
+          if [ -z "$VITE_SUPABASE_URL" ]; then
+            echo "::warning::未配置 VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY，产物将退回本地单机模式"
+          fi
+          npm run build
+
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::warning::未配置 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID，跳过部署"
+            exit 0
+          fi
+          npx --yes wrangler@latest pages deploy dist --project-name=dialysis --branch=main

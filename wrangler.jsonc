@@ -1,14 +1,9 @@
 {
-  // Cloudflare Workers 静态资源部署配置
-  // 场景：Dashboard 里找不到 Pages 入口，改用 Workers 部署本 PWA
-  // 对应 Dashboard 表单：Build command = npm run build，Deploy command = npx wrangler deploy
+  // Cloudflare Pages 部署配置
+  // 用法：npx wrangler pages deploy --project-name=dialysis --branch=main
+  // 产物目录：npm run build 生成的 ./dist
   "$schema": "https://unpkg.com/wrangler@latest/config-schema.json",
   "name": "dialysis",
   "compatibility_date": "2026-10-01",
-  "assets": {
-    // 构建产物目录（npm run build 生成）
-    "directory": "./dist",
-    // 单页应用：未匹配到静态文件的路径统一回退到 index.html
-    "not_found_handling": "single-page-application"
-  }
+  "pages_build_output_dir": "./dist"
 }
