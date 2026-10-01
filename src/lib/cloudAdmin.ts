@@ -47,6 +47,22 @@ export async function listMembers(patientId: string): Promise<MemberInfo[]> {
   }))
 }
 
+/** 我的资料（public.users）—— 记录人显示用 */
+export async function getMyProfile(): Promise<{ name: string | null; phone: string | null } | null> {
+  const uid = await currentUid()
+  if (!uid) return null
+  const { data } = await supabase!.from('users').select('name, phone').eq('id', uid).maybeSingle()
+  return data ? { name: data.name ?? null, phone: data.phone ?? null } : null
+}
+
+/** 修改我的姓名（记录人显示时优先用姓名，为空则显示手机号） */
+export async function updateMyName(name: string) {
+  const uid = await currentUid()
+  if (!uid) return { ok: false, error: '未登录' }
+  const { error } = await supabase!.from('users').update({ name: name || null }).eq('id', uid)
+  return { ok: !error, error: error?.message }
+}
+
 /** 创建病人（Edge Function 原子完成：病人 + owner 成员） */
 export async function createPatient(name: string, wheelchairWeight = 0, rinseBackVolume = 300) {
   const res = await fetch(`${SUPABASE_URL}/functions/v1/create-patient`, {

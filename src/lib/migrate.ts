@@ -7,7 +7,7 @@ import { uuid } from '../utils/id'
 /**
  * 把本机本地数据（IndexedDB）迁移到云端：
  * 1. 用本地病人档案在云端新建病人（调用者成为 owner）；
- * 2. 迁移干体重、透析记录及血压/血糖/不良反应（重新生成 id，关联到新病人/新会话）。
+ * 2. 迁移干体重、透析记录及血压/血糖/血流量/不良反应（重新生成 id，关联到新病人/新会话）。
  */
 export async function migrateLocalToCloud(): Promise<{ ok: boolean; message: string }> {
   const patient = await localRepository.getPatient(DEFAULT_PATIENT_ID)
@@ -37,6 +37,9 @@ export async function migrateLocalToCloud(): Promise<{ ok: boolean; message: str
     }
     for (const g of await localRepository.listBloodGlucoses(s.id)) {
       await repository.saveBloodGlucose({ ...g, id: uuid(), sessionId: newSessionId })
+    }
+    for (const f of await localRepository.listBloodFlows(s.id)) {
+      await repository.saveBloodFlow({ ...f, id: uuid(), sessionId: newSessionId })
     }
     const ars = await localRepository.listAdverseReactions(s.id)
     await repository.replaceAdverseReactions(

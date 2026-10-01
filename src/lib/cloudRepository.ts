@@ -6,6 +6,7 @@ import type {
   DialysisSession,
   BloodPressure,
   BloodGlucose,
+  BloodFlow,
   AdverseReaction,
 } from '../types'
 
@@ -16,6 +17,9 @@ function requireClient() {
   if (!supabase) throw new Error('云端未配置')
   return supabase
 }
+
+// 透析记录查询：带出记录人姓名（sessions.operator_id → users，RLS 允许同病人成员互看）
+const SESSION_SELECT = '*, operator:users(name, phone)'
 
 // ---------- 行 → 领域对象 ----------
 
@@ -52,8 +56,13 @@ function sessionFromRow(r: any): DialysisSession {
     postWeightMeasured: r.post_weight_measured != null ? Number(r.post_weight_measured) : null,
     wheelchairWeightUsed: Number(r.wheelchair_weight_used ?? 0),
     rinseBackVolumeUsed: Number(r.rinse_back_volume_used ?? 300),
-    operator: null, // 云端以 operator_id 记录，显示名后续从 users 表关联
+    // 记录人显示名：优先姓名，没填姓名时退回手机号（未关联到时为空）
+    operator: r.operator?.name || r.operator?.phone || null,
+    doctorUf: r.doctor_uf != null ? Number(r.doctor_uf) : null,
     status: r.status,
+    abortedAt: r.aborted_at != null ? new Date(r.aborted_at).getTime() : null,
+    abortTags: Array.isArray(r.abort_tags) ? [...r.abort_tags] : [],
+    abortReason: r.abort_reason ?? null,
     notes: r.notes,
     createdAt: new Date(r.created_at).getTime(),
     updatedAt: new Date(r.updated_at).getTime(),
@@ -72,6 +81,16 @@ function bpFromRow(r: any): BloodPressure {
 }
 
 function bgFromRow(r: any): BloodGlucose {
+  return {
+    id: r.id,
+    sessionId: r.session_id,
+    measuredAt: new Date(r.measured_at).getTime(),
+    value: Number(r.value),
+    note: r.note,
+  }
+}
+
+function bloodFlowFromRow(r: any): BloodFlow {
   return {
     id: r.id,
     sessionId: r.session_id,
@@ -126,7 +145,11 @@ function sessionToRow(s: DialysisSession) {
     wheelchair_weight_used: s.wheelchairWeightUsed,
     rinse_back_volume_used: s.rinseBackVolumeUsed,
     operator_id: null as string | null, // 保存时自动填入当前登录用户
+    doctor_uf: s.doctorUf,
     status: s.status,
+    aborted_at: s.abortedAt != null ? new Date(s.abortedAt).toISOString() : null,
+    abort_tags: s.abortTags ?? [],
+    abort_reason: s.abortReason,
     notes: s.notes,
     updated_at: new Date().toISOString(),
   }
@@ -161,6 +184,16 @@ function reactionToRow(r: AdverseReaction) {
     detail: r.detail,
     severity: r.severity,
     recorded_at: new Date(r.recordedAt).toISOString(),
+  }
+}
+
+function bloodFlowToRow(f: BloodFlow) {
+  return {
+    id: f.id,
+    session_id: f.sessionId,
+    measured_at: new Date(f.measuredAt).toISOString(),
+    value: f.value,
+    note: f.note,
   }
 }
 
@@ -203,14 +236,14 @@ class CloudRepository implements Repository {
   async listSessions(patientId: string) {
     const { data } = await this.client()
       .from('sessions')
-      .select('*')
+      .select(SESSION_SELECT)
       .eq('patient_id', patientId)
       .order('date', { ascending: false })
     return (data ?? []).map(sessionFromRow)
   }
 
   async getSession(id: string) {
-    const { data } = await this.client().from('sessions').select('*').eq('id', id).maybeSingle()
+    const { data } = await this.client().from('sessions').select(SESSION_SELECT).eq('id', id).maybeSingle()
     return data ? sessionFromRow(data) : undefined
   }
 
@@ -225,7 +258,7 @@ class CloudRepository implements Repository {
   }
 
   async deleteSession(id: string) {
-    // 外键 on delete cascade 自动删除血压/血糖/不良反应
+    // 外键 on delete cascade 自动删除血压/血糖/血流量/不良反应
     const { error } = await this.client().from('sessions').delete().eq('id', id)
     if (error) throw error
   }
@@ -268,6 +301,25 @@ class CloudRepository implements Repository {
     if (error) throw error
   }
 
+  async listBloodFlows(sessionId: string) {
+    const { data } = await this.client()
+      .from('blood_flows')
+      .select('*')
+      .eq('session_id', sessionId)
+      .order('measured_at', { ascending: true })
+    return (data ?? []).map(bloodFlowFromRow)
+  }
+
+  async saveBloodFlow(flow: BloodFlow) {
+    const { error } = await this.client().from('blood_flows').upsert(bloodFlowToRow(flow))
+    if (error) throw error
+  }
+
+  async deleteBloodFlow(id: string) {
+    const { error } = await this.client().from('blood_flows').delete().eq('id', id)
+    if (error) throw error
+  }
+
   async listAdverseReactions(sessionId: string) {
     const { data } = await this.client()
       .from('adverse_reactions')
@@ -289,24 +341,27 @@ class CloudRepository implements Repository {
 
   async exportAll() {
     const client = this.client()
-    const [patients, dryWeights, sessions, bps, bgs, reactions] = await Promise.all([
+    const [patients, dryWeights, sessions, bps, bgs, bfs, reactions] = await Promise.all([
       client.from('patients').select('*'),
       client.from('dry_weights').select('*'),
-      client.from('sessions').select('*'),
+      client.from('sessions').select(SESSION_SELECT),
       client.from('blood_pressures').select('*'),
       client.from('blood_glucoses').select('*'),
+      client.from('blood_flows').select('*'),
       client.from('adverse_reactions').select('*'),
     ])
+    // 导出为与本地模式一致的领域对象格式，便于跨模式备份/恢复
     return JSON.stringify(
       {
         version: 1,
         exportedAt: Date.now(),
-        patients: patients.data ?? [],
-        dryWeights: dryWeights.data ?? [],
-        sessions: sessions.data ?? [],
-        bloodPressures: bps.data ?? [],
-        bloodGlucoses: bgs.data ?? [],
-        adverseReactions: reactions.data ?? [],
+        patients: (patients.data ?? []).map(patientFromRow),
+        dryWeights: (dryWeights.data ?? []).map(dryWeightFromRow),
+        sessions: (sessions.data ?? []).map(sessionFromRow),
+        bloodPressures: (bps.data ?? []).map(bpFromRow),
+        bloodGlucoses: (bgs.data ?? []).map(bgFromRow),
+        bloodFlows: (bfs.data ?? []).map(bloodFlowFromRow),
+        adverseReactions: (reactions.data ?? []).map(reactionFromRow),
       },
       null,
       2,

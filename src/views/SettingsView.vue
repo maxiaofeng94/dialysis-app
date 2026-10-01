@@ -8,8 +8,8 @@ import { Filesystem, Directory, Encoding } from '@capacitor/filesystem'
 import { Share } from '@capacitor/share'
 import { repository } from '../repo'
 import { DEFAULT_RINSE_BACK_ML } from '../constants'
-import { currentPatientId } from '../stores/patient'
-import { listMyPatients, createPatient } from '../lib/cloudAdmin'
+import { currentPatientId, setCurrentPatientId } from '../stores/patient'
+import { listMyPatients, createPatient, getMyProfile, updateMyName } from '../lib/cloudAdmin'
 import { migrateLocalToCloud } from '../lib/migrate'
 import { todayStr, parseNum, fmt, formatDateCN, calcAge } from '../utils/format'
 import { getEffectiveDryWeight } from '../utils/calc'
@@ -26,6 +26,11 @@ async function onLogout() {
   router.replace('/login')
 }
 
+async function saveMyName() {
+  const res = await updateMyName(myName.value.trim())
+  showToast(res.ok ? '已保存' : res.error ?? '保存失败')
+}
+
 const form = reactive({
   name: '',
   birthday: '',
@@ -38,6 +43,8 @@ const showDwForm = ref(false)
 const fileInput = ref<HTMLInputElement>()
 
 const myPatients = ref<{ patient: Patient; role: string }[]>([])
+const myName = ref('')
+const myPhone = ref('')
 const showNewPatient = ref(false)
 const newPatientForm = reactive({ name: '', wheelchairWeight: '', rinseBackVolume: '' })
 
@@ -45,11 +52,14 @@ onMounted(async () => {
   await load()
   if (isLoggedIn.value) {
     myPatients.value = await listMyPatients()
+    const profile = await getMyProfile()
+    myName.value = profile?.name ?? ''
+    myPhone.value = profile?.phone ?? ''
   }
 })
 
 async function switchPatient(id: string) {
-  currentPatientId.value = id
+  setCurrentPatientId(id)
   showToast('已切换病人')
   await load()
 }
@@ -73,7 +83,7 @@ async function onCreatePatient() {
   )
   if (res.ok && res.data?.patient) {
     showNewPatient.value = false
-    currentPatientId.value = res.data.patient.id
+    setCurrentPatientId(res.data.patient.id)
     myPatients.value = await listMyPatients()
     await load()
     showToast('已创建')
@@ -311,7 +321,10 @@ function showHelp() {
 
     <div v-if="isLoggedIn" class="card">
       <div class="card-title">账号</div>
-      <van-button block plain type="danger" @click="onLogout">退出登录</van-button>
+      <van-field v-model="myName" label="我的姓名" placeholder="记录人显示用（默认手机号）" />
+      <div v-if="myPhone" class="muted" style="margin: 4px 16px">手机号 {{ myPhone }}</div>
+      <van-button block plain type="primary" style="margin-top: 10px" @click="saveMyName">保存姓名</van-button>
+      <van-button block plain type="danger" style="margin-top: 10px" @click="onLogout">退出登录</van-button>
     </div>
 
     <van-popup v-model:show="showDwForm" round position="bottom">

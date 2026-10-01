@@ -7,6 +7,7 @@ import SettingsView from '../views/SettingsView.vue'
 import LoginView from '../views/LoginView.vue'
 import MembersView from '../views/MembersView.vue'
 import { useAuth } from '../stores/auth'
+import { restorePatientId, ensureCloudPatient } from '../stores/patient'
 import { isCloudConfigured } from '../lib/supabase'
 
 const router = createRouter({
@@ -22,15 +23,29 @@ const router = createRouter({
   ],
 })
 
+// 已建立病人上下文的账号 id（换账号后自动重建）
+let patientContextUid: string | null | undefined
+
 // 多人版登录守卫：云端模式下未登录跳转登录页；本地模式（未配置 Supabase）不受影响
 router.beforeEach(async (to) => {
-  const { initialized, isLoggedIn, init } = useAuth()
+  const { initialized, isLoggedIn, init, user } = useAuth()
   if (!initialized.value) await init()
   if (!isCloudConfigured) return true
   if (to.path === '/login') {
     return isLoggedIn.value ? '/' : true
   }
-  return isLoggedIn.value ? true : '/login'
+  if (!isLoggedIn.value) {
+    patientContextUid = undefined
+    return '/login'
+  }
+  // 恢复上次选中的病人，并校准到当前账号可访问的病人（首次登录/换账号/被移出成员）
+  const uid = user.value?.id ?? null
+  if (patientContextUid !== uid) {
+    await restorePatientId()
+    await ensureCloudPatient()
+    patientContextUid = uid
+  }
+  return true
 })
 
 export default router
