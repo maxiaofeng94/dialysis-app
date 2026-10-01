@@ -293,15 +293,16 @@ create policy pm_update on public.patient_members for update using (public.is_me
 create policy pm_delete on public.patient_members for delete using (public.is_member(patient_id, array['owner']));
 
 -- 用户资料表：本人可读写；同一病人的成员可互相查看（成员列表、记录人姓名用）
+-- 注意：子查询里的 users.id 必须写成表名限定，否则 patient_members 也有 id 列，会被解析成 pm.user_id = pm.id（恒假）
 alter table public.users enable row level security;
 drop policy if exists users_select on public.users;
 drop policy if exists users_update on public.users;
 create policy users_select on public.users for select using (
-  id = auth.uid()
+  users.id = auth.uid()
   or exists (
     select 1 from public.patient_members pm
-    where pm.user_id = id
+    where pm.user_id = users.id
       and public.is_member(pm.patient_id)
   )
 );
-create policy users_update on public.users for update using (id = auth.uid());
+create policy users_update on public.users for update using (users.id = auth.uid());
