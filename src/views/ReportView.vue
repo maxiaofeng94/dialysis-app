@@ -28,6 +28,9 @@ const flows = ref<BloodFlow[]>([])
 const reactions = ref<AdverseReaction[]>([])
 const reportEl = ref<HTMLDivElement>()
 
+/** 首次加载（本机还没有缓存）时的骨架占位 */
+const loading = ref(true)
+
 onMounted(load)
 
 // 报告页是纯展示页，缓存后台刷新完成后自动重读，无需用户手动刷新
@@ -58,6 +61,7 @@ async function load() {
   glucoses.value = bg
   flows.value = bf
   reactions.value = ar
+  loading.value = false
 }
 
 const comp = computed(() => {
@@ -179,6 +183,12 @@ async function share() {
       </template>
     </van-nav-bar>
 
+    <!-- 首次加载（本机还没有缓存）时显示骨架，避免白屏干等 -->
+    <div v-if="loading" class="card" style="margin-top: 12px">
+      <van-skeleton title :row="8" />
+    </div>
+
+    <template v-if="!loading">
     <div ref="reportEl" style="background: #fff; border-radius: 10px; padding: 16px">
       <div style="text-align: center; margin-bottom: 14px">
         <div style="font-size: 18px; font-weight: 700">透析报告</div>
@@ -253,6 +263,7 @@ async function share() {
       </div>
       <div v-if="session?.notes" class="muted" style="margin-top: 8px">备注：{{ session.notes }}</div>
     </div>
+    </template>
   </div>
 </template>
 

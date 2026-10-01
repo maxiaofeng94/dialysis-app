@@ -48,6 +48,9 @@ const myPhone = ref('')
 const showNewPatient = ref(false)
 const newPatientForm = reactive({ name: '', wheelchairWeight: '', rinseBackVolume: '' })
 
+/** 首次加载（本机还没有缓存）时的骨架占位 */
+const loading = ref(true)
+
 onMounted(async () => {
   await load()
   if (isLoggedIn.value) {
@@ -119,6 +122,7 @@ async function load() {
   form.wheelchairWeight = p ? String(p.wheelchairWeight) : ''
   form.rinseBackVolume = p ? String(p.rinseBackVolume) : ''
   dryWeights.value = dw
+  loading.value = false
 }
 
 const currentDry = computed(() => getEffectiveDryWeight(dryWeights.value, todayStr()))
@@ -256,6 +260,12 @@ function showHelp() {
   <div class="page">
     <van-nav-bar title="设置" :border="false" />
 
+    <!-- 首次加载（本机还没有缓存）时显示骨架，避免白屏干等 -->
+    <div v-if="loading" class="card" style="margin-top: 12px">
+      <van-skeleton title :row="6" />
+    </div>
+
+    <template v-if="!loading">
     <div class="card">
       <div class="card-title">病人档案</div>
       <van-field v-model="form.name" label="姓名" placeholder="请输入姓名" />
@@ -353,5 +363,6 @@ function showHelp() {
         </div>
       </div>
     </van-popup>
+    </template>
   </div>
 </template>

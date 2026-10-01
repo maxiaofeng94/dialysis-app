@@ -19,6 +19,9 @@ const ROLE_LABELS: Record<string, string> = {
   viewer: '只读',
 }
 
+/** 首次加载（本机还没有缓存）时的骨架占位 */
+const loading = ref(true)
+
 onMounted(load)
 
 // 缓存后台刷新完成后自动重读
@@ -28,6 +31,7 @@ watch(cacheVersion, () => {
 
 async function load() {
   members.value = await listMembers(currentPatientId.value)
+  loading.value = false
 }
 
 async function onInvite() {
@@ -92,6 +96,12 @@ async function onRemove(m: MemberInfo) {
   <div class="page">
     <van-nav-bar title="成员管理" left-text="返回" left-arrow @click-left="router.back()" />
 
+    <!-- 首次加载（本机还没有缓存）时显示骨架，避免白屏干等 -->
+    <div v-if="loading" class="card" style="margin-top: 12px">
+      <van-skeleton title :row="4" />
+    </div>
+
+    <template v-if="!loading">
     <div class="card">
       <div class="row">
         <div class="card-title" style="margin: 0">成员列表</div>
@@ -134,5 +144,6 @@ async function onRemove(m: MemberInfo) {
         </div>
       </div>
     </van-popup>
+    </template>
   </div>
 </template>

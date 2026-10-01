@@ -14,6 +14,9 @@ const sessions = ref<DialysisSession[]>([])
 const bpTrend = ref<{ time: number; date: string; systolic: number; diastolic: number }[]>([])
 const gluTrend = ref<{ time: number; date: string; value: number }[]>([])
 
+/** 首次加载（本机还没有缓存）时的骨架占位 */
+const loading = ref(true)
+
 onMounted(load)
 
 // 纯展示页：缓存后台刷新完成后自动重读
@@ -27,6 +30,7 @@ async function load() {
   dryWeights.value = dw
   sessions.value = ss
   await Promise.all([loadBpTrend(), loadGlucoseTrend()])
+  loading.value = false
 }
 
 async function loadBpTrend() {
@@ -103,6 +107,13 @@ const gluOption = computed(() => ({
 <template>
   <div class="page">
     <van-nav-bar title="趋势分析" :border="false" />
+
+    <!-- 首次加载（本机还没有缓存）时显示骨架，避免白屏干等 -->
+    <div v-if="loading" class="card" style="margin-top: 12px">
+      <van-skeleton title :row="8" />
+    </div>
+
+    <template v-if="!loading">
     <van-tabs v-model:active="active">
       <van-tab title="体重">
         <div class="card" style="margin-top: 12px">
@@ -126,5 +137,6 @@ const gluOption = computed(() => ({
         </div>
       </van-tab>
     </van-tabs>
+    </template>
   </div>
 </template>

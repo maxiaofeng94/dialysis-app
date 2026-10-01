@@ -187,7 +187,7 @@ async function doNewBlank() {
     </div>
 
     <!-- 快速创建 -->
-    <div class="quick-card">
+    <div v-if="!loading" class="quick-card">
       <div class="quick-title">快速创建</div>
       <div class="quick-label">上机前体重（含轮椅）</div>
       <div class="quick-input-wrap">
@@ -224,7 +224,7 @@ async function doNewBlank() {
     </van-empty>
 
     <!-- 记录列表 -->
-    <template v-else>
+    <template v-else-if="!loading">
       <van-empty v-if="!sessions.length" description="暂无透析记录，点击上方快速创建" />
       <div v-for="[month, list] in grouped" :key="month" class="card" style="padding: 8px 14px">
         <div class="card-title" style="margin: 6px 0">{{ month }}</div>

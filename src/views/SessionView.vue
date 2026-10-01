@@ -52,6 +52,9 @@ const abortForm = reactive({ date: '', time: '', tags: [] as string[], reason: '
 let loaded = false
 let timer: ReturnType<typeof setTimeout> | null = null
 
+/** 首次加载（本机还没有缓存）时的骨架占位 */
+const loading = ref(true)
+
 onMounted(load)
 
 async function load() {
@@ -79,6 +82,7 @@ async function load() {
   selectedReactions.value = reactions.value.map((r) => r.type)
   otherDetail.value = reactions.value.find((r) => r.type === 'other')?.detail ?? ''
   loaded = true
+  loading.value = false
 }
 
 async function loadSub() {
@@ -409,6 +413,11 @@ async function removeSession() {
         <van-icon name="delete-o" size="20" color="#969799" style="cursor: pointer" @click="removeSession" />
       </template>
     </van-nav-bar>
+
+    <!-- 首次加载（本机还没有缓存）时显示骨架，避免白屏干等 -->
+    <div v-if="loading" class="card" style="margin-top: 12px">
+      <van-skeleton title :row="6" />
+    </div>
 
     <template v-if="session">
       <!-- 基本信息 -->
