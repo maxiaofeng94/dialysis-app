@@ -31,21 +31,25 @@
 
 ## 三、部署 Edge Functions
 
-前置：电脑安装 Supabase CLI（https://supabase.com/docs/guides/cli），并登录：
+前置：电脑安装 Supabase CLI（https://supabase.com/docs/guides/cli），并登录（也可直接设环境变量 `SUPABASE_ACCESS_TOKEN`）：
 
 ```bash
 supabase login
 cd 项目根目录（含 supabase/ 文件夹）
-supabase link --project-ref <你的项目引用ID>
 ```
 
-部署三个函数（或用脚本 `deploy-functions.ps1` 交互式执行）：
+部署三个函数（不必 `supabase link`，直接指定 `--project-ref`）：
 
 ```bash
-supabase functions deploy register
-supabase functions deploy create-patient
-supabase functions deploy invite-member
+# register 必须免 JWT 校验：注册时用户还没登录
+supabase functions deploy register      --project-ref <ref> --no-verify-jwt --use-api
+supabase functions deploy create-patient --project-ref <ref> --use-api
+supabase functions deploy invite-member  --project-ref <ref> --use-api
 ```
+
+- `--use-api`：不依赖 Docker，由平台侧构建
+- 另两个函数保持默认 JWT 校验，前端会带用户 access token 调用
+- 也可用脚本：`powershell -File supabase/deploy-functions.ps1 -ProjectRef <ref>`
 
 ## 四、获取前端连接信息
 
@@ -53,7 +57,7 @@ supabase functions deploy invite-member
 - **Project URL**：如 `https://xxxx.supabase.co`
 - **anon public key**：客户端匿名密钥
 
-这两个值配置到前端环境变量（`.env`）：
+这两个值配置到前端环境变量：开发调试用 `.env`（建议测试库）、生产构建用 `.env.production`（生产库），两者都已被 git 忽略：
 ```
 VITE_SUPABASE_URL=https://xxxx.supabase.co
 VITE_SUPABASE_ANON_KEY=eyJhbGciOi...
