@@ -4,7 +4,8 @@ import { useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { repository } from '../repo'
 import { SESSION_STATUS_LABEL, SESSION_STATUS_TAG, abortText } from '../constants'
-import { currentPatientId } from '../stores/patient'
+import { currentPatientId, hasNoCloudPatient } from '../stores/patient'
+import { isLoggedIn } from '../stores/auth'
 import { todayStr, formatDateCN, fmt, calcAge } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import { uuid } from '../utils/id'
@@ -17,6 +18,7 @@ const sessions = ref<DialysisSession[]>([])
 const quickWeight = ref('')
 const loading = ref(true)
 const showNewDialog = ref(false)
+const noCloudPatient = ref(false)
 
 onMounted(refresh)
 
@@ -25,6 +27,8 @@ async function refresh() {
   dryWeights.value = await repository.listDryWeights(currentPatientId.value)
   sessions.value = await repository.listSessions(currentPatientId.value)
   loading.value = false
+  // 云端账号下还没有任何病人 → 首页给出更明确的引导
+  noCloudPatient.value = !patient.value && isLoggedIn.value ? await hasNoCloudPatient() : false
 }
 
 const currentDry = computed(() => getEffectiveDryWeight(dryWeights.value, todayStr()))
@@ -194,7 +198,10 @@ async function doNewBlank() {
     </div>
 
     <!-- 无病人档案 -->
-    <van-empty v-if="!loading && !patient" description="请先建立病人档案">
+    <van-empty
+      v-if="!loading && !patient"
+      :description="noCloudPatient ? '还没有病人档案，去「设置」新建或上传本地数据' : '请先建立病人档案'"
+    >
       <van-button type="primary" @click="router.push('/settings')">去设置</van-button>
     </van-empty>
 
