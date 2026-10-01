@@ -17,9 +17,9 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
@@ -47,18 +47,20 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "token 长度: ${#CLOUDFLARE_API_TOKEN}（应为 40 左右；若明显偏大，说明值里混入了引号或换行）"
-          echo "token 前缀: ${CLOUDFLARE_API_TOKEN:0:13}..."
-          echo "account id: [$CLOUDFLARE_ACCOUNT_ID]（应为 32 位十六进制，方括号内不应有多余空格或引号）"
+          echo "token 长度: ${#CLOUDFLARE_API_TOKEN}（本项目的 token 为 51 位；明显偏大说明值里混入了引号或换行）"
+          echo "token 前缀: ${CLOUDFLARE_API_TOKEN:0:13}...（本项目应为 cfut_zvmZnjY...）"
+          echo "配置的 account id: [$CLOUDFLARE_ACCOUNT_ID]"
           resp=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" https://api.cloudflare.com/client/v4/user/tokens/verify)
-          echo "token 校验返回: $resp"
+          echo "token 校验: $resp"
           if ! printf '%s' "$resp" | grep -q '"success":true'; then
-            echo "::error::Cloudflare API Token 无效或已过期，请检查仓库 secret CLOUDFLARE_API_TOKEN 的值（不要带引号）"
+            echo "::error::Cloudflare API Token 无效或已过期，请检查 secret CLOUDFLARE_API_TOKEN 的值（不要带引号）"
             exit 1
           fi
           acc=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" https://api.cloudflare.com/client/v4/accounts)
+          echo "该 Token 可见的账号（id / name）："
+          printf '%s' "$acc" | tr ',{' '\n\n' | grep -E '"(id|name)"' | head -20
           if ! printf '%s' "$acc" | grep -q "$CLOUDFLARE_ACCOUNT_ID"; then
-            echo "::error::该 Token 下找不到账号 $CLOUDFLARE_ACCOUNT_ID，请检查 secret CLOUDFLARE_ACCOUNT_ID"
+            echo "::error::上面的账号列表里没有 $CLOUDFLARE_ACCOUNT_ID，请把 secret CLOUDFLARE_ACCOUNT_ID 改成列表里出现的那个 id"
             exit 1
           fi
           echo "凭据自检通过 ✅"
