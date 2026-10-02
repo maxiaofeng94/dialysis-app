@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "dev:admin": "vite --config vite.admin.config.ts",
+    "build:admin": "vue-tsc -b && vite build --config vite.admin.config.ts",
+    "smoke:admin": "node scripts/smoke-admin.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^6.2.1",
@@ -15,9 +18,11 @@
     "@capacitor/filesystem": "^6.0.4",
     "@capacitor/preferences": "^6.0.4",
     "@capacitor/share": "^6.0.4",
+    "@element-plus/icons-vue": "^2.3.2",
     "@supabase/supabase-js": "^2.112.3",
     "dexie": "^4.4.5",
     "echarts": "^6.1.0",
+    "element-plus": "^2.14.7",
     "html2canvas": "^1.4.1",
     "vant": "^4.10.0",
     "vue": "^3.5.40",

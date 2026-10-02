@@ -10,6 +10,7 @@
 ### 第 1 步 · 先起本地预览，等用户确认
 
 - UI/交互改动 → `npm run dev`（http://127.0.0.1:5173 ，连**测试库**，带热更新，最快）
+- 后台管理端改动 → `npm run dev:admin`（http://127.0.0.1:5174 ，连**测试库**）
 - 需要真实数据/构建产物 → `npm run build` 后 `npm run preview`（http://127.0.0.1:4173 ，连**生产库**）
 - 用后台任务启动；端口已被占用就**复用**，不要重复起；改动涉及 `.env`、路由、依赖、构建配置时必须重启服务
 - 启动后**验证可达**（`curl -s -o NUL -w "%{http_code}" <url>` 应为 200），然后告诉用户：**确切地址 + 该看哪个页面 + 预期效果**
@@ -64,8 +65,10 @@ Set-Location ..
 | 测试库 | Supabase 项目 `dialysis-test`（含测试账号与假数据），前端配置 `.env` |
 | 切换规则 | `npm run dev` 读 `.env`；`npm run build` 读 `.env.production` |
 | 敏感文件 | `.env`、`.env.production` 已 git 忽略，**绝不能提交**；PAT/token 只走环境变量或临时文件 |
-| 后端 | `supabase/schema.sql`（可重复执行）+ `supabase/functions/{register,create-patient,invite-member}` |
-| 前端托管 | Cloudflare Pages 项目 `dialysis`，GitHub Actions 自动部署 |
+| 后端 | `supabase/schema.sql`（可重复执行）+ `supabase/functions/{register,create-patient,invite-member,admin-api}` |
+| 前端托管 | Cloudflare Pages 项目 `dialysis`，GitHub Actions（`deploy.yml`）自动部署 |
+| 后台托管 | Cloudflare Pages 项目 `dialysis-admin`（https://dialysis-admin.pages.dev ），由 `deploy-admin.yml` 自动部署；产物 `dist-admin/`，**不进 APK** |
+| 管理员名单 | Supabase 表 `public.admins`（后台无自助提权入口，首个管理员用 SQL Editor 手动 insert） |
 | 移动端 | Capacitor Android，debug 签名可覆盖安装 |
 | APK 产物 | GitHub Release `latest` 的 `dialysis-recorder.apk`，由 `build-apk.yml` 自动构建；手机直链 https://github.com/maxiaofeng94/dialysis-app/releases/download/latest/dialysis-recorder.apk |
 | APK 签名 | CI 用 secret `ANDROID_DEBUG_KEYSTORE_BASE64` 还原本机 debug keystore（配合 `DEBUG_KEYSTORE_PATH`），保证与本地同签名 |
@@ -81,6 +84,11 @@ Set-Location ..
   - `repo/cachedRepository.ts` 云端的「缓存优先 + 后台刷新」包装（缓存实现 `lib/cloudCache.ts`）；
   - `repo/index.ts` 按登录态动态切换
 - 页面：`src/views/`（Home / Session / Report / Trend / Settings / Login / Members）
+- **后台管理端**（独立入口，与 App 两套产物互不影响）：
+  - 前端入口 `admin/index.html` + `src/admin/**`（Element Plus + hash 路由），构建 `npm run build:admin` → `dist-admin/index.html`（**root 指向 `admin/`**，务必保证产物是 index.html，否则 Pages 根路径 404）
+  - 后端唯一入口 `supabase/functions/admin-api/`（action 分发 + 查 `public.admins` 鉴权 + 写 `admin_audit_logs`）
+  - **隐私边界：后台看不到任何病历明细**（刻意不动 `sessions` / `blood_pressures` 等表的 RLS），只给账号、成员关系、病人基础配置与记录聚合数字 —— 不要"顺手"开放
+  - 文档：`docs/后台管理系统设计说明.md`、`docs/后台管理系统部署指南.md`
 
 ---
 
@@ -108,6 +116,10 @@ Set-Location ..
 - 本地数据迁移：本地病人 id 是 `patient-default`（**不是 uuid**），云端主键是 uuid → 必须重映射，并同步改所有子表的 `patient_id` / `session_id`
 - RLS 拦截是**静默过滤**：删除 0 行也返回 204，判断是否被拦要看**数据是否还在**，不能只看状态码
 - Supabase PAT 有权限边界：可操作项目（跑 SQL、部署函数），但建项目属组织级操作（常见 403），项目名单 API 也可能不可见
+- 管理员标记**绝不能**加在 `public.users` 上：`users_update` 策略允许用户更新自己那一行，等于开了自我提权后门 → 用独立表 `public.admins`，且**不建任何写策略**
+- `security definer` 函数要给调用面收口：`revoke all on function ... from public`，再按需 `grant execute ... to service_role`，否则任何登录用户都能执行（`is_admin()` 是唯一例外，RLS 策略需要它）
+- `admin-api` 必须**保持默认 JWT 校验**（恰好与 `register` 的 `--no-verify-jwt` 相反）
+- 用户列表的「最后登录时间 / 禁用状态」在 `auth.users` 里，PostgREST 读不到（不暴露 auth schema，service_role 也一样）→ 只能用 Admin API `auth.admin.listUsers` 分页取，再与 `public.users` 合并
 
 ### Android / APK
 
@@ -137,10 +149,12 @@ Set-Location ..
 
 ## 六、验证手段（改动后如何自证）
 
-- **构建**：`npm run build`
+- **构建**：`npm run build`（App）/ `npm run build:admin`（后台）
+- **后台页面冒烟**：`npm run smoke:admin` —— 用 SSR 把 8 个后台页面各渲染一遍，抓「构建期发现不了」的问题（模板运行时错误、组件名写错被静默渲染成空）
 - **线上产物连对库没有**：`curl` 首页拿到 `/assets/index-*.js` 路径，抓取该 JS 后 grep 项目 ref，确认是 `.env.production` 里的生产库 ref（而不是测试库的）
 - **云端链路**：写 Node 脚本用 anon key + 测试账号跑一遍「注册 → 建病人 → 写记录 → 邀请成员 → 跨账号可见 → 权限拦截」，比点 UI 更彻底
 - **Edge Function**：`GET /v1/projects/<ref>/functions` 看 status/verify_jwt 是否符合预期
+- **后台越权**：不带 token 调 `admin-api` 应 401；普通用户 token 应 403；管理员直连 PostgREST 查 `sessions` 应读不到别人的病历（完整清单见 `docs/后台管理系统部署指南.md` 第六节）
 - **CI 产出的 APK**：从 Release 直链下载后用 `apksigner verify --print-certs` 对比本机 keystore 指纹，并解包确认 web 产物连的是生产库
 - **数据库结构**：用 Management API 的 `POST /v1/projects/<ref>/database/query` 跑 `information_schema` / `pg_policies` 查询核对
 - 交付结论时给出**可复现的证据**（命令 + 输出），不要只说"应该没问题"

@@ -306,3 +306,81 @@ create policy users_select on public.users for select using (
   )
 );
 create policy users_update on public.users for update using (users.id = auth.uid());
+
+-- ============================================================
+-- 后台管理系统 增量（同样可重复执行）
+-- 设计说明见 docs/后台管理系统设计说明.md
+-- ============================================================
+
+-- ---------- 9. 管理员名单 ----------
+-- 单独建表，而不是给 users 加 is_admin 列：
+-- users_update 策略允许用户更新自己那一行，若管理员标记放在 users 表里，任何人都能自我提权。
+create table if not exists public.admins (
+  user_id    uuid primary key references public.users(id) on delete cascade,
+  note       text,
+  created_by uuid references public.users(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+-- 判断当前登录用户是否管理员（security definer：绕过 admins 表自身的 RLS）
+create or replace function public.is_admin()
+returns boolean
+language sql
+stable
+security definer set search_path = public
+as $$
+  select exists (select 1 from public.admins where user_id = auth.uid());
+$$;
+
+alter table public.admins enable row level security;
+drop policy if exists admins_select on public.admins;
+create policy admins_select on public.admins for select using (user_id = auth.uid());
+-- 故意不建 insert / update / delete 策略：
+-- 普通请求（含管理员本人的 anon key 请求）一律写不进去，
+-- 只有 SQL Editor（postgres）与后台 Edge Function（service_role）能授予/撤销管理员。
+
+-- ---------- 10. 后台操作审计日志 ----------
+create table if not exists public.admin_audit_logs (
+  id          bigint generated always as identity primary key,
+  admin_id    uuid references public.users(id) on delete set null,
+  action      text not null,                         -- 如 user.setBanned / patient.update
+  target_type text,                                  -- user / patient / member / admin
+  target_id   text,
+  detail      jsonb not null default '{}'::jsonb,    -- 变更摘要（不含密码等敏感值）
+  created_at  timestamptz not null default now()
+);
+create index if not exists idx_admin_logs_created on public.admin_audit_logs(created_at desc);
+create index if not exists idx_admin_logs_admin   on public.admin_audit_logs(admin_id);
+
+alter table public.admin_audit_logs enable row level security;
+drop policy if exists audit_select on public.admin_audit_logs;
+create policy audit_select on public.admin_audit_logs for select using (public.is_admin());
+-- 写入同样只走 service_role（后台 Edge Function），不建 insert 策略。
+
+-- ---------- 11. 后台统计函数（仅 service_role 可执行） ----------
+-- 按病人聚合记录条数与首末记录日期：后台只拿聚合数字，不读病历明细。
+create or replace function public.admin_patient_stats()
+returns table (patient_id uuid, session_count bigint, first_date date, last_date date)
+language sql
+stable
+security definer set search_path = public
+as $$
+  select s.patient_id, count(*)::bigint, min(s.date), max(s.date)
+  from public.sessions s
+  group by s.patient_id;
+$$;
+
+revoke all on function public.admin_patient_stats() from public;
+revoke all on function public.admin_patient_stats() from anon, authenticated;
+grant execute on function public.admin_patient_stats() to service_role;
+
+-- ---------- 12. 加固：用户只能改自己的姓名 ----------
+-- 原先用户可更新自己 users 行的任意列（含 phone，且 phone 无唯一约束），
+-- 收紧为列级权限；后台改姓名走 Edge Function（service_role），不受影响。
+revoke update on public.users from anon, authenticated;
+grant update (name) on public.users to authenticated;
+
+-- ---------- 13. 首个管理员（手动执行一次；把手机号换成你自己的） ----------
+-- insert into public.admins(user_id, note)
+-- select id, '初始管理员' from public.users where phone = '13800000000'
+-- on conflict (user_id) do nothing;

@@ -5,6 +5,7 @@
 - `functions/register/` — 注册（手机号 + 密码，服务端建号）
 - `functions/create-patient/` — 创建病人（建病人 + owner 成员）
 - `functions/invite-member/` — 按手机号邀请成员
+- `functions/admin-api/` — **后台管理唯一入口**（管理员校验 + 用户/病人/成员管理 + 操作审计）
 - `deploy-functions.ps1` — 一键部署脚本
 
 数据表：`users`、`patients`、`dry_weights`、`sessions`（含医生设定脱水量、中止时间/原因）、`blood_pressures`、`blood_glucoses`、`blood_flows`、`adverse_reactions`、`patient_members`。
@@ -62,6 +63,33 @@ supabase functions deploy invite-member  --project-ref <ref> --use-api
 VITE_SUPABASE_URL=https://xxxx.supabase.co
 VITE_SUPABASE_ANON_KEY=eyJhbGciOi...
 ```
+
+## 四·五、后台管理（2026-10-02 新增）
+
+`schema.sql` 第 9～13 节为后台增量（幂等，可重复执行）：
+
+- `public.admins` — 管理员名单（**无写策略**，只有 SQL Editor / service_role 能写）
+- `public.is_admin()` — 判定函数（security definer）
+- `public.admin_audit_logs` — 后台操作留痕（管理员可读，仅 service_role 可写）
+- `public.admin_patient_stats()` — 按病人聚合记录数/首末日期（**仅 service_role 可执行**）
+- `revoke update on public.users` + `grant update (name)` — 用户只能改自己的姓名
+
+部署后台接口（**保持默认 JWT 校验**，不要加 `--no-verify-jwt`）：
+
+```bash
+supabase functions deploy admin-api --project-ref <ref> --use-api
+```
+
+设置首个管理员（换成你自己的手机号，在 SQL Editor 执行一次）：
+
+```sql
+insert into public.admins(user_id, note)
+select id, '初始管理员' from public.users where phone = '13800000000'
+on conflict (user_id) do nothing;
+```
+
+后台前端是独立入口（`admin/index.html` + `src/admin/**`，Element Plus），构建 `npm run build:admin` 输出 `dist-admin/`，
+完整步骤与验收清单见 `docs/后台管理系统部署指南.md`。
 
 ## 五、安全说明
 
