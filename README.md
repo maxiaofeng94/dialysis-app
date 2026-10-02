@@ -37,6 +37,18 @@ npm run build    # 产物在 dist/
 npm run preview  # 预览构建产物
 ```
 
+## 开发与发布流程（重要）
+
+改动代码后**按三步走**，不要直接推送或发布（完整规则见 `AGENTS.md`，工作区内的 AI 会话会自动遵守）：
+
+1. **本地预览确认**
+   - UI 改动：`npm run dev` → http://localhost:5173 （连**测试库**，含测试数据，带热更新）
+   - 看真实数据：`npm run build && npm run preview` → http://localhost:4173 （连**生产库**）
+2. **确认无误后推送**：`git push origin main` → GitHub Actions 自动构建并部署到 Cloudflare Pages（https://dialysis-49v.pages.dev ）
+3. **打包 APK**：`npx cap sync android`，再在 `android` 目录执行 `gradle assembleDebug`（需先设好 `ANDROID_HOME` / `JAVA_HOME`），产物在 `android/app/build/outputs/apk/debug/app-debug.apk`
+
+> 环境分工：`npm run dev` 读 `.env`（测试库），`npm run build` 读 `.env.production`（生产库）；两个文件都不入库。
+
 ## 部署（免费）
 
 把 `dist/` 上传到任意静态托管即可（PWA 需 HTTPS）：
