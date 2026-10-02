@@ -65,6 +65,7 @@ Set-Location ..
 | 测试库 | Supabase 项目 `dialysis-test`（含测试账号与假数据），前端配置 `.env` |
 | 切换规则 | `npm run dev` 读 `.env`；`npm run build` 读 `.env.production` |
 | 敏感文件 | `.env`、`.env.production` 已 git 忽略，**绝不能提交**；PAT/token 只走环境变量或临时文件 |
+| PAT 存放位置 | 项目根 `.supabase-pat.local`（被 `.gitignore` 的 `*.local` 忽略，**绝不入库**）：`TEST_REF`/`TEST_PAT` = 测试库，`PROD_REF`/`PROD_PAT` = 生产库。跑 SQL / 部署函数时**从这个文件读**，例如 `$env:SUPABASE_ACCESS_TOKEN = ((Select-String .supabase-pat.local -Pattern '^PROD_PAT=').Line -replace '^PROD_PAT=','')`。⚠️ 本仓库是**公开仓库**，PAT 一旦写进任何入库文件，就等于公开两个 Supabase 项目的控制权 |
 | 后端 | `supabase/schema.sql`（可重复执行）+ `supabase/functions/{register,create-patient,invite-member,admin-api}` |
 | 前端托管 | Cloudflare Pages 项目 `dialysis`，GitHub Actions（`deploy.yml`）自动部署 |
 | 后台托管 | Cloudflare Pages 项目 `dialysis-admin`（https://dialysis-admin.pages.dev ），由 `deploy-admin.yml` 自动部署；产物 `dist-admin/`，**不进 APK** |
