@@ -92,7 +92,10 @@ jobs:
 
       - name: 构建 debug APK
         working-directory: android
-        run: ./gradlew assembleDebug --no-daemon --console=plain
+        run: |
+          set -euo pipefail
+          chmod +x gradlew # 保险：Windows 上提交时可能丢掉可执行位
+          ./gradlew assembleDebug --no-daemon --console=plain
 
       - name: 校验 APK
         working-directory: android
