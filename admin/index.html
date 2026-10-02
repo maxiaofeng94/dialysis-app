@@ -10,7 +10,7 @@
   </head>
   <body>
     <div id="admin-app"></div>
-    <!-- 路径相对本文件；vite.admin.config.ts 的 root 指向本目录 -->
+    <!-- Vite root 是项目根，本页通过 / 或 /admin/index.html 访问；相对路径最终解析为 /src/admin/main.ts -->
     <script type="module" src="../src/admin/main.ts"></script>
   </body>
 </html>

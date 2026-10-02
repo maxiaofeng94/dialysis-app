@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "dev:admin": "vite --config vite.admin.config.ts",
     "build:admin": "vue-tsc -b && vite build --config vite.admin.config.ts",
-    "smoke:admin": "node scripts/smoke-admin.mjs"
+    "smoke:admin": "node scripts/smoke-admin.mjs",
+    "check:admin-dev": "node scripts/check-admin-dev.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^6.2.1",

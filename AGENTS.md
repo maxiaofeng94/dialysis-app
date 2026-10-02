@@ -85,7 +85,7 @@ Set-Location ..
   - `repo/index.ts` 按登录态动态切换
 - 页面：`src/views/`（Home / Session / Report / Trend / Settings / Login / Members）
 - **后台管理端**（独立入口，与 App 两套产物互不影响）：
-  - 前端入口 `admin/index.html` + `src/admin/**`（Element Plus + hash 路由），构建 `npm run build:admin` → `dist-admin/index.html`（**root 指向 `admin/`**，务必保证产物是 index.html，否则 Pages 根路径 404）
+  - 前端入口 `admin/index.html` + `src/admin/**`（Element Plus + hash 路由），构建 `npm run build:admin` → `dist-admin/index.html`（Vite root 是项目根；dev 用中间件把 `/` 指向 `/admin/index.html`，构建后用 `closeBundle` 把产物提升为 `index.html`，否则 Pages 根路径 404）
   - 后端唯一入口 `supabase/functions/admin-api/`（action 分发 + 查 `public.admins` 鉴权 + 写 `admin_audit_logs`）
   - **隐私边界：后台看不到任何病历明细**（刻意不动 `sessions` / `blood_pressures` 等表的 RLS），只给账号、成员关系、病人基础配置与记录聚合数字 —— 不要"顺手"开放
   - 文档：`docs/后台管理系统设计说明.md`、`docs/后台管理系统部署指南.md`
@@ -120,6 +120,7 @@ Set-Location ..
 - `security definer` 函数要给调用面收口：`revoke all on function ... from public`，再按需 `grant execute ... to service_role`，否则任何登录用户都能执行（`is_admin()` 是唯一例外，RLS 策略需要它）
 - `admin-api` 必须**保持默认 JWT 校验**（恰好与 `register` 的 `--no-verify-jwt` 相反）
 - 用户列表的「最后登录时间 / 禁用状态」在 `auth.users` 里，PostgREST 读不到（不暴露 auth schema，service_role 也一样）→ 只能用 Admin API `auth.admin.listUsers` 分页取，再与 `public.users` 合并
+- **「首页 200 但页面白屏」**：dev server 返回 HTML 200 不代表能用，入口脚本可能 404 或被 SPA fallback 成 HTML。动过 `vite.admin.config.ts` 的 root 或 HTML 里的脚本路径后，必须跑 `npm run check:admin-dev`，别只看首页状态码
 
 ### Android / APK
 
@@ -151,6 +152,7 @@ Set-Location ..
 
 - **构建**：`npm run build`（App）/ `npm run build:admin`（后台）
 - **后台页面冒烟**：`npm run smoke:admin` —— 用 SSR 把 8 个后台页面各渲染一遍，抓「构建期发现不了」的问题（模板运行时错误、组件名写错被静默渲染成空）
+- **后台预览资源链**：先起 `npm run dev:admin`，再跑 `npm run check:admin-dev` —— 沿 import 递归请求所有模块，抓「首页 200 但白屏」
 - **线上产物连对库没有**：`curl` 首页拿到 `/assets/index-*.js` 路径，抓取该 JS 后 grep 项目 ref，确认是 `.env.production` 里的生产库 ref（而不是测试库的）
 - **云端链路**：写 Node 脚本用 anon key + 测试账号跑一遍「注册 → 建病人 → 写记录 → 邀请成员 → 跨账号可见 → 权限拦截」，比点 UI 更彻底
 - **Edge Function**：`GET /v1/projects/<ref>/functions` 看 status/verify_jwt 是否符合预期
