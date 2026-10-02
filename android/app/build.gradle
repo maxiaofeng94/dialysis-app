@@ -1,5 +1,11 @@
 apply plugin: 'com.android.application'
 
+// CI（GitHub Actions）会设置 DEBUG_KEYSTORE_PATH 指向还原出来的 debug keystore；
+// 本地构建不设该变量，行为与原来完全一致。
+// 不显式指定的话，AGP 在 runner 上会因 ANDROID_USER_HOME/ANDROID_SDK_HOME 而找不到 ~/.android，现场生成新 keystore，
+// 导致 CI 产物与本地签名不一致、手机上必须卸载重装（参见 GITHUB-APK-CI.md §2.3 与坑 1）
+def ciKeystorePath = System.getenv('DEBUG_KEYSTORE_PATH')
+
 android {
     namespace "com.dialysis.record"
     compileSdk rootProject.ext.compileSdkVersion
@@ -14,6 +20,17 @@ android {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
             ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    signingConfigs {
+        debug {
+            // 仅当 CI 传入 DEBUG_KEYSTORE_PATH 时覆盖；buildTypes.debug 默认已引用该签名配置
+            if (ciKeystorePath) {
+                storeFile file(ciKeystorePath)
+                storePassword System.getenv('DEBUG_KEYSTORE_STORE_PASSWORD') ?: 'android'
+                keyAlias System.getenv('DEBUG_KEYSTORE_ALIAS') ?: 'androiddebugkey'
+                keyPassword System.getenv('DEBUG_KEYSTORE_KEY_PASSWORD') ?: 'android'
+            }
         }
     }
     buildTypes {
