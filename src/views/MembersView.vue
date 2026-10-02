@@ -13,7 +13,7 @@ const invitePhone = ref('')
 const inviteRole = ref('caregiver')
 
 const ROLE_LABELS: Record<string, string> = {
-  owner: '主人',
+  owner: '创建者',
   caregiver: '家属/护工',
   doctor: '医生',
   viewer: '只读',
@@ -121,7 +121,7 @@ async function onRemove(m: MemberInfo) {
           </template>
         </div>
       </div>
-      <div class="muted" style="margin-top: 8px">提示：仅「主人」可管理成员与邀请；对方需先用手机号注册登录一次。</div>
+      <div class="muted" style="margin-top: 8px">提示：仅「创建者」可管理成员与邀请；对方需先用手机号注册登录一次。</div>
     </div>
 
     <van-action-sheet v-model:show="roleSheetShow" :actions="roleActions" cancel-text="取消" @select="onRoleSelect" />

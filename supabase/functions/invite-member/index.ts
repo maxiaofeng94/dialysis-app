@@ -52,7 +52,7 @@ Deno.serve(async (req) => {
       .eq('patient_id', patientId)
       .eq('user_id', uid)
       .maybeSingle()
-    if (!caller || caller.role !== 'owner') return json({ error: '仅主人可邀请成员' }, 403)
+    if (!caller || caller.role !== 'owner') return json({ error: '仅创建者可邀请成员' }, 403)
 
     // 按手机号查找已注册用户
     const { data: userRow } = await supabase

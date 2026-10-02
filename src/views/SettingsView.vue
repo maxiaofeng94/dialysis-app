@@ -133,7 +133,7 @@ function calcAgeStr(birthday: string): string {
 }
 
 function roleLabel(role: string): string {
-  const map: Record<string, string> = { owner: '主人', caregiver: '家属/护工', doctor: '医生', viewer: '只读' }
+  const map: Record<string, string> = { owner: '创建者', caregiver: '家属/护工', doctor: '医生', viewer: '只读' }
   return map[role] ?? role
 }
 
