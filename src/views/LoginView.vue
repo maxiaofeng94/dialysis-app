@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast } from 'vant'
 import { useAuth } from '../stores/auth'
@@ -13,14 +13,87 @@ const password = ref('')
 const confirmPassword = ref('')
 const submitting = ref(false)
 
+// ---------- 人机验证（Cloudflare Turnstile，可选） ----------
+// 配置了 VITE_TURNSTILE_SITE_KEY 才启用；未配置时整块不渲染、不加载外部脚本，
+// 与加固前的行为完全一致（服务端此时只靠限流兜底）。
+const turnstileSiteKey = ((import.meta.env.VITE_TURNSTILE_SITE_KEY as string | undefined) ?? '').trim()
+const turnstileEnabled = Boolean(turnstileSiteKey)
+const turnstileToken = ref('')
+const turnstileBox = ref<HTMLElement | null>(null)
+let turnstileWidgetId: string | null = null
+
+const TURNSTILE_SCRIPT = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'
+
+function loadTurnstileScript(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const w = window as unknown as { turnstile?: unknown }
+    if (w.turnstile) return resolve()
+    const existing = document.querySelector<HTMLScriptElement>('script[data-turnstile]')
+    if (existing) {
+      existing.addEventListener('load', () => resolve())
+      existing.addEventListener('error', () => reject(new Error('turnstile script error')))
+      return
+    }
+    const script = document.createElement('script')
+    script.src = TURNSTILE_SCRIPT
+    script.async = true
+    script.defer = true
+    script.dataset.turnstile = '1'
+    script.onload = () => resolve()
+    script.onerror = () => reject(new Error('turnstile script error'))
+    document.head.appendChild(script)
+  })
+}
+
+async function renderTurnstile() {
+  if (!turnstileEnabled || mode.value !== 'register') return
+  try {
+    await loadTurnstileScript()
+    await nextTick()
+    const ts = (window as unknown as { turnstile?: any }).turnstile
+    if (!ts || !turnstileBox.value || turnstileWidgetId) return
+    turnstileWidgetId = ts.render(turnstileBox.value, {
+      sitekey: turnstileSiteKey,
+      callback: (token: string) => {
+        turnstileToken.value = token
+      },
+      'expired-callback': () => {
+        turnstileToken.value = ''
+      },
+      'error-callback': () => {
+        turnstileToken.value = ''
+      },
+    })
+  } catch {
+    // 脚本拉不到时不阻塞提交：服务端仍有限流兜底，失败会给出明确提示
+    turnstileToken.value = ''
+  }
+}
+
+/** 验证 token 一次性：每次提交失败都要作废重来 */
+function resetTurnstile() {
+  turnstileToken.value = ''
+  const ts = (window as unknown as { turnstile?: any }).turnstile
+  if (ts && turnstileWidgetId) {
+    try {
+      ts.reset(turnstileWidgetId)
+    } catch {
+      // ignore
+    }
+  }
+}
+
 onMounted(() => {
   if (initialized.value && isLoggedIn.value) router.replace('/')
+  void renderTurnstile()
 })
 
 function toggleMode() {
   mode.value = mode.value === 'login' ? 'register' : 'login'
   password.value = ''
   confirmPassword.value = ''
+  resetTurnstile()
+  void renderTurnstile()
 }
 
 function validate(): string | null {
@@ -35,17 +108,24 @@ async function onSubmit() {
     showToast(err)
     return
   }
-  submitting.value = true
   if (mode.value === 'register') {
     if (password.value !== confirmPassword.value) {
       showToast('两次输入的密码不一致')
-      submitting.value = false
       return
     }
-    const reg = await register(phone.value, password.value)
+    if (turnstileEnabled && !turnstileToken.value) {
+      showToast('请先完成人机验证')
+      return
+    }
+  }
+
+  submitting.value = true
+  if (mode.value === 'register') {
+    const reg = await register(phone.value, password.value, turnstileToken.value || undefined)
     if (!reg.ok) {
       showToast(reg.message)
       submitting.value = false
+      resetTurnstile()
       return
     }
   }
@@ -72,6 +152,8 @@ async function onSubmit() {
         label="确认密码"
         placeholder="再次输入密码"
       />
+
+      <div v-if="turnstileEnabled && mode === 'register'" ref="turnstileBox" class="turnstile-box"></div>
 
       <van-button type="primary" block :loading="submitting" style="margin-top: 20px" @click="onSubmit">
         {{ mode === 'login' ? '登录' : '注册并登录' }}
@@ -132,5 +214,11 @@ async function onSubmit() {
   font-size: 14px;
   margin-top: 16px;
   cursor: pointer;
+}
+.turnstile-box {
+  display: flex;
+  justify-content: center;
+  margin-top: 16px;
+  min-height: 65px;
 }
 </style>

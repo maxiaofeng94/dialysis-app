@@ -39,9 +39,16 @@ function phoneToEmail(phone: string): string {
   return `${phone}@phone.local`
 }
 
-/** 注册（服务端 createUser，伪邮箱 + 密码） */
-async function register(phone: string, password: string): Promise<{ ok: boolean; message: string }> {
-  const { ok, data } = await callFunction('register', { phone, password })
+/**
+ * 注册（服务端 createUser，伪邮箱 + 密码）
+ * turnstileToken：启用了人机验证时必须带上（未启用时服务端会忽略）
+ */
+async function register(
+  phone: string,
+  password: string,
+  turnstileToken?: string,
+): Promise<{ ok: boolean; message: string }> {
+  const { ok, data } = await callFunction('register', { phone, password, turnstileToken })
   return { ok, message: data?.error ?? '注册成功' }
 }
 

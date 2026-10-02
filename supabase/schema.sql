@@ -384,3 +384,146 @@ grant update (name) on public.users to authenticated;
 -- insert into public.admins(user_id, note)
 -- select id, '初始管理员' from public.users where phone = '13800000000'
 -- on conflict (user_id) do nothing;
+
+-- ============================================================
+-- 注册抗滥用加固（增量，同样可重复执行）
+--
+-- 背景：注册接口对外公开、且不验证手机号归属（产品上保留自助注册），
+--       因此必须把「批量抢占手机号 / 枚举手机号」的成本抬上去：
+--         · 限流：按 IP、手机号、全局三个维度计数，超限 429
+--         · 人机验证：由 Edge Function 校验 Turnstile（可选，见函数注释）
+--         · 手机号收敛：一个账号只能占一个手机号，且不再信任客户端 metadata
+-- ============================================================
+
+-- ---------- 14. 限流计数表 ----------
+create table if not exists public.rate_limits (
+  bucket       text        not null,   -- 用途，如 register:ip
+  key          text        not null,   -- 维度值（IP / 手机号 / all）
+  window_start timestamptz not null,   -- 窗口起点（按窗口长度对齐）
+  count        int         not null default 0,
+  primary key (bucket, key, window_start)
+);
+create index if not exists idx_rate_limits_window on public.rate_limits(window_start);
+
+-- 只有 Edge Function（service_role）读写；开启 RLS 且**不建任何策略**
+alter table public.rate_limits enable row level security;
+
+-- 计数并判定：返回 true = 未超限，false = 应拒绝
+create or replace function public.check_rate_limit(
+  p_bucket text,
+  p_key text,
+  p_max int,
+  p_window_seconds int
+) returns boolean
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  w timestamptz := to_timestamp(floor(extract(epoch from now()) / p_window_seconds) * p_window_seconds);
+  c int;
+begin
+  insert into public.rate_limits (bucket, key, window_start, count)
+  values (p_bucket, p_key, w, 1)
+  on conflict (bucket, key, window_start)
+  do update set count = public.rate_limits.count + 1
+  returning count into c;
+
+  -- 顺手清掉过期窗口（低频执行，避免表无限增长）
+  if random() < 0.02 then
+    delete from public.rate_limits where window_start < now() - interval '2 days';
+  end if;
+
+  return c <= p_max;
+end;
+$$;
+
+revoke all on function public.check_rate_limit(text, text, int, int) from public;
+revoke all on function public.check_rate_limit(text, text, int, int) from anon, authenticated;
+grant execute on function public.check_rate_limit(text, text, int, int) to service_role;
+
+-- ---------- 15. 用户资料：手机号与账号一一对应 ----------
+-- 原先 phone 来自客户端可伪造的 raw_user_meta_data->>'phone'，且 users.phone 无唯一约束：
+--   · 一个邮箱可以写入任意多个手机号；
+--   · 同一个手机号可以出现多行 —— invite-member 用 maybeSingle() 查手机号，多行会直接报错，
+--     等于把「邀请该手机号」这条路径卡死。
+--
+-- 改法：phone 一律取伪邮箱前缀（{手机号}@phone.local），不再信任客户端 metadata；
+--       若该手机号已被占用，则本条资料行的 phone 置空（既不阻断注册，也占不住别人的号）。
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  v_phone text;
+  v_name  text;
+begin
+  v_phone := case
+    when coalesce(new.email, '') like '%@phone.local'
+      then nullif(split_part(new.email, '@', 1), '')
+    else nullif(trim(coalesce(new.raw_user_meta_data->>'phone', '')), '')
+  end;
+
+  v_name := coalesce(
+    nullif(trim(new.raw_user_meta_data->>'name'), ''),
+    v_phone,
+    nullif(split_part(coalesce(new.email, ''), '@', 1), '')
+  );
+
+  begin
+    insert into public.users (id, name, phone)
+    values (new.id, v_name, v_phone)
+    on conflict (id) do nothing;
+  exception when unique_violation then
+    insert into public.users (id, name, phone)
+    values (new.id, v_name, null)
+    on conflict (id) do nothing;
+  end;
+
+  return new;
+end;
+$$;
+
+-- 唯一索引：若库中已有重复 phone，这里只发 notice、不中断脚本（第 16 节给出查重 SQL）
+do $$
+begin
+  create unique index if not exists uniq_users_phone
+    on public.users (phone) where phone is not null;
+exception when unique_violation then
+  raise notice '存在重复 phone，uniq_users_phone 未创建；请先按第 16 节清理重复行，再重跑本脚本。';
+end $$;
+
+-- ---------- 16. 历史脏数据排查（手动执行，仅查询，不改数据） ----------
+-- 16.1 重复手机号（会卡死邀请；确认后保留「注册时间最早」的那行，其余置空）
+--   select phone, count(*), min(created_at), max(created_at)
+--   from public.users where phone is not null group by phone having count(*) > 1;
+--
+-- 16.2 疑似被抢注 / 绕过 App 注册的账号：邮箱未确认（App 注册由 Edge Function 直接确认）
+--   select id, email, email_confirmed_at, created_at, last_sign_in_at
+--   from auth.users where email_confirmed_at is null order by created_at desc;
+--
+-- 16.3 资料行了但从未登录且没有病人（多为批量注册残留）
+--   select u.id, u.phone, u.created_at from public.users u
+--   where u.phone is not null
+--     and not exists (select 1 from public.patient_members m where m.user_id = u.id)
+--   order by u.created_at desc;
+--
+-- 16.4 自检：确认「伪造 metadata.phone 占不到别人的号」真的生效
+--      （整段在事务里跑、最后 rollback，不留任何数据；在 SQL Editor 里执行）
+--   begin;
+--   insert into auth.users (id, email, raw_user_meta_data, created_at, updated_at) values
+--     ('aaaaaaaa-0000-0000-0000-000000000001', '19900000063@phone.local',
+--      '{"phone":"19900000063"}'::jsonb, now(), now()),
+--     ('bbbbbbbb-0000-0000-0000-000000000002', 'attacker@probe.test',
+--      '{"phone":"19900000063"}'::jsonb, now(), now());
+--   select u.id, a.email, u.phone
+--     from public.users u join auth.users a on a.id = u.id
+--    where u.id in ('aaaaaaaa-0000-0000-0000-000000000001','bbbbbbbb-0000-0000-0000-000000000002')
+--    order by u.id;
+--   -- 期望：第一行 phone = 19900000063，第二行 phone 为 NULL（被唯一索引挡住后降级）
+--   rollback;
+--
+-- 16.5 自检：确认限流函数可用（SQL Editor 里以 postgres 身份执行）
+--   select public.check_rate_limit('selftest', 'k', 2, 60) as first_call,   -- true
+--          public.check_rate_limit('selftest', 'k', 2, 60) as second_call,  -- true
+--          public.check_rate_limit('selftest', 'k', 2, 60) as third_call;   -- false（第 3 次超限）

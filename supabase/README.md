@@ -91,11 +91,43 @@ on conflict (user_id) do nothing;
 后台前端是独立入口（`admin/index.html` + `src/admin/**`，Element Plus），构建 `npm run build:admin` 输出 `dist-admin/`，
 完整步骤与验收清单见 `docs/后台管理系统部署指南.md`。
 
+## 四·六、注册抗滥用加固（2026-10-02 新增）
+
+`schema.sql` 第 14～16 节为注册加固增量（幂等）：
+
+- `public.rate_limits` — 限流计数表（**无策略**，只有 service_role 能读写）
+- `public.check_rate_limit(bucket, key, max, window_seconds)` — 原子计数并判定是否超限（**仅 service_role 可执行**）
+- `handle_new_user()` 重写 — 手机号只从伪邮箱前缀取（`{手机号}@phone.local`），**不再信任客户端 metadata**；手机号已被占用时把 `phone` 置空而不是报错
+- `uniq_users_phone` 唯一索引 — 一个手机号只能挂在一个账号上（库里有重复行时只发 notice，先按第 16 节清理）
+
+**部署顺序很重要**：先跑 `schema.sql`（第 14 节），再部署 `register`。新 `register` 在限流不可用时会 **fail closed（503）**，不会带着"其实没限流"的状态放行。
+
+`register` 的限流维度（改常量即可调整）：
+
+| 桶 | 窗口 | 上限 |
+|---|---|---|
+| `register:ip:minute` | 60s | 5 |
+| `register:ip:hour` | 3600s | 20 |
+| `register:global:hour` | 3600s | 300 |
+| `register:phone:hour` | 3600s | 3 |
+
+人机验证（Cloudflare Turnstile，可选）：给函数配 `TURNSTILE_SECRET_KEY` 即启用，前端配 `VITE_TURNSTILE_SITE_KEY`；不配则跳过该步、只靠限流。
+
+```bash
+npx supabase secrets set TURNSTILE_SECRET_KEY=<secret> --project-ref <ref>
+npx supabase functions deploy register --project-ref <ref> --no-verify-jwt --use-api
+node supabase/verify-register-guard.mjs --env .env      # 验证限流真的生效
+```
+
+> ⚠️ 启用 Turnstile 前先在 **APK** 里确认验证码能正常出现：Turnstile 的 site key 需要把 `https://localhost`（Capacitor WebView 的 origin）也加进 Hostnames，否则手机端会卡在"请先完成人机验证"。
+
 ## 五、安全说明
 
 - 密码登录由 Supabase Auth 托管（加密存储），前端用 anon key + RLS 访问；
 - `register`/`create-patient`/`invite-member` 用服务端密钥，负责建号与成员管理；
-- 业务表全部启用 RLS，按 `patient_members` 的角色控制读写权限。
+- 业务表全部启用 RLS，按 `patient_members` 的角色控制读写权限；
+- **注册接口是全网唯一免登录入口**，因此必须自己扛滥用：四道限流 + 可选人机验证（见第四·六节）；
+- 注册**不验证手机号归属**（保留自助注册的代价）。所以「按手机号邀请成员」存在被抢注冒名的风险 —— 缓解手段是限流 + 人机验证 + 邀请后与对方核对姓名/手机号；要根治得改成一次性邀请码或短信验证。
 
 ## 六、成本
 

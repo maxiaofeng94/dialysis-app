@@ -10,7 +10,8 @@
     "dev:admin": "vite --config vite.admin.config.ts",
     "build:admin": "vue-tsc -b && vite build --config vite.admin.config.ts",
     "smoke:admin": "node scripts/smoke-admin.mjs",
-    "check:admin-dev": "node scripts/check-admin-dev.mjs"
+    "check:admin-dev": "node scripts/check-admin-dev.mjs",
+    "verify:register": "node supabase/verify-register-guard.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^6.2.1",
