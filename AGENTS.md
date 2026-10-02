@@ -23,7 +23,15 @@
 - 推送后查结果：`https://api.github.com/repos/maxiaofeng94/dialysis-app/actions/runs?per_page=1`（公开仓库，免 token）
 - 部署完成后**验证线上产物**（见第六节）
 
-### 第 3 步 · 打包 APK
+### 第 3 步 · APK（已自动化，本地打包仅作兜底）
+
+推送后 `.github/workflows/build-apk.yml` 会**自动构建 APK 并发布到 Release**，手机可用固定直链下载安装（签名与本机一致，可覆盖安装）：
+
+```
+https://github.com/maxiaofeng94/dialysis-app/releases/download/latest/dialysis-recorder.apk
+```
+
+只有在**还没推送、或 CI 不可用/需要立即拿包**时，才按下述方式本地构建：
 
 ```powershell
 npm run build                                   # 确保 dist 最新
@@ -59,6 +67,8 @@ Set-Location ..
 | 后端 | `supabase/schema.sql`（可重复执行）+ `supabase/functions/{register,create-patient,invite-member}` |
 | 前端托管 | Cloudflare Pages 项目 `dialysis`，GitHub Actions 自动部署 |
 | 移动端 | Capacitor Android，debug 签名可覆盖安装 |
+| APK 产物 | GitHub Release `latest` 的 `dialysis-recorder.apk`，由 `build-apk.yml` 自动构建；手机直链 https://github.com/maxiaofeng94/dialysis-app/releases/download/latest/dialysis-recorder.apk |
+| APK 签名 | CI 用 secret `ANDROID_DEBUG_KEYSTORE_BASE64` 还原本机 debug keystore（配合 `DEBUG_KEYSTORE_PATH`），保证与本地同签名 |
 
 ---
 
@@ -102,6 +112,8 @@ Set-Location ..
 ### Android / APK
 
 - gradle **必须在 `android` 目录**执行；在项目根跑会报 `Run gradle init to create a new Gradle build in this directory`
+- **`android/gradlew` 必须保持 100755**：Windows 上提交会变成 100644，Linux runner 执行 `./gradlew` 直接 Permission denied；CI 里已加 `chmod +x gradlew` 兜底，但改动权限后仍要 `git ls-files -s android/gradlew` 确认是 100755
+- CI 构建 APK 前**必须先 `npm run build` + `npx cap sync android`**，否则打进包里的 web 产物是旧的（甚至退化成单机版）；workflow 已内置这一步与产物校验
 - `npx cap sync android` 会改写 `android/app/capacitor.build.gradle` 与 `android/capacitor.settings.gradle`（原生插件注册）——**必须一并提交**，否则别人 clone 后构建的 APK 会缺插件（例如 `@capacitor/preferences` 缺失会导致登录态存不住）
 - gradle 即使 `BUILD SUCCESSFUL`，PowerShell 也可能因 stderr 报 `[exit code: 1]`，属正常噪音，看 BUILD 行判断成败
 - 验证产物：`aapt2 dump badging <apk>` 看 versionCode/版本名；解包确认连的是生产库 —— `tar -xf <apk> -C <dir>`（`Expand-Archive` 不接受 `.apk` 扩展名）
@@ -129,5 +141,6 @@ Set-Location ..
 - **线上产物连对库没有**：`curl` 首页拿到 `/assets/index-*.js` 路径，抓取该 JS 后 grep 项目 ref，确认是 `.env.production` 里的生产库 ref（而不是测试库的）
 - **云端链路**：写 Node 脚本用 anon key + 测试账号跑一遍「注册 → 建病人 → 写记录 → 邀请成员 → 跨账号可见 → 权限拦截」，比点 UI 更彻底
 - **Edge Function**：`GET /v1/projects/<ref>/functions` 看 status/verify_jwt 是否符合预期
+- **CI 产出的 APK**：从 Release 直链下载后用 `apksigner verify --print-certs` 对比本机 keystore 指纹，并解包确认 web 产物连的是生产库
 - **数据库结构**：用 Management API 的 `POST /v1/projects/<ref>/database/query` 跑 `information_schema` / `pg_policies` 查询核对
 - 交付结论时给出**可复现的证据**（命令 + 输出），不要只说"应该没问题"
