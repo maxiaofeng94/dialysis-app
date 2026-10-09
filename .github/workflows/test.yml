@@ -56,6 +56,7 @@ jobs:
             {
               echo "exit=$code"
               echo "Unhandled段: $(grep -n 'Unhandled' /tmp/test-output.txt | head -3 | tr '\n' ' ')"
+              echo "Unhandled详情: $(sed -n "$(grep -n 'Unhandled Errors' /tmp/test-output.txt | head -1 | cut -d: -f1),+14p" /tmp/test-output.txt | tr '\n' '~' | cut -c1-900)"
               echo "TestFiles: $(grep -n 'Test Files' /tmp/test-output.txt | head -2 | tr '\n' ' ')"
               echo "Tests行: $(grep -n '^ *Tests ' /tmp/test-output.txt | head -2 | tr '\n' ' ')"
               echo "Duration: $(grep -n 'Duration' /tmp/test-output.txt | head -1 | tr '\n' ' ')"
