@@ -49,18 +49,20 @@ jobs:
           npm run test:coverage > /tmp/test-output.txt 2>&1
           code=$?
           cat /tmp/test-output.txt
+          echo "::notice::vitest exit=$code | 内存：$(free -m | awk 'NR==2{print $3"/"$2" MB used"}')"
           if [ $code -ne 0 ]; then
-            # 只把「失败清单 + 覆盖率总数」转成注解，避免被长长的覆盖率表格冲掉
+            # 失败时把关键信息转成注解：GitHub 的完整日志要登录才能看，
+            # check-run annotations 通过 API 就能读到（公开仓库免 token）。
             {
               echo "=== exit=$code ==="
-              echo "=== 诊断 A：不带覆盖率的退出码 ==="
-              npx vitest run > /tmp/t2.txt 2>&1
-              echo "vitest(无 --coverage) exit=$?"
-              tail -6 /tmp/t2.txt
-              echo "=== 诊断 B：带覆盖率输出的最后 8 行 ==="
-              tail -8 /tmp/test-output.txt
+              echo "=== 内存 ==="
+              free -m
+              echo "=== 是否有进程被 OOM 杀掉 ==="
+              (dmesg 2>/dev/null | grep -iE "killed process|out of memory" | tail -5) || echo "(dmesg 不可读)"
+              echo "=== vitest 输出末尾 6 行 ==="
+              tail -6 /tmp/test-output.txt
               echo "=== 失败 / 阈值摘要 ==="
-              grep -nE "^ *(FAIL|❯|×)|ERROR:|does not meet|Test Files|Tests  " /tmp/test-output.txt | head -20
+              grep -nE "^ *(FAIL|❯|×)|ERROR:|does not meet|Test Files|Tests  |Unhandled" /tmp/test-output.txt | head -20
               echo "=== 覆盖率 All files ==="
               grep -E "All files" /tmp/test-output.txt | head -3
             } | sed 's/^/::error::/'

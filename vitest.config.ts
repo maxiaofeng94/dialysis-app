@@ -39,6 +39,10 @@ export default defineConfig({
     },
     // 视图/仓储用例之间通过 IndexedDB 隔离，禁止并发写同一个库
     fileParallelism: true,
+    // CI runner 只有 2 核 / 7GB，43 个 jsdom 环境同时起容易把内存吃满；
+    // 现象是「所有测试都通过、但 vitest 退出码为 1」（进程被 OOM 干掉时输出已刷完）。
+    // 同一提交在不同 workflow 里一次失败一次成功，就是这个原因。CI 上降到 4 并发，本地全速。
+    ...(process.env.CI ? { maxWorkers: 4, minWorkers: 1 } : {}),
     testTimeout: 15000,
     coverage: {
       provider: 'v8',
