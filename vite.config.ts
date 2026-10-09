@@ -24,5 +24,21 @@ export default defineConfig({
       },
     }),
   ],
-  server: { host: true, port: 5173 },
+  server: {
+    host: true,
+    port: 5173,
+    // Windows 下编辑文件会留下被锁的临时文件（*.tmpdir），watcher 撞上会直接崩：
+    // Error: EBUSY: resource busy or locked, watch '...\.build-apk.yml.xxx.tmpdir\...'
+    // 这些目录本来也不需要热更新，直接不监视（与 vite.admin.config.ts 保持一致）
+    watch: {
+      ignored: [
+        '**/supabase/**',
+        '**/.github/**',
+        '**/dist/**',
+        '**/dist-admin/**',
+        '**/android/**',
+        '**/*.tmpdir/**',
+      ],
+    },
+  },
 })
