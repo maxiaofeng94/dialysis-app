@@ -61,6 +61,8 @@ jobs:
               (dmesg 2>/dev/null | grep -iE "killed process|out of memory" | tail -5) || echo "(dmesg 不可读)"
               echo "=== vitest 输出末尾 6 行 ==="
               tail -6 /tmp/test-output.txt
+              echo "=== vitest 输出开头 100 行（Unhandled Errors 段在总结之前）==="
+              head -100 /tmp/test-output.txt
               echo "=== 失败 / 阈值摘要 ==="
               grep -nE "^ *(FAIL|❯|×)|ERROR:|does not meet|Test Files|Tests  |Unhandled" /tmp/test-output.txt | head -20
               echo "=== 覆盖率 All files ==="
