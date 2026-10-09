@@ -1,5 +1,8 @@
 {
   "appId": "com.dialysis.record",
   "appName": "DialysisRecorder",
-  "webDir": "dist"
+  "webDir": "dist",
+  "android": {
+    "webContentsDebuggingEnabled": false
+  }
 }

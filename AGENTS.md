@@ -41,11 +41,15 @@ $env:ANDROID_HOME = "D:\ai\project\android-sdk"
 $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
 $env:JAVA_HOME = "D:\Program Files\jdk-17.0.14"
 Set-Location android                            # 必须进 android 目录
+# 应急兜底（debug 包，debuggable=true，仅本地自测用）：
 & "D:\ai\project\android-build\gradle\gradle-8.7\bin\gradle.bat" assembleDebug --console=plain
+# 要与线上一致的 release 包（debuggable=false；签名沿用本机 keystore，可与 CI 产物互相覆盖）：
+$env:KEYSTORE_PATH = "$env:USERPROFILE\.android\debug.keystore"
+& "D:\ai\project\android-build\gradle\gradle-8.7\bin\gradle.bat" assembleRelease --console=plain
 Set-Location ..
 ```
 
-- 产物 `android/app/build/outputs/apk/debug/app-debug.apk` → 复制到项目根，命名 `透析记录-多人版-<版本>.apk`，用 `present` 交付
+- 产物：debug 包在 `android/app/build/outputs/apk/debug/app-debug.apk`，release 包在 `android/app/build/outputs/apk/release/app-release.apk` → 复制到项目根，命名 `透析记录-多人版-<版本>.apk`，用 `present` 交付
 - 功能有变化时递增 `android/app/build.gradle` 的 `versionCode` / `versionName`
 - 交付时提醒用户：**覆盖安装，不要卸载**（卸载会清空 App 本地数据）
 
@@ -70,9 +74,9 @@ Set-Location ..
 | 前端托管 | Cloudflare Pages 项目 `dialysis`，GitHub Actions（`deploy.yml`）自动部署 |
 | 后台托管 | Cloudflare Pages 项目 `dialysis-admin`（https://dialysis-admin.pages.dev ），由 `deploy-admin.yml` 自动部署；产物 `dist-admin/`，**不进 APK** |
 | 管理员名单 | Supabase 表 `public.admins`（后台无自助提权入口，首个管理员用 SQL Editor 手动 insert） |
-| 移动端 | Capacitor Android，debug 签名可覆盖安装 |
+| 移动端 | Capacitor Android；CI 出的是 **release** 包（`debuggable=false`，关掉 WebView 远程调试与 run-as 取数），与本地兜底的 debug 包**同一 keystore**、可互相覆盖安装 |
 | APK 产物 | GitHub Release `latest` 的 `dialysis-recorder.apk`，由 `build-apk.yml` 自动构建；手机直链 https://github.com/maxiaofeng94/dialysis-app/releases/download/latest/dialysis-recorder.apk |
-| APK 签名 | CI 用 secret `ANDROID_DEBUG_KEYSTORE_BASE64` 还原本机 debug keystore（配合 `DEBUG_KEYSTORE_PATH`），保证与本地同签名 |
+| APK 签名 | CI 用 secret `ANDROID_DEBUG_KEYSTORE_BASE64` 还原**本机既有的 keystore**，通过 `KEYSTORE_PATH` 交给 Gradle（`DEBUG_KEYSTORE_PATH` 仍兼容），debug 与 release 同源。⚠️ 换掉这份密钥材料 = 换证书 = 用户必须卸载重装（会丢 App 本地数据） |
 
 ---
 

@@ -47,22 +47,19 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "token 长度: ${#CLOUDFLARE_API_TOKEN}（本项目的 token 为 51 位；明显偏大说明值里混入了引号或换行）"
-          echo "token 前缀: ${CLOUDFLARE_API_TOKEN:0:13}...（本项目应为 cfut_zvmZnjY...）"
-          echo "配置的 account id: [$CLOUDFLARE_ACCOUNT_ID]"
+          # 只做校验、不回显任何片段：本仓库是公开仓库，Actions 日志人人可看
           resp=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" https://api.cloudflare.com/client/v4/user/tokens/verify)
-          echo "token 校验: $resp"
           if ! printf '%s' "$resp" | grep -q '"success":true'; then
             echo "::error::Cloudflare API Token 无效或已过期，请检查 secret CLOUDFLARE_API_TOKEN 的值（不要带引号）"
             exit 1
           fi
+          echo "✅ Token 校验通过"
           acc=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" https://api.cloudflare.com/client/v4/accounts)
-          echo "该 Token 可见的账号（id / name）："
-          printf '%s' "$acc" | tr ',{' '\n\n' | grep -E '"(id|name)"' | head -20
           if ! printf '%s' "$acc" | grep -q "$CLOUDFLARE_ACCOUNT_ID"; then
-            echo "::error::上面的账号列表里没有 $CLOUDFLARE_ACCOUNT_ID，请把 secret CLOUDFLARE_ACCOUNT_ID 改成列表里出现的那个 id"
+            echo "::error::该 Token 看不到 CLOUDFLARE_ACCOUNT_ID 对应的账号，请核对 secret 的值"
             exit 1
           fi
+          echo "✅ 账号 ID 校验通过"
           echo "凭据自检通过 ✅"
         id: creds
 

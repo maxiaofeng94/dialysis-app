@@ -25,32 +25,13 @@
 //   未设置则该步自动跳过，只剩上面四道限流兜底。
 // ============================================================
 import { createClient } from 'npm:@supabase/supabase-js@2'
+import { preflight, jsonResponse } from '../_shared/cors.ts'
 
 const supabase = createClient(
   Deno.env.get('SUPABASE_URL')!,
   Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
   { auth: { persistSession: false } },
 )
-
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-}
-
-function json(data: unknown, status = 200, extra: Record<string, string> = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders, ...extra },
-  })
-}
-
-function tooMany(retryAfter: number) {
-  return json({ error: '操作过于频繁，请稍后再试' }, 429, { 'Retry-After': String(retryAfter) })
-}
-
-const SERVICE_BUSY = () =>
-  json({ error: '注册服务暂时不可用，请稍后再试' }, 503)
 
 interface Rule {
   bucket: string
@@ -122,7 +103,14 @@ async function verifyTurnstile(token: unknown, ip: string): Promise<boolean> {
 }
 
 Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
+  // CORS 头按 Origin 白名单下发（见 _shared/cors.ts）
+  const json = (data: unknown, status = 200, extra: Record<string, string> = {}) =>
+    jsonResponse(req, data, status, extra)
+  const tooMany = (retryAfter: number) =>
+    json({ error: '操作过于频繁，请稍后再试' }, 429, { 'Retry-After': String(retryAfter) })
+  const serviceBusy = () => json({ error: '注册服务暂时不可用，请稍后再试' }, 503)
+
+  if (req.method === 'OPTIONS') return preflight(req)
   if (req.method !== 'POST') return json({ error: 'Method Not Allowed' }, 405)
 
   try {
@@ -130,12 +118,12 @@ Deno.serve(async (req) => {
 
     // ① IP 维度：放在参数校验之前，扫描/试探也要计数
     const ipState = await checkRules(IP_RULES, ip)
-    if (ipState === 'error') return SERVICE_BUSY()
+    if (ipState === 'error') return serviceBusy()
     if (ipState === 'limited') return tooMany(60)
 
     // ② 全局兜底
     const globalState = await checkRules(GLOBAL_RULES, 'all')
-    if (globalState === 'error') return SERVICE_BUSY()
+    if (globalState === 'error') return serviceBusy()
     if (globalState === 'limited') return tooMany(300)
 
     const body = (await req.json().catch(() => ({}))) as {
@@ -152,7 +140,7 @@ Deno.serve(async (req) => {
 
     // ③ 手机号维度：同一号码反复注册直接拒（也顺带压住枚举速率）
     const phoneState = await checkRules(PHONE_RULES, phone!)
-    if (phoneState === 'error') return SERVICE_BUSY()
+    if (phoneState === 'error') return serviceBusy()
     if (phoneState === 'limited') return tooMany(3600)
 
     // ④ 人机验证（未配置 Turnstile 时自动跳过）

@@ -121,6 +121,13 @@ node supabase/verify-register-guard.mjs --env .env      # 验证限流真的生�
 
 > ⚠️ 启用 Turnstile 前先在 **APK** 里确认验证码能正常出现：Turnstile 的 site key 需要把 `https://localhost`（Capacitor WebView 的 origin）也加进 Hostnames，否则手机端会卡在"请先完成人机验证"。
 
+## 四·七、接口与响应头加固（2026-10-02 阶段 B）
+
+- **CORS 白名单**：四个 Edge Function 统一改用 `supabase/functions/_shared/cors.ts`，只给白名单内的 Origin 回 CORS 头（线上 App / 后台 / 本地 `5173`·`5174` / Capacitor 的 `https://localhost` 与 `capacitor://localhost` / Pages 预览域名）。没有 Origin 的请求（curl、Node 脚本、服务端调用）照常处理 —— CORS 本来就不是服务端防护。
+  新增部署域名时改 `ALLOWED_ORIGINS` / `PREVIEW_SUFFIXES`，再重新部署用到它的函数。
+- **`sessions` 记录人防伪**：insert / update 的 `with check` 增加 `operator_id = auth.uid()`，任何成员都无法把「记录人」写成别人（前端 `saveSession` 本来就填当前用户，行为不变）。
+- **安全响应头**：`public/_headers` 随构建进两个产物（App 与后台），下发 CSP / X-Frame-Options / HSTS / Referrer-Policy / Permissions-Policy。CSP 的 `connect-src` **精确到生产库 ref**，换库时必须同步改，否则前端所有请求会被 CSP 拦下。
+
 ## 五、安全说明
 
 - 密码登录由 Supabase Auth 托管（加密存储），前端用 anon key + RLS 访问；

@@ -1,0 +1,17 @@
+# Cloudflare Pages 响应头（App 与后台管理端共用这一份；构建时由 Vite 从 public/ 复制到产物根目录）
+#
+# 说明：
+#   · CSP 里 connect-src 精确到生产库 ref（vbamprkcwrpsazkyknjq.supabase.co）；
+#     换库时记得同步改这里，否则前端连不上 Supabase（表现为所有请求被 CSP 拦下）。
+#   · challenges.cloudflare.com 只有启用 Cloudflare Turnstile 人机验证时才用得到，
+#     不打算启用可以删掉 script-src / connect-src / frame-src 里的这一项。
+#   · 产物里没有内联 <script>、没有 eval/new Function（已核对），所以 script-src 不需要 'unsafe-inline'；
+#     style-src 必须保留 'unsafe-inline'，Vue 的 :style 绑定与 Vant/Element Plus 都依赖它。
+
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: geolocation=(), camera=(), microphone=(), payment=(), usb=(), magnetometer=(), gyroscope=()
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  Content-Security-Policy: default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://vbamprkcwrpsazkyknjq.supabase.co wss://vbamprkcwrpsazkyknjq.supabase.co https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; manifest-src 'self'; worker-src 'self' blob:

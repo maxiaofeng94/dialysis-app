@@ -195,14 +195,24 @@ create policy dw_update on public.dry_weights for update using (public.is_member
 create policy dw_delete on public.dry_weights for delete using (public.is_member(patient_id, array['owner']));
 
 -- 透析记录：所有成员可看；owner/caregiver 可增删改
+-- operator_id 必须等于调用者本人：否则任何 caregiver 都能把「记录人」写成别人，
+-- 让"谁记录的"失去审计意义（前端 saveSession 本来就会填当前用户，行为不变）
 alter table public.sessions enable row level security;
 drop policy if exists sessions_select on public.sessions;
 drop policy if exists sessions_insert on public.sessions;
 drop policy if exists sessions_update on public.sessions;
 drop policy if exists sessions_delete on public.sessions;
 create policy sessions_select on public.sessions for select using (public.is_member(patient_id));
-create policy sessions_insert on public.sessions for insert with check (public.is_member(patient_id, array['owner','caregiver']));
-create policy sessions_update on public.sessions for update using (public.is_member(patient_id, array['owner','caregiver']));
+create policy sessions_insert on public.sessions for insert with check (
+  public.is_member(patient_id, array['owner','caregiver'])
+  and operator_id = auth.uid()
+);
+create policy sessions_update on public.sessions for update
+  using (public.is_member(patient_id, array['owner','caregiver']))
+  with check (
+    public.is_member(patient_id, array['owner','caregiver'])
+    and operator_id = auth.uid()
+  );
 create policy sessions_delete on public.sessions for delete using (public.is_member(patient_id, array['owner','caregiver']));
 
 -- 血压：通过 session 关联病人

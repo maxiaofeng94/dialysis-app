@@ -3,6 +3,7 @@
 // 部署：supabase functions deploy create-patient
 // ============================================================
 import { createClient } from 'npm:@supabase/supabase-js@2'
+import { preflight, jsonResponse } from '../_shared/cors.ts'
 
 const supabase = createClient(
   Deno.env.get('SUPABASE_URL')!,
@@ -10,21 +11,11 @@ const supabase = createClient(
   { auth: { persistSession: false } },
 )
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-}
-
-function json(data: unknown, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders },
-  })
-}
-
 Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
+  // CORS 头按 Origin 白名单下发（见 _shared/cors.ts）
+  const json = (data: unknown, status = 200) => jsonResponse(req, data, status)
+
+  if (req.method === 'OPTIONS') return preflight(req)
   if (req.method !== 'POST') return json({ error: 'Method Not Allowed' }, 405)
 
   try {

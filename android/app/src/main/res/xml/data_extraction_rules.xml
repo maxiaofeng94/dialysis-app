@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12+（targetSdk 31 起）用这份规则取代 allowBackup：
+  allowBackup=false 已经关闭备份，这里再显式排除敏感目录，双保险。
+  · shared_prefs/  —— Capacitor Preferences 落在这里，内含 Supabase 会话（access + refresh token）
+  · app_webview/   —— WebView 数据目录，本地缓存里有病历缓存（dialysis-cloud-cache）
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="app_webview" />
+        <exclude domain="database" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="app_webview" />
+        <exclude domain="database" path="." />
+    </device-transfer>
+</data-extraction-rules>

@@ -40,6 +40,21 @@ export async function restorePatientId(): Promise<void> {
 }
 
 /**
+ * 清除「当前病人」的本机记忆（登出 / 凭证失效时调用）。
+ * 不清的话，下一个在这台设备上登录的账号如果拉取病人列表失败（离线、网络抖动），
+ * 会拿着上一个账号的 patientId 命中缓存，显示别人的档案与记录。
+ */
+export async function clearCurrentPatient(): Promise<void> {
+  currentPatientId.value = DEFAULT_PATIENT_ID
+  try {
+    if (isNative) await Preferences.remove({ key: STORAGE_KEY })
+    else localStorage.removeItem(STORAGE_KEY)
+  } catch {
+    // 清不掉也不影响主流程
+  }
+}
+
+/**
  * 校准当前病人（仅云端模式，登录后调用）：
  * - 上次选中的病人不在「我的病人」里（首次登录 / 换账号 / 被移出成员）→ 自动选第一个；
  * - 一个病人都没有 → 保持现状，由页面引导「新建病人」或「上传本地数据」。

@@ -1,10 +1,27 @@
 apply plugin: 'com.android.application'
 
-// CI（GitHub Actions）会设置 DEBUG_KEYSTORE_PATH 指向还原出来的 debug keystore；
-// 本地构建不设该变量，行为与原来完全一致。
-// 不显式指定的话，AGP 在 runner 上会因 ANDROID_USER_HOME/ANDROID_SDK_HOME 而找不到 ~/.android，现场生成新 keystore，
-// 导致 CI 产物与本地签名不一致、手机上必须卸载重装（参见 GITHUB-APK-CI.md §2.3 与坑 1）
-def ciKeystorePath = System.getenv('DEBUG_KEYSTORE_PATH')
+// CI（GitHub Actions）会把本机 keystore 还原到 runner 上，并通过环境变量把路径交给 Gradle。
+//
+// 关键约定：**debug 与 release 用同一份 keystore**。
+// 签名证书决定"能不能覆盖安装"——换了证书，用户必须卸载重装，而卸载会清空 App 本地数据。
+// 所以这里不新生成 release 密钥，沿用既有密钥材料，只把构建类型从 debug 换成 release
+// （release 构建 debuggable=false，关掉 WebView 远程调试与 run-as 取数）。
+//
+// 本地不设这些变量时：debug 仍走 AGP 默认的 ~/.android/debug.keystore；
+// release 因拿不到 keystore 而不签名（本地构建请继续用 assembleDebug）。
+def ciKeystorePath =
+    System.getenv('KEYSTORE_PATH') ?:
+    System.getenv('DEBUG_KEYSTORE_PATH') ?:
+    System.getenv('RELEASE_KEYSTORE_PATH')
+def ciStorePassword =
+    System.getenv('KEYSTORE_STORE_PASSWORD') ?:
+    System.getenv('DEBUG_KEYSTORE_STORE_PASSWORD') ?: 'android'
+def ciKeyAlias =
+    System.getenv('KEYSTORE_ALIAS') ?:
+    System.getenv('DEBUG_KEYSTORE_ALIAS') ?: 'androiddebugkey'
+def ciKeyPassword =
+    System.getenv('KEYSTORE_KEY_PASSWORD') ?:
+    System.getenv('DEBUG_KEYSTORE_KEY_PASSWORD') ?: 'android'
 
 android {
     namespace "com.dialysis.record"
@@ -13,8 +30,8 @@ android {
         applicationId "com.dialysis.record"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 6
-        versionName "1.5"
+        versionCode 7
+        versionName "1.6"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -24,12 +41,21 @@ android {
     }
     signingConfigs {
         debug {
-            // 仅当 CI 传入 DEBUG_KEYSTORE_PATH 时覆盖；buildTypes.debug 默认已引用该签名配置
+            // 仅当 CI 传入 keystore 路径时覆盖；buildTypes.debug 默认已引用该签名配置
             if (ciKeystorePath) {
                 storeFile file(ciKeystorePath)
-                storePassword System.getenv('DEBUG_KEYSTORE_STORE_PASSWORD') ?: 'android'
-                keyAlias System.getenv('DEBUG_KEYSTORE_ALIAS') ?: 'androiddebugkey'
-                keyPassword System.getenv('DEBUG_KEYSTORE_KEY_PASSWORD') ?: 'android'
+                storePassword ciStorePassword
+                keyAlias ciKeyAlias
+                keyPassword ciKeyPassword
+            }
+        }
+        release {
+            // 与 debug 同源：保证签名指纹不变，老用户可直接覆盖安装
+            if (ciKeystorePath) {
+                storeFile file(ciKeystorePath)
+                storePassword ciStorePassword
+                keyAlias ciKeyAlias
+                keyPassword ciKeyPassword
             }
         }
     }
@@ -37,6 +63,10 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            // 拿到 keystore 才签名；否则保持"未签名 release"，不影响本地 assembleDebug
+            if (ciKeystorePath) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 }

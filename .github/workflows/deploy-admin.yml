@@ -13,6 +13,7 @@ on:
     paths:
       - 'admin/**'
       - 'src/admin/**'
+      - 'public/**' # 安全响应头 public/_headers 也在产物里，改它必须重部署后台
       - 'vite.admin.config.ts'
       - 'package.json'
       - 'package-lock.json'
