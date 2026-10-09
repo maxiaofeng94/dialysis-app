@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { showToast } from 'vant'
 import html2canvas from 'html2canvas'
 import { Capacitor } from '@capacitor/core'
 import { Share } from '@capacitor/share'
@@ -30,6 +31,10 @@ const reportEl = ref<HTMLDivElement>()
 
 /** 首次加载（本机还没有缓存）时的骨架占位 */
 const loading = ref(true)
+/** 加载失败（网络/权限/服务端报错）——与「确实没有这条记录」是两码事 */
+const loadError = ref(false)
+/** 分享进行中：防连点（html2canvas 很重，连点会并发跑多次） */
+const sharing = ref(false)
 
 onMounted(load)
 
@@ -40,28 +45,39 @@ watch(cacheVersion, () => {
 
 async function load() {
   const pid = currentPatientId.value
-  // 七个请求并行发出（原来串行，要等七次网络往返）
-  const [s, p, dw, bp, bg, bf, ar] = await Promise.all([
-    repository.getSession(sessionId),
-    repository.getPatient(pid),
-    repository.listDryWeights(pid),
-    repository.listBloodPressures(sessionId),
-    repository.listBloodGlucoses(sessionId),
-    repository.listBloodFlows(sessionId),
-    repository.listAdverseReactions(sessionId),
-  ])
-  session.value = s ?? null
-  if (!session.value) {
-    router.replace('/')
-    return
+  loadError.value = false
+  try {
+    // 七个请求并行发出（原来串行，要等七次网络往返）
+    const [s, p, dw, bp, bg, bf, ar] = await Promise.all([
+      repository.getSession(sessionId),
+      repository.getPatient(pid),
+      repository.listDryWeights(pid),
+      repository.listBloodPressures(sessionId),
+      repository.listBloodGlucoses(sessionId),
+      repository.listBloodFlows(sessionId),
+      repository.listAdverseReactions(sessionId),
+    ])
+    session.value = s ?? null
+    if (!session.value) {
+      // 读接口查询失败会抛错（走 catch），能走到这里就是「确实不存在」→ 回首页
+      router.replace('/')
+      return
+    }
+    patient.value = p ?? null
+    dryWeights.value = dw
+    bps.value = bp
+    glucoses.value = bg
+    flows.value = bf
+    reactions.value = ar
+  } catch (err) {
+    // 加载失败就停在页面上给重试，绝不能当成「记录不存在」静默跳回首页（用户会以为记录丢了）
+    console.error(err)
+    loadError.value = true
+    // 已经有渲染好的报告时（后台刷新失败），保留旧报告只提示一句，别把内容换成一屏错误
+    if (session.value) showToast('报告刷新失败，请检查网络后重试')
+  } finally {
+    loading.value = false // 抛错也一定要收掉骨架，否则页面永久转圈
   }
-  patient.value = p ?? null
-  dryWeights.value = dw
-  bps.value = bp
-  glucoses.value = bg
-  flows.value = bf
-  reactions.value = ar
-  loading.value = false
 }
 
 const comp = computed(() => {
@@ -69,6 +85,9 @@ const comp = computed(() => {
   const dry = getEffectiveDryWeight(dryWeights.value, session.value.date)
   return computeSession(session.value, dry)
 })
+
+/** 致命错误：一条记录都没加载出来（后台刷新失败但已有报告时不算） */
+const blockingError = computed(() => loadError.value && !session.value)
 
 // 医生设定脱水量（存储为 ml，报告按 L 展示）
 const doctorUfL = computed(() => (session.value?.doctorUf != null ? session.value.doctorUf / 1000 : null))
@@ -135,6 +154,23 @@ function downloadDataUrl(url: string, name: string) {
   a.click()
 }
 
+/** 分享入口可用状态：骨架期 / 加载失败 / 正在分享 都不可点 */
+const shareDisabled = computed(() => loading.value || blockingError.value || sharing.value)
+
+/**
+ * 当前浏览器能不能分享「图片文件」。
+ * canShare 不存在或不认 files 时都为 false —— 这时不能静默降级成「只发一段文字」。
+ */
+function canShareImage(file: File): boolean {
+  const nav = navigator as Navigator & { canShare?: (data?: ShareData) => boolean }
+  if (typeof nav.share !== 'function' || typeof nav.canShare !== 'function') return false
+  try {
+    return nav.canShare({ files: [file] })
+  } catch {
+    return false
+  }
+}
+
 async function writeImageNative(): Promise<string> {
   const canvas = await capture()
   const base64 = canvas.toDataURL('image/png').split(',')[1] ?? ''
@@ -148,6 +184,8 @@ async function writeImageNative(): Promise<string> {
 }
 
 async function share() {
+  if (shareDisabled.value) return // 防连点：重复进来说明界面还没就绪
+  sharing.value = true
   try {
     if (isNative) {
       const uri = await writeImageNative()
@@ -155,22 +193,29 @@ async function share() {
     } else {
       const canvas = await capture()
       const blob = await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png')
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('生成图片失败'))), 'image/png')
       })
       const file = new File([blob], reportFilename(), { type: 'image/png' })
-      if (navigator.share) {
-        if (navigator.canShare && navigator.canShare({ files: [file] })) {
-          await navigator.share({ files: [file], title: '透析报告' })
-        } else {
-          await navigator.share({ title: '透析报告', text: summaryText.value })
-        }
+      if (canShareImage(file)) {
+        await navigator.share({ files: [file], title: '透析报告', text: summaryText.value })
       } else {
+        // 浏览器不支持分享图片：退化为下载图片 + 明确告知，
+        // 不能静默降级成「只发一段文字」，用户会以为图片发出去了。
         downloadDataUrl(canvas.toDataURL('image/png'), reportFilename())
+        showToast(
+          typeof navigator.share === 'function'
+            ? '当前浏览器不支持分享图片，已下载报告图片，可从下载目录发送'
+            : '报告图片已下载，可从下载目录发送给医生',
+        )
       }
     }
   } catch (err) {
-    // 用户取消分享等，忽略
+    // 用户主动取消（AbortError）与真正的失败要分开说，但都不能静默
     console.error(err)
+    if ((err as { name?: string } | null)?.name === 'AbortError') showToast('已取消分享')
+    else showToast('分享失败，请检查网络后重试')
+  } finally {
+    sharing.value = false
   }
 }
 </script>
@@ -179,7 +224,16 @@ async function share() {
   <div class="page">
     <van-nav-bar class="no-print" title="透析报告" left-text="返回" left-arrow @click-left="router.back()">
       <template #right>
-        <van-icon name="share-o" size="22" color="#07c160" style="cursor: pointer" @click="share" />
+        <!-- 骨架期/加载失败/正在分享时不给点：点了也是白点，还会并发跑多次截图 -->
+        <van-icon
+          v-if="!shareDisabled"
+          name="share-o"
+          size="22"
+          color="#07c160"
+          style="cursor: pointer"
+          @click="share"
+        />
+        <van-icon v-else name="share-o" size="22" color="#c8c9cc" style="cursor: not-allowed" />
       </template>
     </van-nav-bar>
 
@@ -188,7 +242,14 @@ async function share() {
       <van-skeleton title :row="8" />
     </div>
 
-    <template v-if="!loading">
+    <!-- 加载失败：停在页面给重试，不要静默跳回首页（用户会以为记录没了） -->
+    <div v-if="!loading && blockingError" class="card" style="margin-top: 12px">
+      <van-empty image="error" description="报告加载失败，请检查网络后重试">
+        <van-button type="primary" round size="small" @click="load">重试</van-button>
+      </van-empty>
+    </div>
+
+    <template v-if="!loading && !blockingError">
     <div ref="reportEl" style="background: #fff; border-radius: 10px; padding: 16px">
       <div style="text-align: center; margin-bottom: 14px">
         <div style="font-size: 18px; font-weight: 700">透析报告</div>

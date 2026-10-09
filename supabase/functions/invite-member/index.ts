@@ -20,11 +20,19 @@ Deno.serve(async (req) => {
   if (req.method !== 'POST') return json({ error: 'Method Not Allowed' }, 405)
 
   try {
-    const { patientId, phone, role } = await req.json()
-    if (!patientId || !/^1[3-9]\d{9}$/.test(phone ?? '')) {
+    // 请求体不是合法 JSON 时按空对象处理 → 走参数校验回 400，而不是抛异常变 500
+    const body = (await req.json().catch(() => ({}))) as Record<string, unknown>
+
+    // patientId 必须 trim：空白串以前能过校验，之后查不到成员关系 → 回 403「仅创建者可邀请成员」，
+    // 把一个「参数没填对」说成了「你没权限」，排查方向被带偏。
+    const patientId = typeof body.patientId === 'string' ? body.patientId.trim() : ''
+    const phone = typeof body.phone === 'string' ? body.phone.trim() : ''
+    if (!patientId || !/^1[3-9]\d{9}$/.test(phone)) {
       return json({ error: '参数不正确' }, 400)
     }
-    const targetRole = role ?? 'caregiver'
+
+    const role = body.role
+    const targetRole = typeof role === 'string' && role ? role : 'caregiver'
     if (!['owner', 'caregiver', 'doctor', 'viewer'].includes(targetRole)) {
       return json({ error: '角色不正确' }, 400)
     }

@@ -6,10 +6,10 @@ import { api, messageOf } from '../lib/api'
 import {
   fmtDate,
   fmtDateTime,
+  maskName,
   roleLabel,
   roleTagType,
   ROLE_OPTIONS,
-  ROLE_OPTIONS_WITH_OWNER,
   sinceText,
 } from '../lib/format'
 import type { PatientDetail } from '../lib/types'
@@ -102,14 +102,18 @@ async function doAddMember() {
 
 // ---- 成员操作 ----
 async function changeRole(userId: string, role: string) {
+  // 下拉里不含「创建者」：转移创建者只能走「设为创建者」（有确认，服务端会降级原创建者），
+  // 否则一个病人会出现两个 owner，「唯一创建者」的保护全部失效。
+  if (role === 'owner') return
   busy.value = true
   try {
     await api.setMemberRole(patientId.value, userId, role)
     ElMessage.success('角色已更新')
-    await load()
   } catch (err) {
     ElMessage.error(messageOf(err))
   } finally {
+    // 失败时下拉还停在没生效的新值上，用服务端真值回填
+    await load()
     busy.value = false
   }
 }
@@ -120,6 +124,7 @@ async function removeMember(userId: string, label: string) {
       type: 'warning',
       confirmButtonText: '确定',
       cancelButtonText: '取消',
+      autofocus: false,
     })
   } catch {
     return
@@ -141,7 +146,7 @@ async function makeOwner(userId: string, label: string) {
     await ElMessageBox.confirm(
       `将把「${label}」设为该病人的创建者；若原创建者只有一个，会降为「家属/护工」。确定？`,
       '转移创建者',
-      { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消' },
+      { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消', autofocus: false },
     )
   } catch {
     return
@@ -243,15 +248,20 @@ async function doDeletePatient() {
         </el-table-column>
         <el-table-column label="改角色" width="150">
           <template #default="{ row }">
+            <!-- 下拉里没有「创建者」：否则一点就静默多出一个 owner。
+                 创建者行不给下拉（Element Plus 对没有匹配选项的值会直接显示 'owner'），
+                 转移创建者走带确认的「设为创建者」。 -->
             <el-select
+              v-if="row.role !== 'owner'"
               :model-value="row.role"
               size="small"
               style="width: 130px"
               :disabled="busy"
               @change="changeRole(row.userId, String($event))"
             >
-              <el-option v-for="o in ROLE_OPTIONS_WITH_OWNER" :key="o.value" :label="o.label" :value="o.value" />
+              <el-option v-for="o in ROLE_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
             </el-select>
+            <span v-else class="muted" style="font-size: 12px">创建者（用「设为创建者」转移）</span>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="200" fixed="right">
@@ -323,15 +333,17 @@ async function doDeletePatient() {
     </el-dialog>
 
     <!-- 删除病人 -->
-    <el-dialog v-model="delShow" title="删除病人" width="480px">
+    <el-dialog v-model="delShow" title="删除病人" width="480px" :close-on-click-modal="false" :close-on-press-escape="false">
       <el-alert
         type="error"
         :closable="false"
         title="该操作不可恢复"
-        :description="`将删除「${detail?.patient.name ?? ''}」及其全部透析记录与成员关系。`"
+        description="将删除该病人及其全部透析记录、血压、血糖、血流量、不良反应、干体重与成员关系。"
         style="margin-bottom: 14px"
       />
-      <div class="muted" style="margin-bottom: 6px">请输入病人姓名以确认：{{ detail?.patient.name }}</div>
+      <div class="muted" style="margin-bottom: 6px">
+        请输入病人姓名以确认（此处打码显示）：{{ maskName(detail?.patient.name) }}
+      </div>
       <el-input v-model="delConfirm" placeholder="完整姓名" />
       <template #footer>
         <el-button @click="delShow = false">取消</el-button>

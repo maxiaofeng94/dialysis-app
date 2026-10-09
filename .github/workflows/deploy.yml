@@ -14,7 +14,14 @@ on:
   workflow_dispatch:
 
 jobs:
+  # 发布前门禁：测试或构建不过，下面的 deploy 直接不执行（不会污染生产）
+  test:
+    name: 发布前门禁
+    uses: ./.github/workflows/test.yml
+    secrets: inherit
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

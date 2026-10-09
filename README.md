@@ -62,12 +62,22 @@ npm run dev:admin    # 后台管理 → http://localhost:5174 （连测试库 .e
 npm run build         # App 产物      → dist/         （读 .env.production，连生产库）
 npm run build:admin   # 后台产物      → dist-admin/   （产出 index.html，Pages 根路径直接可访问）
 
+# 测试（详见 docs/测试说明.md）
+npm test                 # 全部测试：单元 / 数据层 / 组件 / Edge 接口 / 静态守卫
+npm run test:coverage    # 带覆盖率（CI 跑的就是这条，跌破阈值会失败）
+npm run test:watch       # 边写边跑
+npm run verify           # 测试 + App 构建 + 后台构建（推送前一把梭）
+npm run hooks:install    # 装 git 钩子（npm install 时会自动装，这里是手动重装）
+
 npm run smoke:admin      # 后台页面冒烟：SSR 渲染 8 个页面，抓模板错误与写错的组件名
 npm run check:admin-dev  # 后台预览自检：沿 import 递归检查资源链（需先起 dev:admin）
 npm run preview          # 预览 App 构建产物 → http://localhost:4173
 ```
 
 > `npm run build` 会先跑 `vue-tsc` 类型检查，**类型不过就不能提交**。
+>
+> 测试不通过会**直接拦住发布**，而不只是发条通知：`deploy.yml`、`deploy-admin.yml`、`build-apk.yml`
+> 都依赖同一个测试门禁（`.github/workflows/test.yml`，`needs: test`），测试或构建失败时部署与出包都不会执行。
 
 ## 开发与发布流程（重要）
 
@@ -77,10 +87,12 @@ npm run preview          # 预览 App 构建产物 → http://localhost:4173
    - App 改动：`npm run dev` → http://localhost:5173 （连**测试库**）
    - 后台改动：`npm run dev:admin` → http://localhost:5174 （连**测试库**），再跑 `npm run check:admin-dev`
    - 看真实数据：`npm run build && npm run preview` → http://localhost:4173 （连**生产库**）
-2. **确认无误后推送**：`git push origin main` → GitHub Actions 自动完成：
-   - App 部署到 Cloudflare Pages（`deploy.yml`）→ https://dialysis-49v.pages.dev
-   - 后台部署到 Cloudflare Pages（`deploy-admin.yml`，仅当改动命中后台相关路径）→ https://dialysis-admin.pages.dev
-   - 构建 APK 并**滚动发布**到 GitHub Release `latest`（`build-apk.yml`）
+2. **确认无误后推送**：`git push origin main`
+   - push 时本机钩子先跑「类型检查 + 全部测试」（装过 `npm run hooks:install` 才生效；急事可 `SKIP_TESTS=1 git push`）
+   - 推上去后 GitHub Actions 依序完成（**测试门禁不过则全部跳过**）：
+     - App 部署到 Cloudflare Pages（`deploy.yml`）→ https://dialysis-49v.pages.dev
+     - 后台部署到 Cloudflare Pages（`deploy-admin.yml`，仅当改动命中后台相关路径）→ https://dialysis-admin.pages.dev
+     - 构建 APK 并**滚动发布**到 GitHub Release `latest`（`build-apk.yml`）
 3. **拿 APK**：直接用上面的固定直链下载，覆盖安装即可
 
 > 环境分工：`npm run dev` / `dev:admin` 读 `.env`（测试库），`npm run build` / `build:admin` 读 `.env.production`（生产库）；两个文件都已 git 忽略，**不入库**。
@@ -138,10 +150,12 @@ src/
   views/              Home/Session/Report/Trend/Settings/Login/Members
   admin/              后台管理端（Element Plus：登录/概览/用户/病人/操作日志/我的账号）
 
-scripts/              后台自检脚本（页面冒烟、预览资源链）
+scripts/              自检与工具脚本（后台冒烟、预览资源链、git 钩子安装）
+tests/                测试：unit / repo / stores / router / lib / views / admin / edge / guards
+.githooks/            仓库自带的 git 钩子（npm run hooks:install 启用）
 supabase/             多人版后端：schema.sql + Edge Functions（含 admin-api）+ 配置/验证脚本
-docs/                 需求与设计文档、部署指南
-.github/workflows/    App 部署、后台部署、APK 构建
+docs/                 需求与设计文档、部署指南、测试说明
+.github/workflows/    测试门禁（test/ci）+ App 部署、后台部署、APK 构建
 ```
 
 ## 多人 / 多设备（可选）
@@ -162,4 +176,5 @@ docs/                 需求与设计文档、部署指南
 | `docs/前端部署指南.md` | 静态托管部署说明 |
 | `docs/后台管理系统设计说明.md` | 后台的权限模型、接口设计、隐私边界、验证结果 |
 | `docs/后台管理系统部署指南.md` | 后台部署步骤与验收清单 |
+| `docs/测试说明.md` | 测试怎么跑、分了几层、CI 怎么拦、哪些没覆盖 |
 | `AGENTS.md` | 工作区规则、环境与凭据说明、踩坑清单、验证手段 |

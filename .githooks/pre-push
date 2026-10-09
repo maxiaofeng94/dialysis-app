@@ -1,0 +1,35 @@
+#!/bin/sh
+# ============================================================
+# 透析记录 App · 推送前自动检查
+#
+# 由 `npm run hooks:install` 注册（git config core.hooksPath .githooks）。
+# 目的：把「推上去 CI 红了再回来改」的来回，提前到本机拦住。
+#
+# 临时跳过（例如紧急修文档）：
+#   SKIP_TESTS=1 git push
+# ============================================================
+
+if [ "${SKIP_TESTS}" = "1" ]; then
+  echo "[pre-push] 已跳过推送前检查（SKIP_TESTS=1）"
+  exit 0
+fi
+
+echo "[pre-push] ① 类型检查（vue-tsc）…"
+npx vue-tsc -b
+if [ $? -ne 0 ]; then
+  echo ""
+  echo "[pre-push] ❌ 类型检查未通过，推送已中止。"
+  echo "           修好再推；确实要强行推送：SKIP_TESTS=1 git push"
+  exit 1
+fi
+
+echo "[pre-push] ② 测试（vitest）…"
+npx vitest run --reporter=dot
+if [ $? -ne 0 ]; then
+  echo ""
+  echo "[pre-push] ❌ 测试未通过，推送已中止。"
+  echo "           看上面的失败用例；确实要强行推送：SKIP_TESTS=1 git push"
+  exit 1
+fi
+
+echo "[pre-push] ✅ 通过（类型检查 + 全部测试）"

@@ -3,15 +3,58 @@ import { ref, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast } from 'vant'
 import { useAuth } from '../stores/auth'
+import { isCloudConfigured } from '../lib/supabase'
 
 const router = useRouter()
 const { initialized, isLoggedIn, register, login } = useAuth()
+
+/** 本地单机版（没配 .env）：没有云端账号体系，登录页只做提示用 */
+const cloudConfigured = isCloudConfigured
 
 const mode = ref<'login' | 'register'>('login')
 const phone = ref('')
 const password = ref('')
 const confirmPassword = ref('')
 const submitting = ref(false)
+
+/**
+ * Supabase 返回的是英文原文（Invalid login credentials / Failed to fetch …），
+ * 40~60 岁的家属看不懂。这里在 App 侧自己维护一份中文映射（不 import 后台管理端模块）。
+ */
+function friendlyAuthError(message: string): string {
+  const raw = (message ?? '').trim()
+  if (!raw) return '操作失败，请稍后再试'
+  const m = raw.toLowerCase()
+  if (m.includes('invalid login credentials') || m.includes('invalid_grant')) return '手机号或密码不正确'
+  if (
+    m.includes('failed to fetch') ||
+    m.includes('networkerror') ||
+    m.includes('network request failed') ||
+    m.includes('load failed') ||
+    m.includes('etimedout') ||
+    m.includes('timeout')
+  ) {
+    return '网络连接失败，请检查网络后重试'
+  }
+  if (m.includes('email not confirmed')) return '账号尚未验证，请先完成验证'
+  if (m.includes('user already registered') || m.includes('already been registered') || m.includes('already registered')) {
+    return '该手机号已注册，请直接登录'
+  }
+  if (m.includes('rate limit') || m.includes('too many')) return '尝试过于频繁，请稍后再试'
+  if (m.includes('signups not allowed') || m.includes('signup is disabled')) return '当前暂不开放注册'
+  if (m.includes('password should be at least')) return '密码至少 6 位'
+  return raw
+}
+
+/** 提交时抛出的异常（断网、本地模式未配置云端导致 supabase 为 null 的 TypeError…）转成用户提示 */
+function errorToMessage(err: unknown): string {
+  if (!cloudConfigured) return '当前是本地单机模式（未配置云端），无需登录即可直接使用'
+  const raw = err instanceof Error ? err.message : String(err ?? '')
+  if (err instanceof TypeError || /fetch|network|load failed/i.test(raw)) {
+    return '网络连接失败，请检查网络后重试'
+  }
+  return friendlyAuthError(raw)
+}
 
 // ---------- 人机验证（Cloudflare Turnstile，可选） ----------
 // 配置了 VITE_TURNSTILE_SITE_KEY 才启用；未配置时整块不渲染、不加载外部脚本，
@@ -120,19 +163,27 @@ async function onSubmit() {
   }
 
   submitting.value = true
-  if (mode.value === 'register') {
-    const reg = await register(phone.value, password.value, turnstileToken.value || undefined)
-    if (!reg.ok) {
-      showToast(reg.message)
-      submitting.value = false
-      resetTurnstile()
-      return
+  // 无论正常返回、失败还是抛异常（断网 / 未配置云端），finally 一定复位按钮，
+  // 否则页面会永久转圈，用户只能杀进程。
+  try {
+    if (mode.value === 'register') {
+      const reg = await register(phone.value, password.value, turnstileToken.value || undefined)
+      if (!reg.ok) {
+        showToast(friendlyAuthError(reg.message))
+        resetTurnstile()
+        return
+      }
     }
+    const res = await login(phone.value, password.value)
+    showToast(res.ok ? res.message : friendlyAuthError(res.message))
+    if (res.ok) await router.replace('/')
+  } catch (e) {
+    console.error(e)
+    showToast(errorToMessage(e))
+    resetTurnstile()
+  } finally {
+    submitting.value = false
   }
-  const res = await login(phone.value, password.value)
-  submitting.value = false
-  showToast(res.message)
-  if (res.ok) router.replace('/')
 }
 </script>
 
@@ -142,6 +193,11 @@ async function onSubmit() {
       <div class="login-logo">透</div>
       <div class="login-title">透析记录</div>
       <div class="login-sub">{{ mode === 'login' ? '手机号 + 密码登录' : '注册新账号' }}</div>
+
+      <!-- 本地单机版没有云端账号体系：先把话说清楚，别让用户在这里反复试密码 -->
+      <div v-if="!cloudConfigured" class="login-hint">
+        当前是本地单机模式（未配置云端），无需登录，返回即可直接使用
+      </div>
 
       <van-field v-model="phone" type="tel" maxlength="11" label="手机号" placeholder="请输入手机号" />
       <van-field v-model="password" type="password" label="密码" placeholder="至少 6 位" />
@@ -207,6 +263,16 @@ async function onSubmit() {
   color: #969799;
   font-size: 13px;
   margin: 4px 0 20px;
+}
+.login-hint {
+  margin: -8px 0 16px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #fff7e6;
+  color: #ed6a0c;
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
 }
 .toggle {
   text-align: center;

@@ -1,0 +1,90 @@
+name: Test
+
+# 可复用测试工作流（被 ci.yml / deploy*.yml / build-apk.yml 调用）
+#
+# 单独抽出来是为了「只定义一次门禁」：
+#   · ci.yml            —— 每次 push / PR 都跑，作为日常质量门禁
+#   · deploy.yml        —— 部署生产前必须先过（needs: test）
+#   · deploy-admin.yml  —— 后台部署前必须先过
+#   · build-apk.yml     —— 出 APK 前必须先过
+# 这样「测试不通过就绝不会部署/出包」，而不是只发一条通知。
+#
+# 注意：本工作流必须自带完整环境（checkout + node + npm ci），
+# 因为 reusable workflow 各自跑在独立的 runner 上。
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1. 测试：单元 / 接口（Edge Function）/ 静态守卫 + 覆盖率阈值
+  # ---------------------------------------------------------------
+  tests:
+    name: 测试与覆盖率
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      # 覆盖率阈值写在 vitest.config.ts 里，跌破阈值这一步会红
+      - name: 运行全部测试
+        run: npm run test:coverage
+
+      - name: 上传覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------
+  # 2. 构建：类型检查（vue-tsc）+ App 产物 + 后台产物 + 后台冒烟
+  #    与部署工作流同款步骤，确保「测试过 ≠ 能构建」这种坑提前暴露
+  # ---------------------------------------------------------------
+  build:
+    name: 类型检查与构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建 App（vue-tsc 类型检查 + vite build）
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: |
+          if [ -z "${VITE_SUPABASE_URL:-}" ]; then
+            echo "::warning::未配置 VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY，本次产物会退化为单机版（仅用于校验构建与类型）"
+          fi
+          npm run build
+
+      - name: 构建后台管理端并校验入口文件
+        run: |
+          set -euo pipefail
+          npm run build:admin
+          # 产物必须是 dist-admin/index.html，否则 Pages 根路径 404
+          test -f dist-admin/index.html || { echo "::error::dist-admin/index.html 不存在，检查 vite.admin.config.ts 的 root"; exit 1; }
+
+      - name: 后台页面 SSR 冒烟
+        run: npm run smoke:admin

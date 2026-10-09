@@ -1,5 +1,5 @@
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from './supabase'
-import { cacheGet, cacheSet, cacheVersion } from './cloudCache'
+import { cacheGet, cacheSet, cacheVersion, FRESH_MS } from './cloudCache'
 import type { Patient } from '../types'
 
 export interface MemberInfo {
@@ -57,11 +57,16 @@ export async function listMyPatients(): Promise<{ patient: Patient; role: string
   }
   const cached = await cacheGet<{ patient: Patient; role: string }[]>(key)
   if (cached) {
-    void load()
-      .then(() => {
-        cacheVersion.value++
-      })
-      .catch(() => {})
+    // 必须和 cachedRepository.cacheFirst 用同一道「新鲜度」闸门：
+    // 否则「命中缓存 → 后台刷新 → cacheVersion++ → 页面 watch 重读 → 又命中缓存 …」
+    // 会自激成一个停不下来的请求循环（成员页/首页实测每轮都打一次 join 查询）。
+    if (Date.now() - cached.updatedAt >= FRESH_MS) {
+      void load()
+        .then(() => {
+          cacheVersion.value++
+        })
+        .catch(() => {})
+    }
     return cached.value
   }
   return load()
@@ -86,11 +91,14 @@ export async function listMembers(patientId: string): Promise<MemberInfo[]> {
   }
   const cached = await cacheGet<MemberInfo[]>(key)
   if (cached) {
-    void load()
-      .then(() => {
-        cacheVersion.value++
-      })
-      .catch(() => {})
+    // 同上：没有这道闸门时，成员页会在 watch(cacheVersion) 与后台刷新之间反复自激
+    if (Date.now() - cached.updatedAt >= FRESH_MS) {
+      void load()
+        .then(() => {
+          cacheVersion.value++
+        })
+        .catch(() => {})
+    }
     return cached.value
   }
   return load()
@@ -133,22 +141,36 @@ export async function inviteMember(patientId: string, phone: string, role: strin
   return { ok: res.ok, error: data?.error }
 }
 
+/**
+ * 成员表的写操作也要 `.select()` 复查影响行数。
+ * RLS 对无权限的行是静默过滤的：更新/删除 0 行同样返回 204、error 为 null，
+ * 前端如果只看 error，就会提示「已移除 / 角色已更新」，实际什么都没发生。
+ */
+function memberWriteFailed(data: unknown[] | null, action: string): { ok: false; error: string } | null {
+  if (data?.length) return null
+  return { ok: false, error: `${action}失败：可能没有权限，或该成员已被其他人处理` }
+}
+
 /** 设置成员角色（RLS 仅 owner 可改） */
 export async function setMemberRole(patientId: string, userId: string, role: string) {
-  const { error } = await supabase!
+  const { data, error } = await supabase!
     .from('patient_members')
     .update({ role })
     .eq('patient_id', patientId)
     .eq('user_id', userId)
-  return { ok: !error, error: error?.message }
+    .select('user_id')
+  if (error) return { ok: false, error: error.message }
+  return memberWriteFailed(data, '修改成员角色') ?? { ok: true }
 }
 
 /** 移除成员（RLS 仅 owner 可删） */
 export async function removeMember(patientId: string, userId: string) {
-  const { error } = await supabase!
+  const { data, error } = await supabase!
     .from('patient_members')
     .delete()
     .eq('patient_id', patientId)
     .eq('user_id', userId)
-  return { ok: !error, error: error?.message }
+    .select('user_id')
+  if (error) return { ok: false, error: error.message }
+  return memberWriteFailed(data, '移除成员') ?? { ok: true }
 }

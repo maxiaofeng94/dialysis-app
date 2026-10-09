@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { Capacitor } from '@capacitor/core'
 import { Preferences } from '@capacitor/preferences'
 import { DEFAULT_PATIENT_ID } from '../constants'
@@ -9,6 +9,33 @@ import { listMyPatients } from '../lib/cloudAdmin'
 // - 本地模式：固定为 DEFAULT_PATIENT_ID
 // - 云端模式：登录后切换为用户选择/唯一可访问的病人（持久化，刷新或重开 App 不丢）
 export const currentPatientId = ref(DEFAULT_PATIENT_ID)
+
+/**
+ * 当前登录账号对「当前病人」的角色：owner / caregiver / doctor / viewer。
+ * 本地模式、未登录或还没拉到时为 null（= 不限制，维持原行为）。
+ */
+export const currentRole = ref<string | null>(null)
+
+/**
+ * 只读角色（医生 / 只读）——他们看得到病人，但写操作会被数据库 RLS 拒绝。
+ * 界面必须据此隐藏编辑入口，否则用户会遇到「点了没反应」或「删了又回来」。
+ */
+export const isReadOnly = computed(() => currentRole.value === 'doctor' || currentRole.value === 'viewer')
+
+/** 云端模式下重新拉取当前病人对应的角色（本地模式恒为 null） */
+export async function refreshCurrentRole(): Promise<void> {
+  if (!isCloudConfigured) {
+    currentRole.value = null
+    return
+  }
+  try {
+    const list = await listMyPatients()
+    currentRole.value = list.find((item) => item.patient.id === currentPatientId.value)?.role ?? null
+  } catch {
+    // 拉不到就不要把用户当只读锁住界面（服务端仍然会拦越权写）
+    currentRole.value = null
+  }
+}
 
 const STORAGE_KEY = 'dialysis.currentPatientId'
 const isNative = Capacitor.isNativePlatform()
@@ -62,15 +89,27 @@ export async function clearCurrentPatient(): Promise<void> {
 export async function ensureCloudPatient(): Promise<void> {
   if (!isCloudConfigured) return
   const list = await listMyPatients().catch(() => [])
-  if (!list.length) return
-  if (!list.some((item) => item.patient.id === currentPatientId.value)) {
+  if (!list.length) {
+    currentRole.value = null
+    return
+  }
+  const current = list.find((item) => item.patient.id === currentPatientId.value)
+  if (!current) {
     setCurrentPatientId(list[0].patient.id)
+    currentRole.value = list[0].role
+  } else {
+    currentRole.value = current.role
   }
 }
 
 /** 当前账号下是否一个病人都没有（用于首页引导） */
 export async function hasNoCloudPatient(): Promise<boolean> {
   if (!isCloudConfigured) return false
-  const list = await listMyPatients().catch(() => [])
-  return list.length === 0
+  try {
+    return (await listMyPatients()).length === 0
+  } catch {
+    // 拉取失败（离线、网络抖动、令牌刚失效）时**不能**断言「没有病人」——
+    // 首页会据此提示「还没有病人档案，去设置新建」，等于诱导用户重复建档。
+    return false
+  }
 }

@@ -11,7 +11,15 @@
     "build:admin": "vue-tsc -b && vite build --config vite.admin.config.ts",
     "smoke:admin": "node scripts/smoke-admin.mjs",
     "check:admin-dev": "node scripts/check-admin-dev.mjs",
-    "verify:register": "node supabase/verify-register-guard.mjs"
+    "verify:register": "node supabase/verify-register-guard.mjs",
+    "hooks:install": "node scripts/install-hooks.mjs",
+    "prepare": "node scripts/install-hooks.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:unit": "vitest run tests/unit",
+    "test:edge": "vitest run tests/edge",
+    "verify": "npm run test && npm run build && npm run build:admin"
   },
   "dependencies": {
     "@capacitor/android": "^6.2.1",
@@ -33,10 +41,16 @@
     "@capacitor/cli": "^6.2.2",
     "@types/node": "^24.13.3",
     "@vitejs/plugin-vue": "^6.0.8",
+    "@vitest/coverage-v8": "^5.0.3",
+    "@vue/test-utils": "^2.5.1",
     "@vue/tsconfig": "^0.9.1",
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^30.1.2",
     "typescript": "~6.0.2",
     "vite": "^8.2.0",
     "vite-plugin-pwa": "^1.3.0",
-    "vue-tsc": "^3.3.8"
+    "vitest": "^5.0.3",
+    "vue-tsc": "^3.3.8",
+    "yaml": "^2.9.1"
   }
 }

@@ -263,11 +263,32 @@ async function statsOverview(): Promise<HandlerResult> {
   }
 }
 
+/**
+ * 前端可传的排序键 → 列表行上的**真实字段名**。
+ *
+ * 踩过的坑：前端传 `lastSignIn`，行上的字段却叫 `lastSignInAt`，
+ * 排序时 `a[sort]` 恒为 undefined → 所有行并列 → 实际按 id 排序，
+ * 也就是「按最后登录排序」这个功能看起来有、实际没生效。
+ * 用白名单映射顺带挡掉 `payload.sort` 传任意字符串的可能。
+ */
+const USER_SORT_FIELDS: Record<string, string> = {
+  createdAt: 'createdAt',
+  lastSignIn: 'lastSignInAt',
+  lastSignInAt: 'lastSignInAt',
+  name: 'name',
+  phone: 'phone',
+  patientCount: 'patientCount',
+}
+
 /** 用户列表（分页 / 搜索 / 排序） */
 async function userList(payload: any): Promise<HandlerResult> {
   const { page, size } = parsePaging(payload)
   const search = str(payload?.search).toLowerCase()
-  const sort = str(payload?.sort) === 'lastSignIn' ? 'lastSignIn' : 'createdAt'
+  // 必须用 Object.hasOwn：直接 `TABLE[key] ?? 默认值` 会被原型链上的键骗过
+  // （sort='__proto__' / 'constructor' / 'toString' 都取到 truthy 的继承值，
+  //  于是 sort 变成一个对象，行上取不到该字段 → 全部并列 → 又退化成按 id 排序）
+  const sortKey = str(payload?.sort)
+  const sort = Object.hasOwn(USER_SORT_FIELDS, sortKey) ? USER_SORT_FIELDS[sortKey] : 'createdAt'
   const desc = str(payload?.order) !== 'asc'
 
   const [profiles, members, patients, admins, authUsers] = await Promise.all([
@@ -312,6 +333,9 @@ async function userList(payload: any): Promise<HandlerResult> {
   const profileIds = new Set(profiles.map((p) => p.id))
   for (const [id, auth] of authUsers) {
     if (profileIds.has(id)) continue
+    // 成员关系仍要照实填：这些账号虽然缺资料行，却可能真的在某个病人的成员表里，
+    // 硬编码成 0/[] 会让「列表显示 0 个病人、点进详情却有」自相矛盾。
+    const ghostMembers = byUser.get(id) ?? []
     rows.push({
       id,
       phone: null,
@@ -322,8 +346,12 @@ async function userList(payload: any): Promise<HandlerResult> {
       bannedUntil: auth.bannedUntil,
       isAdmin: admins.has(id),
       profileMissing: true,
-      patientCount: 0,
-      roles: [],
+      patientCount: ghostMembers.length,
+      roles: ghostMembers.map((m) => ({
+        patientId: m.patient_id,
+        patientName: patientName.get(m.patient_id) ?? '（病人已删除）',
+        role: m.role,
+      })),
     })
   }
 
@@ -771,7 +799,9 @@ async function adminRevoke(payload: any, ctx: Ctx): Promise<HandlerResult> {
 
   const admins = await loadAdminIds()
   if (!admins.has(userId)) fail('该用户不是管理员', 400)
-  if (admins.size <= 1) fail('至少保留一名管理员', 400)
+  // 「不能撤掉最后一个管理员」这条防线由上面的「不能撤销自己」保证：
+  // 调用者必然是管理员（入口已挡），又不能撤自己，所以撤销后至少还剩调用者本人。
+  // 原先这里还有一句 `if (admins.size <= 1) fail(...)` —— 该条件永远不成立，是自欺欺人的死代码，已删。
 
   const profile = await getProfile(userId)
   const { error } = await supabase.from('admins').delete().eq('user_id', userId)

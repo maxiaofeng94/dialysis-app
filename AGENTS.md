@@ -18,7 +18,9 @@
 
 ### 第 2 步 · 用户确认后才推送（触发自动部署）
 
-- 推送前自查：`npm run build` 通过；未把 `.env`、`.env.production`、token 等加入提交
+- 推送前自查：`npm test` 全绿、`npm run build` 通过；未把 `.env`、`.env.production`、token 等加入提交
+- 装过 `npm run hooks:install` 后，`git push` 会自动先跑「类型检查 + 全部测试」，不通过就中止推送（急事可 `SKIP_TESTS=1 git push`）
+- CI 侧同一套门禁（`.github/workflows/test.yml`）是**部署与出包的前置**：`deploy.yml` / `deploy-admin.yml` / `build-apk.yml` 都 `needs: test`，测试不过不会发布
 - `git push origin main` → GitHub Actions（`.github/workflows/deploy.yml`）自动构建并部署到 Cloudflare Pages
 - 生产地址：https://dialysis-49v.pages.dev （项目 `dialysis`）
 - 推送后查结果：`https://api.github.com/repos/maxiaofeng94/dialysis-app/actions/runs?per_page=1`（公开仓库，免 token）
@@ -127,6 +129,13 @@ Set-Location ..
 - 用户列表的「最后登录时间 / 禁用状态」在 `auth.users` 里，PostgREST 读不到（不暴露 auth schema，service_role 也一样）→ 只能用 Admin API `auth.admin.listUsers` 分页取，再与 `public.users` 合并
 - **「首页 200 但页面白屏」**：dev server 返回 HTML 200 不代表能用，入口脚本可能 404 或被 SPA fallback 成 HTML。动过 `vite.admin.config.ts` 的 root 或 HTML 里的脚本路径后，必须跑 `npm run check:admin-dev`，别只看首页状态码
 
+### 云端读写（读/写/删各有各的坑）
+
+- **读接口必须 `if (error) throw error`**：PostgREST 出错时 `data` 为 null，`(data ?? []).map(...)` 会把「查询失败」静默变成「没有数据」——断网/401 时首页显示「请先建立病人档案 / 暂无透析记录」，用户以为数据全丢了，可能去重建档案或导入备份（二次伤害）。**写接口同理**：`savePatient` 曾用 `update`，命中 0 行时 PostgREST 不报错，档案改动「看着保存成功其实没写进去」→ 所有写一律 `upsert`，或显式检查影响行数
+- **RLS 对删除是静默过滤**（删 0 行也返回 204、error 为 null）→ 前端删除必须 `.delete().eq('id', id).select('id')` 把被删的行要回来，空数组就抛错；否则会「删了又复活」：前端以为成功、清缓存跳走，几秒后缓存刷新记录重现（`cloudRepository` 的 `assertDeleted()`）
+- **不要写别人的 `operator_id`**：`sessions_insert` / `sessions_update` 的 `with check` 强制 `operator_id = auth.uid()`，想「保留原记录人」反而会让整条更新被拒（还是静默的）。所以记录人语义目前是「最后修改人」；要真正区分创建人/最后修改人得加列 + 触发器，不能只改前端
+- **`patients_insert` 不给普通用户**：前端从不直接插病人（新建走 `create-patient` EF 用 service_role），策略留成 `auth.uid() is not null` 等于人人可插，配合 `savePatient` 的 upsert，`currentPatientId` 是脏值时会在云端插出没有任何成员的「孤儿」档案
+
 ### Android / APK
 
 - gradle **必须在 `android` 目录**执行；在项目根跑会报 `Run gradle init to create a new Gradle build in this directory`
@@ -150,11 +159,25 @@ Set-Location ..
 - 本地单机数据与云端缓存是**两个独立 IndexedDB**：`dialysis-db`（业务）与 `dialysis-cloud-cache`（缓存），不要混用
 - 缓存 key 约定：`patient:` / `dryWeights:` / `session:` / `sessions:` / `bps:` / `bgs:` / `bfs:` / `ars:` / `myPatients:` / `members:`；写操作后要同步更新或删除对应 key
 - 本地 IndexedDB 升级用 Dexie `version(n).stores(...)`，新增非索引字段无需升版本，但读取时要兼容旧数据（参见 `localRepository.normalizeSession`）
+- **「缓存优先 + 后台刷新」必须有 `FRESH_MS` 闸门**：命中缓存就无条件后台刷新并 `cacheVersion++`，会和页面的 `watch(cacheVersion)` 组成自激循环（成员页曾因此每轮打一次 join 查询）。`cloudAdmin` 的两个读函数就漏了这道闸门，现已对齐 `cachedRepository.cacheFirst`
+- **导入备份要「先整份校验 → 再在事务里清库写入」**：先 `clear()` 再 `bulkPut()` 的话，JSON 能解析但字段不合法时数据已经全清空，界面却只说「文件格式不正确」（数据没了却不知道）。现在 `localRepository.importAll` 先校验（结构/每行 id/version），失败时一个字节都不动
+
+### 移动端输入与不可逆操作（本轮修复新增）
+
+- **输入清洗必须处理全角标点**：`el.value.replace(/,/g, '.')` 只认半角逗号，中文输入法的「，」会被 `[^\d.]` 直接删掉 → `70，5` 变成 `705`（**10 倍体重误差**）。要用 `/[,，]/g` 并把「中文逗号/全角」写进测试
+- **数值要有量程校验**：只判 `parseNum != null` 时，体重 0、血糖 999、粘贴进来的 `-5` 都能入库（Vant 的 number 输入实际允许一个前导负号）
+- **每个写操作按钮都要 in-flight 守卫**：云端下一次保存要等网络，没有 loading/disabled 时用户会连点 ——「立即创建」连点两次就是两条透析记录，子记录弹窗同理
+- **写失败必须给提示**：对非技术用户，「没有报错」＝「已经存好了」。曾经详情页所有写操作都没有 `catch`，断网时填的体重/血压静默丢失；同一项目的成员页却每个写操作都有 try/catch + toast
+- **不可逆操作（导入覆盖、迁移到云端、删除、退出登录）要二次确认并写清后果**：包括「会删掉哪几个病人、共多少条记录」「本机数据会被覆盖且无法撤销」
 
 ---
 
 ## 六、验证手段（改动后如何自证）
 
+- **测试（推送前必跑）**：`npm test` —— 单元 / 数据层 / 组件 / Edge 接口 / 静态守卫；
+  `npm run test:coverage` 带覆盖率阈值（CI 用这条）；`npm run verify` = 测试 + 两个构建。
+  测试跑在**纯本地模式**（`.env` 被 `envDir` 隔离），要验云端分支须 `vi.mock('src/lib/supabase')`。
+  静态守卫会把「敏感信息不得入库 / 后台不得碰病历表 / 结构三处同步 / gradlew 权限」等约定固化下来 —— 改了相关文件却忘了同步，这里会红。详见 `docs/测试说明.md`
 - **构建**：`npm run build`（App）/ `npm run build:admin`（后台）
 - **后台页面冒烟**：`npm run smoke:admin` —— 用 SSR 把 8 个后台页面各渲染一遍，抓「构建期发现不了」的问题（模板运行时错误、组件名写错被静默渲染成空）
 - **后台预览资源链**：先起 `npm run dev:admin`，再跑 `npm run check:admin-dev` —— 沿 import 递归请求所有模块，抓「首页 200 但白屏」

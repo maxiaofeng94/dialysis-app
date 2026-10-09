@@ -76,7 +76,7 @@ const warnings = computed(() => {
       <template #header>需要关注</template>
       <div v-for="w in warnings" :key="w.text" style="padding: 4px 0">
         <span style="color: #e6a23c; margin-right: 6px">⚠</span>
-        <el-link type="warning" :underline="false" @click="router.push(w.to)">{{ w.text }}</el-link>
+        <el-link type="warning" underline="never" @click="router.push(w.to)">{{ w.text }}</el-link>
       </div>
     </el-card>
 

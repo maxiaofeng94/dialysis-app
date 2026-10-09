@@ -39,8 +39,15 @@ permissions:
   contents: write # 发布 Release 必须；只读会 403
 
 jobs:
+  # 出包前门禁：测试或构建不过，就不发布 APK（Release 直链始终指向能用的包）
+  test:
+    name: 打包前门禁
+    uses: ./.github/workflows/test.yml
+    secrets: inherit
+
   build:
     name: 构建并发布 APK
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

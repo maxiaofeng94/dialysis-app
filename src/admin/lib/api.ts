@@ -36,10 +36,26 @@ export function setUnauthorizedHandler(fn: () => void): void {
   unauthorizedHandler = fn
 }
 
+/**
+ * 无后台权限（403）时的回调，同样由 auth.ts 注册。
+ * 403 不等于「登录态失效」：可能是权限刚被撤销，也可能是单个 action 被拒，
+ * 所以这里只上报，由 auth.ts 复核 whoami 后再决定是否登出（避免误伤）。
+ */
+let forbiddenHandler: (() => Promise<void> | void) | null = null
+
+export function setForbiddenHandler(fn: () => Promise<void> | void): void {
+  forbiddenHandler = fn
+}
+
 async function authHeaders(): Promise<Record<string, string>> {
   const { data } = await supabase!.auth.getSession()
   const token = data.session?.access_token
-  if (!token) throw new AdminApiError('登录已过期，请重新登录', 401)
+  if (!token) {
+    // 本地已经没有登录凭证了：单抛错的话页面会一直停在原地反复报「登录已过期」，
+    // 所以同样上报给 auth.ts，统一登出并回到登录页。
+    unauthorizedHandler?.()
+    throw new AdminApiError('登录已过期，请重新登录', 401)
+  }
   return {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${token}`,
@@ -53,15 +69,33 @@ export async function call<T>(action: string, payload: Record<string, unknown> =
     throw new AdminApiError('未配置 Supabase 连接（缺少 VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY）', 500)
   }
 
-  const res = await fetch(`${SUPABASE_URL}/functions/v1/admin-api`, {
-    method: 'POST',
-    headers: await authHeaders(),
-    body: JSON.stringify({ action, payload }),
-  })
+  // 取 token 失败（无 session）时抛的是 401，必须原样上传，不能被下面的断网分支吞掉
+  const headers = await authHeaders()
+
+  let res: Response
+  try {
+    res = await fetch(`${SUPABASE_URL}/functions/v1/admin-api`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action, payload }),
+    })
+  } catch {
+    // 断网 / DNS 失败 / 被拦截：浏览器只给 TypeError: Failed to fetch，转成中文提示
+    throw new AdminApiError('网络连接失败，请检查网络后重试', 0)
+  }
   const body = (await res.json().catch(() => ({}))) as { error?: string; data?: T; warning?: string }
 
   // 登录凭证失效：交给 auth.ts 统一登出并回到登录页，避免页面反复报错却停在原地
   if (res.status === 401) unauthorizedHandler?.()
+
+  // 无后台权限：交给 auth.ts 复核身份（确认已不是管理员才登出）
+  if (res.status === 403 && forbiddenHandler) {
+    try {
+      await forbiddenHandler()
+    } catch {
+      // 复核身份本身失败不影响把原始 403 抛给页面
+    }
+  }
 
   if (!res.ok || body.error) {
     throw new AdminApiError(body.error ?? `请求失败（HTTP ${res.status}）`, res.status)

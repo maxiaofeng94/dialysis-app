@@ -7,19 +7,46 @@ export const ROLE_LABELS: Record<string, string> = {
   viewer: '只读',
 }
 
+/**
+ * 可选的成员角色（**不含 owner**）。
+ *
+ * 刻意不提供「创建者」选项：行内下拉一点就发请求、没有确认，还会让一个病人出现两个 owner，
+ * 服务端所有「唯一创建者」的保护随之失效。要转移创建者只能用带确认的「设为创建者」按钮
+ * （走 api.transferOwner，服务端会把原创建者降级）。
+ */
 export const ROLE_OPTIONS = [
   { value: 'caregiver', label: '家属/护工' },
   { value: 'doctor', label: '医生（只读）' },
   { value: 'viewer', label: '只读' },
 ]
 
-export const ROLE_OPTIONS_WITH_OWNER = [
-  { value: 'owner', label: '创建者' },
-  ...ROLE_OPTIONS,
-]
-
 export function roleLabel(role: string): string {
   return ROLE_LABELS[role] ?? role
+}
+
+/**
+ * 打码手机号：13800000001 → 138****0001
+ *
+ * 删除确认框里要「打码显示但仍要求输入完整值」，避免管理员直接照抄提示里的号码。
+ * 太短的值（不足 7 位）无法可靠打码，只保留首位。
+ */
+export function maskPhone(phone?: string | null): string {
+  const s = (phone ?? '').trim()
+  if (!s) return '—'
+  if (s.length >= 7) return `${s.slice(0, 3)}****${s.slice(-4)}`
+  return `${s.slice(0, 1)}****`
+}
+
+/**
+ * 打码姓名：张三 → 张*，张三丰 → 张**
+ *
+ * 与 maskPhone 同样的目的：可辨认「是谁」，但不能照抄进确认框。
+ */
+export function maskName(name?: string | null): string {
+  const s = (name ?? '').trim()
+  if (!s) return '—'
+  const chars = Array.from(s)
+  return `${chars[0]}${'*'.repeat(Math.max(1, chars.length - 1))}`
 }
 
 export type TagType = 'primary' | 'success' | 'warning' | 'danger' | 'info'

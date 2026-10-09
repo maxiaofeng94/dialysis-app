@@ -3,9 +3,9 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, messageOf } from '../lib/api'
-import { fmtDateTime, roleLabel, roleTagType, ROLE_OPTIONS_WITH_OWNER, sinceText } from '../lib/format'
+import { fmtDateTime, maskPhone, roleLabel, roleTagType, ROLE_OPTIONS, sinceText } from '../lib/format'
 import { me } from '../lib/auth'
-import type { UserDetail } from '../lib/types'
+import type { UserDetail, UserPatientRef } from '../lib/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -112,7 +112,8 @@ async function toggleBan() {
         ? '禁用后该账号将无法登录（已签发的登录凭证最长 1 小时后失效）。确定禁用？'
         : '确定恢复该账号的登录？',
       next ? '禁用账号' : '解禁账号',
-      { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消' },
+      // autofocus:false —— 默认焦点落在「确定」上，管理员顺手敲回车就会执行
+      { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消', autofocus: false },
     )
   } catch {
     return
@@ -131,7 +132,7 @@ async function toggleAdmin() {
         ? '授予后该账号可以进入后台，管理所有用户与病人配置。确定授予？'
         : '撤销后该账号将无法进入后台。确定撤销？',
       next ? '授予管理员' : '撤销管理员',
-      { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消' },
+      { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消', autofocus: false },
     )
   } catch {
     return
@@ -146,12 +147,28 @@ async function toggleAdmin() {
 const delShow = ref(false)
 const delMode = ref<'detach' | 'purge'>('detach')
 const delConfirm = ref('')
+/** 打开删除框那一刻算出的「他是唯一创建者的病人」快照：purge 会把它们连同全部记录一起删掉 */
+const delSoleOwned = ref<UserPatientRef[]>([])
+
+/** 会被 purge 连带删掉的记录总数 */
+const delSoleOwnedSessions = computed(() =>
+  delSoleOwned.value.reduce((sum, p) => sum + (p.sessionCount ?? 0), 0),
+)
 
 function openDelete() {
   delMode.value = 'detach'
   delConfirm.value = ''
+  // detail.patients 里已经带 role / ownerCount / sessionCount，直接在本地算，不再多打一次接口
+  delSoleOwned.value = (detail.value?.patients ?? []).filter((p) => p.role === 'owner' && p.ownerCount === 1)
   delShow.value = true
 }
+
+/** purge + 有清单时，按钮上直接写清要删几个病人 */
+const delConfirmText = computed(() =>
+  delMode.value === 'purge' && delSoleOwned.value.length
+    ? `确认删除 ${delSoleOwned.value.length} 个病人及全部记录`
+    : '确认删除',
+)
 
 async function doDelete() {
   busy.value = true
@@ -171,7 +188,19 @@ async function doDelete() {
 
 // ---- 名下病人的成员操作 ----
 async function changeRole(patientId: string, uid: string, role: string) {
-  await run(() => api.setMemberRole(patientId, uid, role), '角色已更新')
+  // 下拉里不含「创建者」：转移创建者只能走「设为创建者」（有确认，服务端会降级原创建者）
+  if (role === 'owner') return
+  busy.value = true
+  try {
+    await api.setMemberRole(patientId, uid, role)
+    ElMessage.success('角色已更新')
+  } catch (err) {
+    ElMessage.error(messageOf(err))
+  } finally {
+    // 无论成功失败都用服务端真值回填：失败时下拉不能停在没生效的新角色上
+    await load()
+    busy.value = false
+  }
 }
 
 async function removeMembership(patientId: string, uid: string, label: string) {
@@ -180,6 +209,7 @@ async function removeMembership(patientId: string, uid: string, label: string) {
       type: 'warning',
       confirmButtonText: '确定',
       cancelButtonText: '取消',
+      autofocus: false,
     })
   } catch {
     return
@@ -192,7 +222,7 @@ async function makeOwner(patientId: string, uid: string) {
     await ElMessageBox.confirm(
       '将把该用户设为该病人的创建者；若原创建者只有一个，会降为「家属/护工」。确定？',
       '转移创建者',
-      { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消' },
+      { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消', autofocus: false },
     )
   } catch {
     return
@@ -266,7 +296,7 @@ async function makeOwner(patientId: string, uid: string) {
       <el-table :data="detail?.patients ?? []" border stripe style="width: 100%">
         <el-table-column label="病人" min-width="130">
           <template #default="{ row }">
-            <el-link type="primary" :underline="false" @click="router.push(`/patients/${row.patientId}`)">
+            <el-link type="primary" underline="never" @click="router.push(`/patients/${row.patientId}`)">
               {{ row.patientName }}
             </el-link>
           </template>
@@ -289,15 +319,20 @@ async function makeOwner(patientId: string, uid: string) {
         </el-table-column>
         <el-table-column label="改角色" width="150">
           <template #default="{ row }">
+            <!-- 成员就是本页这个用户：UserPatientRef 里没有 userId 字段，必须用路由上的 userId。
+                 下拉里没有「创建者」：否则一点就静默多出一个 owner；创建者行不给下拉
+                 （Element Plus 对没有匹配选项的值会直接显示 'owner'），转移走带确认的「设为创建者」。 -->
             <el-select
+              v-if="row.role !== 'owner'"
               :model-value="row.role"
               size="small"
               style="width: 130px"
               :disabled="busy"
-              @change="changeRole(row.patientId, row.userId, String($event))"
+              @change="changeRole(row.patientId, userId, String($event))"
             >
-              <el-option v-for="o in ROLE_OPTIONS_WITH_OWNER" :key="o.value" :label="o.label" :value="o.value" />
+              <el-option v-for="o in ROLE_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
             </el-select>
+            <span v-else class="muted" style="font-size: 12px">创建者（用「设为创建者」转移）</span>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="190" fixed="right">
@@ -307,11 +342,11 @@ async function makeOwner(patientId: string, uid: string) {
               link
               type="primary"
               :disabled="busy"
-              @click="makeOwner(row.patientId, row.userId)"
+              @click="makeOwner(row.patientId, userId)"
             >
               设为创建者
             </el-button>
-            <el-button link type="danger" :disabled="busy" @click="removeMembership(row.patientId, row.userId, row.patientName)">
+            <el-button link type="danger" :disabled="busy" @click="removeMembership(row.patientId, userId, row.patientName)">
               移除
             </el-button>
           </template>
@@ -356,27 +391,49 @@ async function makeOwner(patientId: string, uid: string) {
     </el-dialog>
 
     <!-- 删除用户 -->
-    <el-dialog v-model="delShow" title="删除用户" width="520px">
+    <el-dialog v-model="delShow" title="删除用户" width="560px" :close-on-click-modal="false" :close-on-press-escape="false">
+      <el-alert type="error" :closable="false" title="删除后该账号无法登录，且不可恢复" style="margin-bottom: 14px">
+        <div style="line-height: 1.9">
+          · 他作为成员的关系会被一并删除；<br />
+          · 他录入过的记录会全部失去「记录人」，他做过的操作日志会失去「操作人」（选「仅删除账号」也一样）；<br />
+          · 以上均不可逆。
+        </div>
+      </el-alert>
+
+      <!-- 高-1：purge 会级联删掉哪些病人，必须事前讲清 -->
       <el-alert
-        type="error"
+        v-if="delSoleOwned.length"
+        type="warning"
         :closable="false"
-        title="删除后该账号无法登录，且不可恢复"
-        description="该用户作为成员的关系会被一并删除；他创建的病人不会自动删除（可选「连同病人数据一并删除」）。"
+        title="选「连同病人数据一并删除」时，下列病人及其全部记录会被一起删除（不可恢复）"
         style="margin-bottom: 14px"
-      />
+      >
+        <ul style="margin: 6px 0 0; padding-left: 18px; line-height: 1.9">
+          <li v-for="p in delSoleOwned" :key="p.patientId">
+            {{ p.patientName }} —— {{ p.sessionCount }} 条记录
+          </li>
+        </ul>
+        <div style="margin-top: 6px">
+          合计 <b>{{ delSoleOwned.length }}</b> 个病人、<b>{{ delSoleOwnedSessions }}</b> 条记录，删除后不可恢复。
+        </div>
+      </el-alert>
+
       <el-radio-group v-model="delMode" style="display: flex; flex-direction: column; gap: 8px">
-        <el-radio value="detach">仅删除账号，保留病人数据（病人若失去创建者会变成无人可见）</el-radio>
-        <el-radio value="purge">连同他创建的病人及其全部记录一并删除</el-radio>
+        <el-radio value="detach">仅删除账号，保留病人数据（若他是某病人的唯一创建者，本选项会被拒绝）</el-radio>
+        <el-radio value="purge">连同他作为唯一创建者的病人及其全部记录一并删除</el-radio>
       </el-radio-group>
       <div style="margin-top: 14px">
         <div class="muted" style="margin-bottom: 6px">
-          请输入该用户的完整手机号以确认：<span class="mono">{{ user?.phone || '（无手机号，无法删除）' }}</span>
+          请输入该用户的完整手机号以确认（此处打码显示）：
+          <span class="mono">{{ user?.phone ? maskPhone(user.phone) : '（无手机号，无法删除）' }}</span>
         </div>
         <el-input v-model="delConfirm" placeholder="完整手机号" :disabled="!user?.phone" />
       </div>
       <template #footer>
         <el-button @click="delShow = false">取消</el-button>
-        <el-button type="danger" :loading="busy" :disabled="!user?.phone" @click="doDelete">确认删除</el-button>
+        <el-button type="danger" :loading="busy" :disabled="!user?.phone" @click="doDelete">
+          {{ delConfirmText }}
+        </el-button>
       </template>
     </el-dialog>
   </div>

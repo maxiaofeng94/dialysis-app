@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { repository } from '../repo'
 import { SESSION_STATUS_LABEL, SESSION_STATUS_TAG, abortText } from '../constants'
-import { currentPatientId, hasNoCloudPatient } from '../stores/patient'
+import { currentPatientId, hasNoCloudPatient, isReadOnly, refreshCurrentRole } from '../stores/patient'
 import { isLoggedIn } from '../stores/auth'
 import { cacheVersion } from '../lib/cloudCache'
 import { todayStr, formatDateCN, fmt, calcAge } from '../utils/format'
@@ -20,29 +20,76 @@ const quickWeight = ref('')
 const loading = ref(true)
 const showNewDialog = ref(false)
 const noCloudPatient = ref(false)
+/** 加载失败提示（H5）：非空时用错误态 +「重试」取代空状态，否则会误导用户去重新建档 */
+const error = ref('')
+/** 创建中（H3）：连点「立即创建」会写出两条一模一样的记录 */
+const creating = ref(false)
 
-onMounted(refresh)
+/**
+ * 体重量程（M6，kg，含轮椅）。
+ * 填 0 / 5 也能建记录，列表随即显示「-72L」级别的荒谬脱水量，家属根本看不出哪条是真的。
+ * 超范围一律不写库、只提示。注意：SessionView 里有一份同样的阈值，改这里要同步改那边。
+ */
+const WEIGHT_MIN = 20
+const WEIGHT_MAX = 200
+
+/** 量程校验（M6）：不在 min~max 之间返回 false，由调用方负责提示且不写库 */
+function checkRange(value: number, min: number, max: number): boolean {
+  return value >= min && value <= max
+}
+
+onMounted(async () => {
+  // 只读角色（医生 / 只读成员）的写操作会被 RLS 静默拒绝，界面必须提前隐藏写入口（H4）。
+  // 本地模式或未登录时 refreshCurrentRole 自己会 return，不会多发请求。
+  void refreshCurrentRole()
+  await refresh()
+})
 
 // 后台静默刷新的数据写回缓存后会自增 cacheVersion，这里自动重读一次（命中新缓存，无需等网络）
 watch(cacheVersion, () => {
   void refresh()
 })
 
+/**
+ * 加载失败不再让页面永远停在骨架（H5）：
+ * - 失败必须留下错误态与「重试」入口，只 toast 一下等于没下文；
+ * - `loading` 放 finally，任何分支都会收起骨架。
+ */
 async function refresh() {
   const pid = currentPatientId.value
-  // 三个请求并行发出：总耗时约等于最慢的那个，而不是三次网络往返相加
-  const [p, dw, ss] = await Promise.all([
-    repository.getPatient(pid),
-    repository.listDryWeights(pid),
-    repository.listSessions(pid),
-  ])
-  patient.value = p ?? null
-  dryWeights.value = dw
-  sessions.value = ss
-  loading.value = false
-  // 云端账号下还没有任何病人 → 首页给出更明确的引导
-  noCloudPatient.value = !patient.value && isLoggedIn.value ? await hasNoCloudPatient() : false
+  try {
+    // 三个请求并行发出：总耗时约等于最慢的那个，而不是三次网络往返相加
+    const [p, dw, ss] = await Promise.all([
+      repository.getPatient(pid),
+      repository.listDryWeights(pid),
+      repository.listSessions(pid),
+    ])
+    patient.value = p ?? null
+    dryWeights.value = dw
+    sessions.value = ss
+    // 云端账号下还没有任何病人 → 首页给出更明确的引导
+    noCloudPatient.value = !patient.value && isLoggedIn.value ? await hasNoCloudPatient() : false
+    error.value = ''
+  } catch (err) {
+    console.error(err)
+    error.value = '加载失败，请检查网络后重试'
+  } finally {
+    loading.value = false
+  }
 }
+
+/** 「重试」：回到骨架态再拉一次 */
+async function retry() {
+  loading.value = true
+  error.value = ''
+  await refresh()
+}
+
+/**
+ * 只有「首屏加载失败且本机没有任何可展示数据」才用错误态盖住页面；
+ * 已经有内容时（例如后台静默刷新失败）继续显示旧数据，不打扰用户。
+ */
+const loadFailed = computed(() => error.value !== '' && !patient.value && sessions.value.length === 0)
 
 const currentDry = computed(() => getEffectiveDryWeight(dryWeights.value, todayStr()))
 
@@ -62,15 +109,26 @@ const quickPreview = computed(() => {
   return { pre, plan }
 })
 
+/** 缺日期的脏数据统一落到这个分组，不要让它把整页渲染搞崩 */
+const UNKNOWN_MONTH = '日期未知'
+
 const grouped = computed(() => {
   const map = new Map<string, DialysisSession[]>()
   for (const s of sessions.value) {
-    const month = s.date.slice(0, 7)
+    // `s.date` 可能缺失/为空（旧数据、导入的数据）：原先直接 .slice 会抛错，整页白屏（L1）
+    const date = String(s.date ?? '')
+    const month = date ? date.slice(0, 7) : UNKNOWN_MONTH
     const arr = map.get(month)
     if (arr) arr.push(s)
     else map.set(month, [s])
   }
-  return Array.from(map.entries())
+  const entries = Array.from(map.entries())
+  // 「日期未知」始终排在最后，别插在正常月份中间
+  const unknownAt = entries.findIndex(([m]) => m === UNKNOWN_MONTH)
+  if (unknownAt >= 0 && unknownAt !== entries.length - 1) {
+    entries.push(entries.splice(unknownAt, 1)[0])
+  }
+  return entries
 })
 
 function summary(s: DialysisSession) {
@@ -78,10 +136,11 @@ function summary(s: DialysisSession) {
   return computeSession(s, dry)
 }
 
-// 只允许数字和一个小数点，并把中文逗号/全角转换为英文点
+// 只允许数字和一个小数点，并把半角/全角（中文输入法）逗号都转成小数点。
+// 只认半角逗号时，「70，5」会被 [^\d.] 剔成 705 —— 10 倍体重误差。
 function onWeightInput(e: Event) {
   const el = e.target as HTMLInputElement
-  let v = el.value.replace(/,/g, '.').replace(/[^\d.]/g, '')
+  let v = el.value.replace(/[,，]/g, '.').replace(/[^\d.]/g, '')
   const dot = v.indexOf('.')
   if (dot !== -1) v = v.slice(0, dot + 1) + v.slice(dot + 1).replace(/\./g, '')
   if (v.length > 8) v = v.slice(0, 8)
@@ -117,6 +176,8 @@ async function createSession(preWeight: number | null) {
 }
 
 async function onQuickCreate() {
+  // H3：双击 / 连点会写出两条重复记录，创建期间直接忽略后续点击
+  if (creating.value) return
   if (!patient.value) {
     router.push('/settings')
     return
@@ -137,7 +198,12 @@ async function onQuickCreate() {
     showToast('请输入有效的体重数值')
     return
   }
-  await createSession(w)
+  // M6：越界不写库（否则会算出 -72L 这种谁都看不懂的脱水量）
+  if (!checkRange(w, WEIGHT_MIN, WEIGHT_MAX)) {
+    showToast(`体重需在 ${WEIGHT_MIN}~${WEIGHT_MAX}kg 之间，请检查输入`)
+    return
+  }
+  await guardedCreate(() => createSession(w))
 }
 
 function onNewBlank() {
@@ -146,7 +212,24 @@ function onNewBlank() {
 
 async function doNewBlank() {
   showNewDialog.value = false
-  await createSession(null)
+  await guardedCreate(() => createSession(null))
+}
+
+/**
+ * 创建记录的唯一入口：防连点（H3），并在失败时明确提示
+ * （原来的裸 await 一旦保存失败就是「点了没反应」，用户会一直点）。
+ */
+async function guardedCreate(run: () => Promise<void>): Promise<void> {
+  if (creating.value) return
+  creating.value = true
+  try {
+    await run()
+  } catch (err) {
+    console.error(err)
+    showToast('创建失败，请检查网络后重试')
+  } finally {
+    creating.value = false
+  }
 }
 </script>
 
@@ -154,16 +237,25 @@ async function doNewBlank() {
   <div class="page">
     <van-nav-bar title="透析记录" :border="false">
       <template #right>
-        <van-button size="small" type="primary" plain @click="onNewBlank">＋ 新建</van-button>
+        <van-button v-if="!isReadOnly" size="small" type="primary" plain @click="onNewBlank">＋ 新建</van-button>
       </template>
     </van-nav-bar>
+
+    <!-- 只读角色提示（H4）：写操作会被服务端静默拒绝，必须提前说清楚，不能等用户点了没反应 -->
+    <div v-if="isReadOnly" class="readonly-banner">你是只读成员，仅可查看</div>
 
     <!-- 首次在本机打开（还没有缓存）时先显示骨架，避免白屏干等 -->
     <div v-if="loading" class="card" style="margin-top: 12px">
       <van-skeleton title :row="4" />
     </div>
 
-    <div v-if="patient" class="card patient-card">
+    <!-- 加载失败（H5）：骨架与错误态互斥，且必须给出可点的「重试」 -->
+    <div v-else-if="loadFailed" class="card load-error">
+      <div class="load-error-text">{{ error }}</div>
+      <van-button type="primary" round size="small" @click="retry">重试</van-button>
+    </div>
+
+    <div v-if="patient && !loadFailed" class="card patient-card">
       <div class="patient-head">
         <div class="avatar">{{ patient.name.charAt(0) }}</div>
         <div class="patient-name">{{ patient.name }}</div>
@@ -186,8 +278,8 @@ async function doNewBlank() {
       </div>
     </div>
 
-    <!-- 快速创建 -->
-    <div v-if="!loading" class="quick-card">
+    <!-- 快速创建（只读成员没有创建入口，整块隐藏，避免填了半天发现点不了） -->
+    <div v-if="!loading && !loadFailed && !isReadOnly" class="quick-card">
       <div class="quick-title">快速创建</div>
       <div class="quick-label">上机前体重（含轮椅）</div>
       <div class="quick-input-wrap">
@@ -212,20 +304,25 @@ async function doNewBlank() {
         </div>
       </div>
       <div v-else class="quick-hint">请先到「设置」建立病人档案，才能自动计算</div>
-      <button class="quick-btn" @click="onQuickCreate">立即创建</button>
+      <button class="quick-btn" :disabled="creating" @click="onQuickCreate">
+        {{ creating ? '创建中…' : '立即创建' }}
+      </button>
     </div>
 
     <!-- 无病人档案 -->
     <van-empty
-      v-if="!loading && !patient"
+      v-if="!loading && !loadFailed && !patient"
       :description="noCloudPatient ? '还没有病人档案，去「设置」新建或上传本地数据' : '请先建立病人档案'"
     >
       <van-button type="primary" @click="router.push('/settings')">去设置</van-button>
     </van-empty>
 
     <!-- 记录列表 -->
-    <template v-else-if="!loading">
-      <van-empty v-if="!sessions.length" description="暂无透析记录，点击上方快速创建" />
+    <template v-else-if="!loading && !loadFailed">
+      <van-empty
+        v-if="!sessions.length"
+        :description="isReadOnly ? '暂无透析记录' : '暂无透析记录，点击上方快速创建'"
+      />
       <div v-for="[month, list] in grouped" :key="month" class="card" style="padding: 8px 14px">
         <div class="card-title" style="margin: 6px 0">{{ month }}</div>
         <div
@@ -271,6 +368,26 @@ async function doNewBlank() {
 </template>
 
 <style scoped>
+/* 只读角色提示条（H4） */
+.readonly-banner {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #fffbe8;
+  color: #ed6a0c;
+  font-size: 13px;
+  text-align: center;
+}
+/* 加载失败态（H5） */
+.load-error {
+  text-align: center;
+  padding: 20px 14px;
+}
+.load-error-text {
+  font-size: 14px;
+  color: #646566;
+  margin-bottom: 12px;
+}
 .quick-card {
   background: linear-gradient(135deg, #07c160, #05a84f);
   border-radius: 16px;
@@ -360,6 +477,11 @@ async function doNewBlank() {
 }
 .quick-btn:active {
   opacity: 0.9;
+}
+/* 创建中（H3）：按钮在提交期间禁用，配合文案「创建中…」给出可见反馈 */
+.quick-btn:disabled {
+  opacity: 0.65;
+  cursor: default;
 }
 .patient-card {
   padding: 16px;

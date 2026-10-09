@@ -1,15 +1,27 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { computed, onMounted, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { me } from '../lib/auth'
 import { supabase } from '../lib/supabase'
-import { messageOf } from '../lib/api'
+import { api, messageOf } from '../lib/api'
 
 const pwd1 = ref('')
 const pwd2 = ref('')
 const saving = ref(false)
+/** 管理员总数，用于「唯一管理员」的强警告；拿不到（接口异常）时为 null，不影响改密码 */
+const adminCount = ref<number | null>(null)
 
 const whoText = computed(() => me.value?.name || me.value?.phone || '管理员')
+/** 只有一位管理员时风险最高：他忘记密码＝谁也进不了后台 */
+const isSoleAdmin = computed(() => adminCount.value !== null && adminCount.value <= 1)
+
+onMounted(async () => {
+  try {
+    adminCount.value = (await api.overview()).adminCount
+  } catch {
+    adminCount.value = null
+  }
+})
 
 async function onChangePassword() {
   if (pwd1.value.length < 6) {
@@ -21,6 +33,20 @@ async function onChangePassword() {
     return
   }
   if (!supabase) return
+
+  // 改密码不可逆（后台没有找回入口），必须先确认；autofocus:false 避免顺手敲回车就改掉
+  try {
+    await ElMessageBox.confirm(
+      isSoleAdmin.value
+        ? `你是当前唯一的管理员（共 ${adminCount.value} 个），后台没有找回密码入口：一旦忘记新密码，没有人能帮你重置。确定修改？`
+        : '修改后手机 App 也用新密码登录，后台没有找回密码入口。确定修改？',
+      '修改我的密码',
+      { type: 'warning', confirmButtonText: '确定修改', cancelButtonText: '取消', autofocus: false },
+    )
+  } catch {
+    return
+  }
+
   saving.value = true
   try {
     const { error } = await supabase.auth.updateUser({ password: pwd1.value })
@@ -60,6 +86,15 @@ async function onChangePassword() {
 
     <el-card class="page-card" shadow="never">
       <template #header>修改我的密码</template>
+      <el-alert
+        v-if="isSoleAdmin"
+        type="error"
+        :closable="false"
+        show-icon
+        title="你是当前唯一的管理员，忘记密码就没人能帮你重置"
+        description="后台没有找回密码入口，也无人能替你重置。请先把新密码记牢再改，或先请另一位同事被授予管理员后再改。"
+        style="margin-bottom: 12px"
+      />
       <el-form label-width="90px" style="max-width: 420px">
         <el-form-item label="新密码">
           <el-input v-model="pwd1" type="password" show-password placeholder="至少 6 位" />
@@ -71,8 +106,9 @@ async function onChangePassword() {
           <el-button type="primary" :loading="saving" @click="onChangePassword">保存</el-button>
         </el-form-item>
       </el-form>
-      <div class="muted" style="font-size: 12px">
-        当前登录的管理员：{{ whoText }}。修改的是你自己的 App 登录密码（手机端同样生效）。
+      <div class="muted" style="font-size: 12px; line-height: 1.8">
+        · 当前登录的管理员：{{ whoText }}。修改的是你自己的 App 登录密码（手机端同样生效）。<br />
+        · 后台没有找回密码入口，若你是唯一管理员请先记牢新密码（可先请另一位管理员重置）。
       </div>
     </el-card>
   </div>

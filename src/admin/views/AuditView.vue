@@ -11,17 +11,23 @@ const total = ref(0)
 const page = ref(1)
 const size = ref(30)
 
+/** 请求序号：连点翻页时先发的请求可能后到，只认最后一次的结果 */
+let reqSeq = 0
+
 async function load() {
+  const seq = ++reqSeq
   loading.value = true
   error.value = ''
   try {
     const res = await api.audit({ page: page.value, size: size.value })
+    if (seq !== reqSeq) return // 已被更新的请求取代，丢弃这次结果
     rows.value = res.rows
     total.value = res.total
   } catch (err) {
+    if (seq !== reqSeq) return
     error.value = messageOf(err)
   } finally {
-    loading.value = false
+    if (seq === reqSeq) loading.value = false
   }
 }
 

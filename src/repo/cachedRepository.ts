@@ -76,7 +76,9 @@ async function removeFromListsById(id: string, prefixes: string[]): Promise<void
   }
 }
 
-const byDateDesc = (a: { date: string }, b: { date: string }) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)
+// 与 localRepository.listSessions 保持同一口径：date 倒序，同一天按 createdAt 倒序
+const byDateDesc = (a: DialysisSession, b: DialysisSession) =>
+  a.date !== b.date ? (a.date < b.date ? 1 : -1) : b.createdAt - a.createdAt
 const byEffectiveDesc = (a: DryWeight, b: DryWeight) =>
   a.effectiveDate < b.effectiveDate ? 1 : a.effectiveDate > b.effectiveDate ? -1 : 0
 const byMeasuredAsc = (a: { measuredAt: number }, b: { measuredAt: number }) => a.measuredAt - b.measuredAt
@@ -119,15 +121,11 @@ export const cachedCloudRepository: Repository = {
     await upsertInto(K.sessions(session.patientId), session, byDateDesc)
   },
   async deleteSession(id) {
-    const cached = await cacheGet<DialysisSession>(K.session(id))
     await cloudRepository.deleteSession(id)
     await cacheDelete([K.session(id), K.bps(id), K.bgs(id), K.bfs(id), K.ars(id)])
-    const patientId = cached?.value.patientId
-    if (patientId) {
-      const key = K.sessions(patientId)
-      const list = await cacheGet<DialysisSession[]>(key)
-      if (list) await cacheSet(key, list.value.filter((s) => s.id !== id))
-    }
+    // 不再依赖「单条 session 缓存」里的 patientId（可能刚被清掉、或本来就没缓存过）：
+    // 直接扫所有 sessions: 列表把它摘掉，否则用户会看到一条已经删掉的「幽灵记录」直到下次刷新。
+    await removeFromListsById(id, ['sessions:'])
   },
 
   // ---------- 血压 ----------

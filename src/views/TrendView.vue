@@ -16,6 +16,12 @@ const gluTrend = ref<{ time: number; date: string; value: number }[]>([])
 
 /** 首次加载（本机还没有缓存）时的骨架占位 */
 const loading = ref(true)
+/** 主数据（干体重 / 记录）加载失败 —— 与「确实没有数据」是两码事，必须分开显示 */
+const loadError = ref(false)
+/** 血压 / 血糖趋势加载失败（只影响对应页签） */
+const bpError = ref(false)
+const gluError = ref(false)
+const retrying = ref(false)
 
 onMounted(load)
 
@@ -26,38 +32,70 @@ watch(cacheVersion, () => {
 
 async function load() {
   const pid = currentPatientId.value
-  const [dw, ss] = await Promise.all([repository.listDryWeights(pid), repository.listSessions(pid)])
-  dryWeights.value = dw
-  sessions.value = ss
+  try {
+    const [dw, ss] = await Promise.all([repository.listDryWeights(pid), repository.listSessions(pid)])
+    dryWeights.value = dw
+    sessions.value = ss
+    loadError.value = false
+  } catch (err) {
+    // 读接口查询失败会抛错（不再静默返回空）：失败要能重试，不能显示成「暂无数据」
+    console.error(err)
+    loadError.value = true
+    return
+  } finally {
+    loading.value = false // 抛错也要收掉骨架，否则页面永久白等
+  }
   await Promise.all([loadBpTrend(), loadGlucoseTrend()])
-  loading.value = false
+}
+
+/** 失败后手动重试（按钮上带 loading，避免连点并发再打一轮请求） */
+async function retry() {
+  if (retrying.value) return
+  retrying.value = true
+  try {
+    await load()
+  } finally {
+    retrying.value = false
+  }
 }
 
 async function loadBpTrend() {
   const recent = sessions.value.slice(0, 30)
-  // 原来是每条记录串行拉一次血压（30 条 = 30 次往返），改成全部并行
-  const lists = await Promise.all(recent.map((s) => repository.listBloodPressures(s.id)))
-  const all: { time: number; date: string; systolic: number; diastolic: number }[] = []
-  recent.forEach((s, i) => {
-    for (const bp of lists[i]) {
-      all.push({ time: bp.measuredAt, date: s.date, systolic: bp.systolic, diastolic: bp.diastolic })
-    }
-  })
-  all.sort((a, b) => a.time - b.time)
-  bpTrend.value = all
+  try {
+    // 原来是每条记录串行拉一次血压（30 条 = 30 次往返），改成全部并行
+    const lists = await Promise.all(recent.map((s) => repository.listBloodPressures(s.id)))
+    const all: { time: number; date: string; systolic: number; diastolic: number }[] = []
+    recent.forEach((s, i) => {
+      for (const bp of lists[i]) {
+        all.push({ time: bp.measuredAt, date: s.date, systolic: bp.systolic, diastolic: bp.diastolic })
+      }
+    })
+    all.sort((a, b) => a.time - b.time)
+    bpTrend.value = all
+    bpError.value = false
+  } catch (err) {
+    console.error(err)
+    bpError.value = true
+  }
 }
 
 async function loadGlucoseTrend() {
   const recent = sessions.value.slice(0, 30)
-  const lists = await Promise.all(recent.map((s) => repository.listBloodGlucoses(s.id)))
-  const all: { time: number; date: string; value: number }[] = []
-  recent.forEach((s, i) => {
-    for (const g of lists[i]) {
-      all.push({ time: g.measuredAt, date: s.date, value: g.value })
-    }
-  })
-  all.sort((a, b) => a.time - b.time)
-  gluTrend.value = all
+  try {
+    const lists = await Promise.all(recent.map((s) => repository.listBloodGlucoses(s.id)))
+    const all: { time: number; date: string; value: number }[] = []
+    recent.forEach((s, i) => {
+      for (const g of lists[i]) {
+        all.push({ time: g.measuredAt, date: s.date, value: g.value })
+      }
+    })
+    all.sort((a, b) => a.time - b.time)
+    gluTrend.value = all
+    gluError.value = false
+  } catch (err) {
+    console.error(err)
+    gluError.value = true
+  }
 }
 
 /**
@@ -144,7 +182,16 @@ const gluOption = computed(() => ({
       <van-skeleton title :row="8" />
     </div>
 
-    <template v-if="!loading">
+    <!-- 加载失败：和「暂无数据」分开显示，并给重试入口（失败不等于没数据） -->
+    <div v-if="!loading && loadError" class="card" style="margin-top: 12px">
+      <van-empty image="error" description="趋势数据加载失败，请检查网络后重试">
+        <van-button type="primary" round size="small" :loading="retrying" :disabled="retrying" @click="retry">
+          重试
+        </van-button>
+      </van-empty>
+    </div>
+
+    <template v-if="!loading && !loadError">
     <van-tabs v-model:active="active">
       <van-tab title="体重">
         <div class="card" style="margin-top: 12px">
@@ -156,14 +203,28 @@ const gluOption = computed(() => ({
       <van-tab title="血压">
         <div class="card" style="margin-top: 12px">
           <div class="card-title">血压趋势（近 30 次）</div>
-          <BaseChart v-if="bpTrend.length" :option="bpOption" />
+          <template v-if="bpError">
+            <van-empty image="error" description="血压数据加载失败">
+              <van-button size="small" type="primary" plain :loading="retrying" :disabled="retrying" @click="retry">
+                重试
+              </van-button>
+            </van-empty>
+          </template>
+          <BaseChart v-else-if="bpTrend.length" :option="bpOption" />
           <van-empty v-else description="暂无血压数据" />
         </div>
       </van-tab>
       <van-tab title="血糖">
         <div class="card" style="margin-top: 12px">
           <div class="card-title">血糖趋势（近 30 次）</div>
-          <BaseChart v-if="gluTrend.length" :option="gluOption" />
+          <template v-if="gluError">
+            <van-empty image="error" description="血糖数据加载失败">
+              <van-button size="small" type="primary" plain :loading="retrying" :disabled="retrying" @click="retry">
+                重试
+              </van-button>
+            </van-empty>
+          </template>
+          <BaseChart v-else-if="gluTrend.length" :option="gluOption" />
           <van-empty v-else description="暂无血糖数据" />
         </div>
       </van-tab>

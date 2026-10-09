@@ -179,7 +179,12 @@ drop policy if exists patients_insert on public.patients;
 drop policy if exists patients_update on public.patients;
 drop policy if exists patients_delete on public.patients;
 create policy patients_select on public.patients for select using (public.is_member(id));
-create policy patients_insert on public.patients for insert with check (auth.uid() is not null);
+-- 刻意**不建 insert 策略**：前端从不直接插入病人档案（新建走 create-patient Edge Function，
+-- 用 service_role 绕过 RLS），因此普通用户不需要 insert 权限。
+-- 曾经这里是 `with check (auth.uid() is not null)`（等于人人可插），配上前端 savePatient 的
+-- upsert 语义，一旦 currentPatientId 是个脏值（例如本地遗留的 patient-default、或换账号后
+-- 列表还没拉到），就会在云端插出一行没有任何 patient_members 的「孤儿」档案 —— 谁也看不到、
+-- 谁也删不掉，只能进后台清理。
 create policy patients_update on public.patients for update using (public.is_member(id, array['owner']));
 create policy patients_delete on public.patients for delete using (public.is_member(id, array['owner']));
 

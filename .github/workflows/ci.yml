@@ -1,0 +1,19 @@
+name: CI
+
+# 日常质量门禁：任何分支的 push 与所有 PR 都会跑
+# （main 分支额外会被 deploy*.yml / build-apk.yml 里的同名门禁再挡一次 ——
+#  那些是「发布前必须过」，这里是「尽早发现」）
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 门禁
+    uses: ./.github/workflows/test.yml
+    secrets: inherit
