@@ -59,19 +59,42 @@ if (!hasDom) {
 }
 
 // ------------------------------------------------------------------
-// 3. Vue Test Utils 全局配置
+// 3. 定时器兜底：Vant 的 Tabs / Swipe 会在 setTimeout 里去读 window
+//    （@vant/use 的 useRect / setHeight）。如果这个定时器在本测试文件的
+//    jsdom 环境销毁之后才触发，就会抛 "window is not defined"，被 vitest
+//    记成 unhandled error —— 现象很迷惑：43 个测试文件全都 passed，
+//    但 vitest 退出码是 1（CI 时序更慢，那边几乎必现）。
+//    这里记录本文件创建的所有定时器，在环境还在时统一清掉。
+// ------------------------------------------------------------------
+const domTimers = new Set<ReturnType<typeof setTimeout>>()
+
+if (hasDom) {
+  const origSetTimeout = window.setTimeout.bind(window)
+  window.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+    const id = origSetTimeout(handler as TimerHandler, timeout, ...(args as []))
+    domTimers.add(id)
+    return id
+  }) as typeof window.setTimeout
+}
+
+// ------------------------------------------------------------------
+// 4. Vue Test Utils 全局配置
 // ------------------------------------------------------------------
 // 渲染期的 Vue 警告视为「值得知道」但不失败；需要断言警告的用例自行覆盖 warnHandler
 config.global.stubs = {}
 
 // ------------------------------------------------------------------
-// 4. 每个用例后清理状态，避免隐性串味
+// 5. 每个用例后清理状态，避免隐性串味
 // ------------------------------------------------------------------
 beforeEach(() => {
   if (hasDom) localStorage.clear()
 })
 
 afterEach(() => {
+  // 先清定时器：此时 jsdom 还在，clearTimeout 有效；等文件级 teardown 之后
+  // 它们再触发就来不及了（会变成 unhandled error，测试全过但退出码为 1）
+  for (const id of domTimers) clearTimeout(id)
+  domTimers.clear()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   if (hasDom) document.body.innerHTML = ''
