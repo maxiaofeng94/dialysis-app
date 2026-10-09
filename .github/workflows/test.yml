@@ -52,8 +52,16 @@ jobs:
           if [ $code -ne 0 ]; then
             # 只把「失败清单 + 覆盖率总数」转成注解，避免被长长的覆盖率表格冲掉
             {
+              echo "=== exit=$code ==="
+              echo "=== 环境 ==="
+              node --version
+              npx vitest --version 2>&1 | head -2
+              echo "=== 输出头部 30 行 ==="
+              head -30 /tmp/test-output.txt
               echo "=== 失败 / 阈值摘要 ==="
-              grep -nE "^ *(FAIL|❯|×)|ERROR:|does not meet|Test Files|Tests  " /tmp/test-output.txt | head -40
+              grep -nE "^ *(FAIL|❯|×)|ERROR:|does not meet|Test Files|Tests  " /tmp/test-output.txt | head -20
+              echo "=== 含 error/unhandled 的行 ==="
+              grep -inE "unhandled|rejection|error" /tmp/test-output.txt | grep -viE "Error: offline" | head -20
               echo "=== 覆盖率 All files ==="
               grep -E "All files" /tmp/test-output.txt | head -3
             } | sed 's/^/::error::/'
