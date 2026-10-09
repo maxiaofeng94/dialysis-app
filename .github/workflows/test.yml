@@ -39,8 +39,20 @@ jobs:
         run: npm ci
 
       # 覆盖率阈值写在 vitest.config.ts 里，跌破阈值这一步会红
+      #
+      # 失败时把尾部输出转成 ::error:: 注解：GitHub 的完整日志需要登录才能看，
+      # 而 check-run 的 annotations 通过 API 就能读到（公开仓库免 token），
+      # 这样「CI 红了但看不到原因」的情况就不会再发生。
       - name: 运行全部测试
-        run: npm run test:coverage
+        run: |
+          set +e
+          npm run test:coverage > /tmp/test-output.txt 2>&1
+          code=$?
+          cat /tmp/test-output.txt
+          if [ $code -ne 0 ]; then
+            tail -60 /tmp/test-output.txt | sed 's/^/::error::/'
+          fi
+          exit $code
 
       - name: 上传覆盖率报告
         if: always()
