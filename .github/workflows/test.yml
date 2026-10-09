@@ -51,22 +51,15 @@ jobs:
           cat /tmp/test-output.txt
           echo "::notice::vitest exit=$code | 内存：$(free -m | awk 'NR==2{print $3"/"$2" MB used"}')"
           if [ $code -ne 0 ]; then
-            # 失败时把关键信息转成注解：GitHub 的完整日志要登录才能看，
-            # check-run annotations 通过 API 就能读到（公开仓库免 token）。
+            # 每次只输出极少几行：GitHub 每个 check-run 最多 50 条注解，
+            # 输出一多就会被截断，反而看不到关键信息。
             {
-              echo "=== exit=$code ==="
-              echo "=== 内存 ==="
-              free -m
-              echo "=== 是否有进程被 OOM 杀掉 ==="
-              (dmesg 2>/dev/null | grep -iE "killed process|out of memory" | tail -5) || echo "(dmesg 不可读)"
-              echo "=== vitest 输出末尾 6 行 ==="
-              tail -6 /tmp/test-output.txt
-              echo "=== vitest 输出开头 100 行（Unhandled Errors 段在总结之前）==="
-              head -100 /tmp/test-output.txt
-              echo "=== 失败 / 阈值摘要 ==="
-              grep -nE "^ *(FAIL|❯|×)|ERROR:|does not meet|Test Files|Tests  |Unhandled" /tmp/test-output.txt | head -20
-              echo "=== 覆盖率 All files ==="
-              grep -E "All files" /tmp/test-output.txt | head -3
+              echo "exit=$code"
+              echo "Unhandled段: $(grep -n 'Unhandled' /tmp/test-output.txt | head -3 | tr '\n' ' ')"
+              echo "TestFiles: $(grep -n 'Test Files' /tmp/test-output.txt | head -2 | tr '\n' ' ')"
+              echo "Tests行: $(grep -n '^ *Tests ' /tmp/test-output.txt | head -2 | tr '\n' ' ')"
+              echo "Duration: $(grep -n 'Duration' /tmp/test-output.txt | head -1 | tr '\n' ' ')"
+              echo "覆盖率: $(grep -E 'All files' /tmp/test-output.txt | head -1)"
             } | sed 's/^/::error::/'
           fi
           exit $code
