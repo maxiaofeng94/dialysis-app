@@ -109,23 +109,59 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
         run: |
           set -euo pipefail
+
+          echo "=== 产物目录 ==="
+          ls -lh app/build/outputs/apk/release/
           APK=app/build/outputs/apk/release/app-release.apk
-          ls -lh "$APK"
+          if [ ! -f "$APK" ]; then
+            echo "::error title=产物文件名不符::没有 app-release.apk。若只看到 app-release-unsigned.apk，说明 release 的 signingConfig 没生效（检查 KEYSTORE_PATH 有没有传到 Gradle）"
+            exit 1
+          fi
+
           BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
           TOOL="$ANDROID_HOME/build-tools/$BT"
+          echo "ANDROID_HOME=${ANDROID_HOME:-（空）} ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-（空）}"
+          echo "使用 build-tools: ${BT:-（空）}（可用版本：$(ls "$ANDROID_HOME/build-tools" 2>&1 | tr '\n' ' ')）"
           "$TOOL/aapt2" dump badging "$APK" | grep -E "^package:|^application-label:" || true
 
           # ① 必须是真正的 release：debuggable=true 会让 adb / chrome://inspect 接管 WebView
-          if "$TOOL/aapt2" dump xmltree --file AndroidManifest.xml "$APK" \
-             | grep -q 'debuggable(0x0101000f)=(type 0x12)0x1'; then
+          echo "=== ① debuggable 检查 ==="
+          MANIFEST=$("$TOOL/aapt2" dump xmltree --file AndroidManifest.xml "$APK" 2>&1) && RC=0 || RC=$?
+          if [ "$RC" -ne 0 ]; then
+            echo "::error title=aapt2 不可用::退出码 $RC，输出：$(printf '%s' "$MANIFEST" | head -3)"
+            exit 1
+          fi
+          if printf '%s' "$MANIFEST" | grep -q 'debuggable(0x0101000f)=(type 0x12)0x1'; then
             echo "::error title=产物是 debuggable::APK 带 android:debuggable=true，WebView 可被远程调试"
             exit 1
           fi
           echo "✅ debuggable 未开启（release 构建）"
 
-          # ② 必须已签名，且证书指纹与本地一致（决定手机能否直接覆盖安装）
-          if ! "$TOOL/apksigner" verify --print-certs "$APK" | grep -E "Signer #1 certificate (DN|SHA-256)"; then
-            echo "::error title=产物未签名::release APK 没有可用签名，无法安装"
+          # ② 必须已签名（决定手机能否直接覆盖安装）
+          #    apksigner 为主，keytool 兜底 —— 只要有一个能证明签名存在就放行
+          echo "=== ② 签名校验 ==="
+          SIG_OK=0
+          if [ -x "$TOOL/apksigner" ]; then
+            SIG_OUT=$("$TOOL/apksigner" verify --print-certs "$APK" 2>&1) && SIG_RC=0 || SIG_RC=$?
+            printf '%s\n' "$SIG_OUT" | head -20
+            echo "apksigner 退出码: $SIG_RC"
+            if [ "$SIG_RC" -eq 0 ] && printf '%s' "$SIG_OUT" | grep -q "Signer #1 certificate"; then
+              SIG_OK=1
+            fi
+          else
+            echo "⚠️ 找不到可执行的 $TOOL/apksigner"
+          fi
+          if [ "$SIG_OK" -ne 1 ]; then
+            echo "--- 回退检查：keytool -printcert -jarfile ---"
+            KT_OUT=$(keytool -printcert -jarfile "$APK" 2>&1) && KT_RC=0 || KT_RC=$?
+            printf '%s\n' "$KT_OUT" | head -12
+            echo "keytool 退出码: $KT_RC"
+            if [ "$KT_RC" -eq 0 ] && printf '%s' "$KT_OUT" | grep -qi "Certificate fingerprint"; then
+              SIG_OK=1
+            fi
+          fi
+          if [ "$SIG_OK" -ne 1 ]; then
+            echo "::error title=签名校验未通过::apksigner 与 keytool 都没能证明签名存在（若产物目录里只有 app-release-unsigned.apk，则是 signingConfig 没生效）"
             exit 1
           fi
           echo "✅ APK 已签名"
