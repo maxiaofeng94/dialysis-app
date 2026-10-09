@@ -1,0 +1,26 @@
+/**
+ * Vant 图标字体本地化
+ *
+ * Vant 4 的图标默认从阿里 CDN（at.alicdn.com）加载字体，有两个问题：
+ *   1. 生产环境的 CSP 是 `font-src 'self' data:`，CDN 请求会被拦下
+ *      （控制台每次都报一条 CSP violation，只有 woff2 侥幸能加载）；
+ *   2. 更关键的是**离线场景**——透析室信号差是常态，字体下不来时图标就是空白，
+ *      而图标承担了「返回 / 删除 / 分享 / 记录 / 状态切换」等主要操作入口。
+ *
+ * 这里把字体放进 public/fonts/ 并从本地引用，再用 CSS 变量接管字体族
+ * （Vant 的 .van-icon 用的是 `var(--van-icon-font-family, "vant-icon")`），
+ * 这样它运行时注入的那个 CDN @font-face 就不会再被任何元素引用。
+ */
+@font-face {
+  font-family: 'vant-icon-local';
+  src:
+    url('/fonts/vant-icon.woff2') format('woff2'),
+    url('/fonts/vant-icon.woff') format('woff');
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+}
+
+:root {
+  --van-icon-font-family: 'vant-icon-local';
+}
