@@ -169,6 +169,80 @@ Set-Location ..
 - **每个写操作按钮都要 in-flight 守卫**：云端下一次保存要等网络，没有 loading/disabled 时用户会连点 ——「立即创建」连点两次就是两条透析记录，子记录弹窗同理
 - **写失败必须给提示**：对非技术用户，「没有报错」＝「已经存好了」。曾经详情页所有写操作都没有 `catch`，断网时填的体重/血压静默丢失；同一项目的成员页却每个写操作都有 try/catch + toast
 - **不可逆操作（导入覆盖、迁移到云端、删除、退出登录）要二次确认并写清后果**：包括「会删掉哪几个病人、共多少条记录」「本机数据会被覆盖且无法撤销」
+- **「负数」在业务界面上要钳制**：脱水量算出来是「上机前实际体重 − 干体重」，称重忘了扣轮椅或干体重填错时会得到 -20 之类的值，
+  直接显示「计划脱水 -20.0 L」会被家属读成「要往身体里输 20 升」→ 三个脱水量统一 `Math.max(0, x)`（`calc.ts` 的 `nonNegative`）。
+  **但体重本身不钳制**：那是原始测量值，填错了要照实显示，否则用户永远发现不了
+
+### GitHub Actions / CI
+
+- **CI 红了却看不到日志**：GitHub 的完整 job 日志**需要登录**才能看（页面上的日志是懒加载的，未登录时 DOM 里根本没有内容）。
+  公开仓库可以走 **check-run annotations**（免 token）：`GET /repos/<owner>/<repo>/actions/runs?per_page=N` 找 run →
+  `GET .../actions/jobs/<job_id>` 拿 `check_run_url` → `GET <check_run_url>/annotations`。
+  所以值得在 workflow 里把失败关键信息转成注解：`... | sed 's/^/::error::/'`。
+  ⚠️ **每个 check-run 最多 50 条注解**，超了静默截断——诊断输出压到 5~6 行（曾输出 60 行覆盖率表格，把真正的错误挤没了）。
+- **同一个提交、不同 workflow 跑同一套测试却一绿一红 = 测试不稳定（flaky）**，不是 runner 配置差异，别往那个方向查。
+- **「测试全过、覆盖率达标，但退出码是 1」** → 几乎一定是 **Unhandled Errors**（见下一节）。
+- **`paths:` 过滤**：`deploy-admin.yml` / `build-apk.yml` 只在特定路径变化时触发，**改测试或 workflow 不会触发部署**。
+  要让后台/APK 重新出包，提交里必须包含 `src/**`、`public/**`、`admin/**` 这类路径；
+  `workflow_dispatch` 需要权限（没 token 时无法手动重跑），所以只能靠再推一个匹配 paths 的提交。
+- **CI 不会部署 Edge Functions**：`functions deploy` 只在本地手动跑（推送后别忘了，否则线上函数还是旧版）。
+- 查状态比看页面快：`GET /repos/maxiaofeng94/dialysis-app/actions/runs?per_page=20`，再用 `run.jobs_url` 拿步骤级结论。
+
+### 测试环境（vitest + jsdom）
+
+- **「测试全过但退出码 1」的头号原因：未处理的错误**。vitest 把它打印在 `Test Files / Tests` 汇总**之前**，
+  只看输出尾部会漏掉。本项目踩到的是 **Vant 的 Tabs/Swipe 挂的 `setTimeout`** 在 jsdom 销毁后才触发，
+  抛 `window is not defined`。修法在 `tests/setup/setup.ts`：包装 `window.setTimeout` 记录 id，`afterEach` 里清掉。
+  ⚠️ 这类问题**本地（Windows/快）常常躲过、CI（Linux/慢）几乎必现**，「本地全绿」不能当作 CI 会绿的理由。
+- **`.env` 必须隔离**：`vitest.config.ts` 用 `envDir` 指向不存在的 `tests/.no-env`，`setup.ts` 再断言
+  `VITE_SUPABASE_*` 为空。本机 `.env` 连的是测试库，一旦被带进测试，同一份用例在本地与 CI 的表现就会不一致。
+- **假 Supabase 要支持多级排序**（`.order().order()`）：只保留最后一次 `order` 会让二级排序键失效，出现假绿。
+- 断言 toast/提示时**必须过滤可见性**（见「浏览器实测」），否则读到的是历史残留。
+
+### PWA 与生产产物
+
+- **Service Worker 会缓存旧脚本**：部署完新版本后，用户（和验证时的你）可能仍看到旧版。
+  实测生产环境前先清再刷新，否则会对着旧代码下结论（本轮就误判过一次）：
+  ```js
+  for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister()
+  for (const k of await caches.keys()) await caches.delete(k)
+  ```
+- **别只看首页 HTML 判断版本**（浏览器会缓存它）：用 `fetch('/?v=' + Date.now(), { cache: 'reload' })` 抓最新 HTML，
+  再看 `/assets/index-*.js` 的 hash 有没有变。
+- **Vant 图标字体默认从 `at.alicdn.com` 加载**（运行时注入 @font-face）：生产 CSP 是 `font-src 'self' data:`，
+  回退用的 woff 会被拦（控制台每次报 violation），**离线时图标直接空白**——对信号差的医院是硬伤。
+  已本地化：字体放 `public/fonts/`，用 `.van-icon` 支持的 `--van-icon-font-family` 变量指向本地族名，
+  样式在 `src/styles/vant-icon-font.css`，**必须 import 在 `vant/lib/index.css` 之后**。
+
+### 浏览器实测（Playwright MCP）
+
+- **Vant 的 toast / popup 关闭后 DOM 仍在**（只是高度/透明度为 0）：读提示必须过滤可见性，否则会拿到上一条历史提示、
+  得出完全错误的结论；`body.innerText` 里也会残留已关闭弹窗的文本，不能据此判断「弹窗还开着」。
+  ```js
+  [...document.querySelectorAll('.van-toast')].find((e) => e.getBoundingClientRect().height > 0)?.innerText
+  ```
+- **元素定位的坑**：Vant 按钮是 `<button><span>文字</span></button>`，用 `children.length === 0` 匹配不到，要用
+  `textContent.includes()`；数值常被拆进多个 `<span>`，`textContent === '7.8 mmol/L'` 会失败，改成 `closest('.card')`
+  后在容器里找；`van-dialog` 只用于 `showDialog`，**普通弹窗是 `.van-popup`**，Element Plus 则是 `.el-dialog`。
+- **弹窗操作优先用原生 DOM 点击**（`page.evaluate` 里 `el.click()`），比 locator 稳，省掉「不可见/不稳定」的重试等待。
+- **验证下载型功能**（导出备份、报告图片）用 `page.on('download')` + `download.createReadStream()` 读内容，
+  比只看「有没有触发下载」可靠得多，还能顺带核对备份里的表与条数。
+- **`page.evaluate` 注入 DOM 当探针**很好用：插一个 `<i class="van-icon">` 再看 `document.fonts` 的状态，
+  就能判断图标字体到底加载没有。
+- **只读实测的纪律**：详情页/设置页的输入框有**防抖自动保存**，`fill()` 一下就等于改了线上数据。
+  只读验证只做「导航 + 读文本 + 点页面跳转」，**绝不碰输入框、绝不点保存/创建/删除类按钮**。
+- 未登录/只读状态下可测的面比想象中大：路由守卫、表单校验、错误文案、静态资源、响应头、manifest、SW，
+  以及**产物里连的是哪个库**（grep 打包 JS 里的 `<ref>.supabase.co`）。
+
+### Vite dev server（本地预览）
+
+- **`--force` 会重建 `node_modules/.vite`**，而多个 dev server 共享这份缓存 → 其他端口的服务开始报
+  `504 (Outdated Optimize Dep)`、页面白屏。要么别用 `--force`，要么把所有 dev server 一起重启。
+- **Vite 监听 `.env` 变化并自动重启**：想「临时移走 `.env`」跑单机模式时，一把 `.env` 移回来服务就重启回云端模式。
+  正确做法是**整个测试期间保持移走**，测完再恢复（恢复后要验证文件确实回来了）。
+- **`npm ci` 会被运行中的 dev server 锁住文件**（Windows 直接报「文件被占用」）→ 先停服务再重装。
+- **`npm run dev -- --port 5175` 的端口传不进去**：npm 会吃掉 `--port`、把 `5175` 当成 vite 的 root（页面 404）。
+  直接用 `npx vite --port 5175`。
 
 ---
 
