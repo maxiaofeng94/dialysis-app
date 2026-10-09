@@ -50,7 +50,13 @@ jobs:
           code=$?
           cat /tmp/test-output.txt
           if [ $code -ne 0 ]; then
-            tail -60 /tmp/test-output.txt | sed 's/^/::error::/'
+            # 只把「失败清单 + 覆盖率总数」转成注解，避免被长长的覆盖率表格冲掉
+            {
+              echo "=== 失败 / 阈值摘要 ==="
+              grep -nE "^ *(FAIL|❯|×)|ERROR:|does not meet|Test Files|Tests  " /tmp/test-output.txt | head -40
+              echo "=== 覆盖率 All files ==="
+              grep -E "All files" /tmp/test-output.txt | head -3
+            } | sed 's/^/::error::/'
           fi
           exit $code
 
