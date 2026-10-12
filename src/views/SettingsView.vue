@@ -4,6 +4,7 @@ import { showToast, showConfirmDialog, showDialog } from 'vant'
 import { useRouter } from 'vue-router'
 import { useAuth } from '../stores/auth'
 import { Capacitor } from '@capacitor/core'
+import { App } from '@capacitor/app'
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem'
 import { Share } from '@capacitor/share'
 import { repository } from '../repo'
@@ -110,8 +111,26 @@ const newPatientForm = reactive({ name: '', wheelchairWeight: '', rinseBackVolum
 const loading = ref(true)
 /** 加载失败：骨架必须收起并给出「重试」，否则用户只能杀进程（与首页/详情页保持一致） */
 const loadError = ref('')
+/** 当前版本：装机后想确认「装的是哪一版」时，不用再翻系统设置 */
+const appVersion = ref('')
+
+async function loadAppVersion() {
+  if (!Capacitor.isNativePlatform()) {
+    // 网页端跟着部署走（SW 换新后会自动重载），没有「装在手机上的哪一版」这个概念
+    appVersion.value = '网页版 · 自动更新'
+    return
+  }
+  try {
+    const info = await App.getInfo()
+    appVersion.value = `版本 ${info.version}（build ${info.build}）`
+  } catch {
+    // 拿不到就不显示 —— 不值得为了一个版本号打扰用户
+    appVersion.value = ''
+  }
+}
 
 onMounted(async () => {
+  void loadAppVersion()
   await load()
   if (!isLoggedIn.value) return
   // 下面几项是锦上添花（我的病人 / 角色 / 我的账号）：拉不到不该挡住页面主体，
@@ -711,6 +730,11 @@ function showHelp() {
         </div>
       </div>
     </van-popup>
+
+    <!-- 版本号放页面最底部：装机后想确认「装的是哪一版」，不用再去翻系统设置 -->
+    <div v-if="appVersion" class="muted" style="text-align: center; padding: 18px 0 6px">
+      {{ appVersion }}
+    </div>
     </template>
   </div>
 </template>

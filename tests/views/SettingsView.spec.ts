@@ -1179,3 +1179,13 @@ describe('SettingsView · 非创建者的写入收口（H6）', () => {
     expect(w.text()).not.toContain('仅创建者可修改病人配置')
   })
 })
+
+describe('SettingsView · 版本号', () => {
+  it('页面底部显示当前版本，用户不必去翻系统设置', async () => {
+    const w = await mountSettings()
+
+    // 测试跑在 jsdom，等同于网页端：网页端跟着部署走（SW 换新后自动重载），
+    // 没有「装在手机上的哪一版」这个概念；原生端走 App.getInfo() 显示真实版本号
+    expect(w.text()).toContain('网页版 · 自动更新')
+  })
+})
