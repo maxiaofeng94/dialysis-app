@@ -247,6 +247,29 @@ Remove-Item Env:\DISABLE_SW
 - **不可逆操作要二次确认并写清后果**（导入覆盖、迁移、删除、退出登录）：包括「会删掉哪几个病人、多少条记录」
 - **业务数值为负要钳制**：脱水量 = 上机前实际体重 − 干体重，称重忘了扣轮椅时会得到 -20 之类，显示「计划脱水 -20.0 L」会被读成「要输 20 升」→ 三个脱水量统一 `Math.max(0, x)`（`calc.ts` 的 `nonNegative`）。**但体重本身不钳制**（原始测量值要照实显示，否则发现不了填错）
 
+### 移动端布局与交互（真机才暴露）
+
+- **`viewport-fit=cover` 必须配安全区适配**：`index.html` 声明了 cover，页面会一直铺到
+  iPhone 的刘海 / 灵动岛区域 —— 而**状态栏那一块会拦截触摸**，顶部导航不加
+  `padding-top: env(safe-area-inset-top)` 就成了「看得见、点不到」
+  （实际症状：首页右上角的「＋ 新建」点不动，用户报的「顶部操作栏被遮挡」就是它）。
+  底部 tabbar 同理要避开手势条。安全区统一用 `--app-safe-top/bottom` 包一层
+  （见 `src/style.css`），这样 Playwright 能覆盖变量复现刘海布局 ——
+  `env()` 在桌面浏览器里恒为 0，**不包一层就没法自动化验证**
+- ⚠️ 安全区**只加在 `.van-nav-bar` 与 `.van-tabbar--fixed` 上**，不要顺手给 `.page` 也加，
+  否则两层 padding 叠加，正常机型上也会多出一大块空白
+- **Android 返回键必须自己接管**：Capacitor 只在 JS 侧注册了 `backButton` 监听时才不执行
+  系统默认的 `finish()`。不注册 = 在任何页面（**包括弹窗打开时**）按返回都直接退出 App，
+  正在弹窗里填的血压 / 血糖全丢 —— 用户的感受就是「App 又没了」。
+  优先级：关弹层 → 退回上一页 → 首页双击退出（`src/lib/backButton.ts`）
+- ⚠️ 返回键的两个坑：**Vant 弹窗关闭后 DOM 仍在（高度为 0）**，不过滤可见性就永远
+  「还有弹窗开着」、返回键彻底失灵；**命令式对话框只能点「取消」** ——
+  点确认等于替用户确认了删除记录 / 删除病人这类不可逆操作
+- ⚠️ 只在 Android 上接管：iOS 没有系统返回键，而且 Apple 不允许应用主动退出
+- 装原生插件后必须 `npx cap sync android`，并把 `android/app/capacitor.build.gradle`、
+  `android/capacitor.settings.gradle`、`android/app/src/main/assets/capacitor.plugins.json`
+  一并提交，否则别人 clone 后构建的 APK 缺插件
+
 ### GitHub Actions / CI
 
 - **CI 红了却看不到日志**：完整 job 日志**需要登录**（页面日志是懒加载的，未登录时 DOM 里没有内容）。公开仓库改走 **check-run annotations**（免 token）：`GET /repos/<o>/<r>/actions/runs` 找 run → `GET .../actions/jobs/<id>` 拿 `check_run_url` → `GET <check_run_url>/annotations`。所以值得把失败关键信息转成注解（`... | sed 's/^/::error::/'`）。⚠️ **每个 check-run 最多 50 条注解**，超了静默截断 —— 诊断输出压到 5~6 行

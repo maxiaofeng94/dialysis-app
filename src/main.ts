@@ -4,6 +4,7 @@ import Vant from 'vant'
 import 'vant/lib/index.css'
 import App from './App.vue'
 import router from './router'
+import { setupAndroidBackButton } from './lib/backButton'
 import './style.css'
 // 必须放在 vant 的 CSS 之后：它用 CSS 变量接管图标字体族，指向本地字体文件
 import './styles/vant-icon-font.css'
@@ -70,3 +71,6 @@ router.isReady().then(mountApp, mountApp)
 window.setTimeout(mountApp, 12000)
 
 reloadOnServiceWorkerUpdate()
+
+// 不接管的话，Android 上在任何页面按返回键都会直接退出 App（正在填的数据全丢）
+setupAndroidBackButton()

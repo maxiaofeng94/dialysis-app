@@ -1,5 +1,18 @@
 :root {
   --van-primary-color: #07c160;
+
+  /**
+   * 安全区（iOS 刘海 / 灵动岛 / 底部手势条）。
+   *
+   * index.html 里用了 `viewport-fit=cover`，页面会一直铺到刘海区域 ——
+   * 顶部导航与底部 tabbar 必须自己让开，否则会被状态栏盖住、**点不动**
+   * （iPhone 上首页右上角的「＋ 新建」点不到就是这个原因）。
+   *
+   * 包一层自定义属性是为了能在测试里覆盖：Playwright 模拟不了真实的 env()，
+   * 但可以改 --app-safe-top 来复现「有刘海」的布局。
+   */
+  --app-safe-top: env(safe-area-inset-top, 0px);
+  --app-safe-bottom: env(safe-area-inset-bottom, 0px);
 }
 * {
   box-sizing: border-box;
@@ -18,6 +31,16 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
     sans-serif;
 }
+
+/* 顶部导航避开状态栏 / 刘海 */
+.van-nav-bar {
+  padding-top: var(--app-safe-top);
+}
+/* 固定在底部的 tabbar 避开手势条 */
+.van-tabbar--fixed {
+  padding-bottom: var(--app-safe-bottom);
+}
+
 #app {
   min-height: 100vh;
 }

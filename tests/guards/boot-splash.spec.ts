@@ -207,6 +207,65 @@ describe('启动兜底 · main.ts 的挂载时机', () => {
   })
 })
 
+describe('移动端安全区（iPhone 刘海 / 底部手势条）', () => {
+  const style = read('src/style.css')
+
+  it('安全区用自定义属性包一层（Playwright 模拟不了 env()，只能靠它复现刘海布局）', () => {
+    expect(style, '缺少 --app-safe-top').toMatch(/--app-safe-top:\s*env\(safe-area-inset-top/)
+    expect(style, '缺少 --app-safe-bottom').toMatch(/--app-safe-bottom:\s*env\(safe-area-inset-bottom/)
+  })
+
+  it('顶部导航避开状态栏 / 刘海', () => {
+    expect(
+      style,
+      '页面用了 viewport-fit=cover（会一直铺到刘海区域），.van-nav-bar 不加 padding-top 的话\n' +
+        '返回按钮与标题会被状态栏盖住、点不动 —— iPhone 上首页右上角的「＋ 新建」就是这个症状',
+    ).toMatch(/\.van-nav-bar\s*\{[^}]*padding-top:\s*var\(--app-safe-top\)/)
+  })
+
+  it('固定在底部的 tabbar 避开手势条', () => {
+    expect(style).toMatch(/\.van-tabbar--fixed\s*\{[^}]*padding-bottom:\s*var\(--app-safe-bottom\)/)
+  })
+
+  it('index.html 声明了 viewport-fit=cover（安全区生效的前提）', () => {
+    expect(index.html).toMatch(/viewport-fit=cover/)
+  })
+})
+
+describe('Android 返回键（不能让系统直接退出 App）', () => {
+  const main = read('src/main.ts')
+  const back = read('src/lib/backButton.ts')
+
+  it('入口注册了返回键接管', () => {
+    expect(main, 'main.ts 没有 setupAndroidBackButton()：任何页面按返回键都会直接退出 App，\n' +
+      '正在弹窗里填的血压 / 血糖全丢').toMatch(/setupAndroidBackButton\(\)/)
+  })
+
+  it('只在 Android 上注册（iOS 没有返回键，Apple 也不允许应用主动退出）', () => {
+    expect(back).toMatch(/getPlatform\(\)\s*!==\s*'android'/)
+  })
+
+  it('弹层关闭前先过滤可见性（Vant 关闭后 DOM 仍在，高度为 0）', () => {
+    expect(
+      back,
+      '不过滤可见性的话会永远以为「还有弹窗开着」，返回键再也退不出去',
+    ).toMatch(/getBoundingClientRect\(\)/)
+  })
+
+  it('命令式对话框只点「取消」，绝不点「确认」', () => {
+    expect(back).toMatch(/van-dialog__cancel/)
+    expect(
+      /van-dialog__confirm/.test(back),
+      '返回键绝不能去点确认按钮：那背后是删除记录 / 删除病人这类不可逆操作',
+    ).toBe(false)
+  })
+
+  it('首页用双击退出，避免误触', () => {
+    expect(back).toMatch(/再按一次返回键退出/)
+    expect(back).toMatch(/exitApp\(\)/)
+  })
+})
+
 describe('启动兜底 · App.vue 的空路由占位', () => {
   const app = read('src/App.vue')
 
