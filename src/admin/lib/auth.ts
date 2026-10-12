@@ -101,22 +101,77 @@ export async function initAuth(): Promise<void> {
   ready.value = true
 }
 
+/**
+ * 网络类失败的重试节奏，与 App 端（src/stores/auth.ts）保持一致：
+ * 弱网下首次请求要现做 DNS + TLS 握手，偶发直接失败，隔一下再试基本就通了。
+ * 长度即额外重试次数。
+ */
+const NETWORK_RETRY_DELAYS_MS = [500, 1500]
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * 这条错误是不是「网络没通」。
+ * 必须用 supabase 返回的**英文原文**判断：密码错了重试一万次也没用，只有网络问题值得重试。
+ */
+function isNetworkFailure(message: string): boolean {
+  const m = (message ?? '').toLowerCase()
+  if (!m) return false
+  return (
+    m.includes('failed to fetch') ||
+    m.includes('network') ||
+    m.includes('load failed') ||
+    m.includes('timeout') ||
+    m.includes('timed out') ||
+    m.includes('abort') ||
+    m.includes('fetch')
+  )
+}
+
 function friendlyAuthError(message: string): string {
   const m = message.toLowerCase()
   if (m.includes('invalid login')) return '手机号或密码不正确'
+  if (isNetworkFailure(m)) return '网络连接失败，请检查网络后重试'
   if (m.includes('email not confirmed')) return '账号未确认'
   if (m.includes('banned') || m.includes('disabled')) return '账号已被禁用，请联系其他管理员'
   if (m.includes('rate limit') || m.includes('too many')) return '尝试过于频繁，请稍后再试'
   return message
 }
 
-/** 登录：手机号 + 密码（与 App 同一套账号），登录后立即校验后台权限 */
+/**
+ * 登录：手机号 + 密码（与 App 同一套账号），登录后立即校验后台权限。
+ *
+ * 网络类失败会自动重试（原来一次失败就弹「网络连接失败」，用户得反复点）。
+ * 密码错、被禁用这类业务错误不重试，立刻返回提示。
+ */
 export async function login(phone: string, password: string): Promise<{ ok: boolean; message: string }> {
   if (!isConfigured) {
     return { ok: false, message: '未配置 Supabase 连接，无法登录' }
   }
-  const { error } = await supabase!.auth.signInWithPassword({ email: phoneToEmail(phone), password })
-  if (error) return { ok: false, message: friendlyAuthError(error.message) }
+
+  const credentials = { email: phoneToEmail(phone), password }
+  const attempts = NETWORK_RETRY_DELAYS_MS.length + 1
+  let lastMessage = ''
+  let signedIn = false
+
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const { error } = await supabase!.auth.signInWithPassword(credentials)
+      if (!error) {
+        signedIn = true
+        break
+      }
+      lastMessage = error.message
+    } catch (err) {
+      lastMessage = err instanceof Error ? err.message : String(err ?? '')
+    }
+    if (!isNetworkFailure(lastMessage) || i === attempts - 1) break
+    await sleep(NETWORK_RETRY_DELAYS_MS[i])
+  }
+
+  if (!signedIn) return { ok: false, message: friendlyAuthError(lastMessage) }
 
   try {
     const who = await api.whoami()

@@ -23,9 +23,10 @@ function stripComments(src: string): string {
 }
 
 const cloudRepo = stripComments(read('src/lib/cloudRepository.ts'))
+const cloudAdmin = stripComments(read('src/lib/cloudAdmin.ts'))
 
 describe('静态守卫 · 云端读接口必须检查 error', () => {
-  it('没有任何「只解构 data、不看 error」的查询', () => {
+  it('cloudRepository 没有任何「只解构 data、不看 error」的查询', () => {
     // 反例形态：`const { data } = await this.client()` —— 出错时 data 为 null，
     // 后面的 `(data ?? []).map(...)` 会把失败静默变成空数据。
     const missed = cloudRepo.match(/const \{ data \} = await this\.client\(\)/g) ?? []
@@ -42,6 +43,45 @@ describe('静态守卫 · 云端读接口必须检查 error', () => {
     const guarded = cloudRepo.match(/if \(error\) throw error/g) ?? []
     // 8 个读方法 + 若干写方法，低于这个数说明有人把检查删了
     expect(guarded.length).toBeGreaterThanOrEqual(8)
+  })
+
+  /**
+   * cloudAdmin 是第二轮才补上的：它同样有读接口，但当时只扫了 cloudRepository，
+   * 于是三个读函数长期「只解构 data」—— 出错时返回空数组，
+   * 首页据此显示「还没有病人档案，去『设置』新建」，会诱导用户建出重复档案。
+   */
+  it('cloudAdmin 也没有「只解构 data、不看 error」的查询', () => {
+    // 只管 PostgREST 查询（supabase!.from(...)）：`auth.getSession()` 是本地读，
+    // 拿不到 session 就等于未登录，那里没有 error 可看
+    const missed = cloudAdmin.match(/const \{ data \} = await supabase!\.from\(/g) ?? []
+
+    expect(
+      missed,
+      `cloudAdmin 里有 ${missed.length} 处读方法没有解构 error（listMyPatients / listMembers / getMyProfile）：\n` +
+        '  后果不是「卡住」而是「骗用户」：首页会说「还没有病人档案，去『设置』新建」，' +
+        'store/patient.ts 里 hasNoCloudPatient() 的 catch 兜底也永远等不到 throw',
+    ).toEqual([])
+  })
+
+  it('cloudAdmin 的读方法都带 if (error) throw error', () => {
+    const guarded = cloudAdmin.match(/if \(error\) throw error/g) ?? []
+    // listMyPatients / listMembers / getMyProfile 三个读方法
+    expect(
+      guarded.length,
+      `cloudAdmin 只有 ${guarded.length} 处 error 检查（应为 3 个读方法）`,
+    ).toBeGreaterThanOrEqual(3)
+  })
+
+  it('cloudAdmin 的 currentUid 读本地 session，不发 /auth/v1/user 往返', () => {
+    expect(
+      /auth\.getSession\(\)/.test(cloudAdmin),
+      'currentUid 应改用 getSession()（只读本地存储）',
+    ).toBe(true)
+    expect(
+      /auth\.getUser\(\)/.test(cloudAdmin),
+      'currentUid 又用回 getUser() 了：它每次都要发一趟 /auth/v1/user，弱网下失败时\n' +
+        '  data.user 为 null，会被调用方的 `if (!uid) return []` 静默变成「一个病人都没有」',
+    ).toBe(false)
   })
 })
 
@@ -74,6 +114,36 @@ describe('静态守卫 · 缓存读函数必须有 FRESH_MS 闸门', () => {
       'cloudAdmin 里命中缓存就无条件后台刷新 + cacheVersion++ 的话，会和页面的 watch(cacheVersion)\n' +
         '  组成自激循环（成员页曾每轮打一次 join 查询）。两个读函数都必须有 FRESH_MS 判断',
     ).toBe(2)
+  })
+})
+
+describe('静态守卫 · 加载失败必须有出口（不能只剩骨架）', () => {
+  it('SettingsView 的 load() 用 finally 收起骨架，并给出可见的错误文案', () => {
+    const src = stripComments(read('src/views/SettingsView.vue'))
+
+    expect(
+      /finally\s*\{[\s\S]{0,160}loading\.value\s*=\s*false/.test(src),
+      '设置页的 load() 没有把 loading 放 finally：本机还没有缓存时一旦首次加载失败\n' +
+        '（弱网、令牌失效），页面会永久停在骨架屏上，没有文案也没有「重试」，用户只能杀进程。\n' +
+        '其他页面（首页/详情/趋势/报告）全都是 try/catch + finally + 重试。',
+    ).toBe(true)
+    expect(/loadError/.test(src), '设置页需要可见的加载失败文案与「重试」入口').toBe(true)
+  })
+
+  it('后台管理端的 supabase 客户端与 admin-api 调用都带超时', () => {
+    const adminClient = stripComments(read('src/admin/lib/supabase.ts'))
+    const adminApi = stripComments(read('src/admin/lib/api.ts'))
+
+    expect(
+      /resilientFetch/.test(adminClient),
+      '后台的 supabase 客户端没有注入 global.fetch：supabase-js 默认既不超时也不重试，\n' +
+        '弱网下请求会一直挂着（App 端已修，后台漏了 → 两端表现不一致）',
+    ).toBe(true)
+    expect(
+      /resilientFetch/.test(adminApi),
+      'admin-api 用裸 fetch 调用：连上了但服务端不响应时 fetch 不会 reject，\n' +
+        'call() 永不返回 → 页面的 v-loading 与 finally 永远不执行',
+    ).toBe(true)
   })
 })
 

@@ -1,6 +1,7 @@
-import { createClient, type SupabaseClient } from '@supabase/supabase-js'
+import { createClient, type SupabaseClient, type User } from '@supabase/supabase-js'
 import { Capacitor } from '@capacitor/core'
 import { Preferences } from '@capacitor/preferences'
+import { resilientFetch, REQUEST_TIMEOUT_MS } from './resilientFetch'
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined
@@ -10,6 +11,10 @@ export const isCloudConfigured = Boolean(supabaseUrl && supabaseAnonKey)
 
 export const SUPABASE_URL = supabaseUrl ?? ''
 export const SUPABASE_ANON_KEY = supabaseAnonKey ?? ''
+
+// 带超时的 fetch 抽在 lib/resilientFetch.ts（不依赖 Capacitor），后台管理端也用它。
+// 这里重新导出，App 内的模块与测试继续从 lib/supabase 引用即可。
+export { resilientFetch, REQUEST_TIMEOUT_MS }
 
 const isNative = Capacitor.isNativePlatform()
 
@@ -28,75 +33,44 @@ const nativeStorage = {
   },
 }
 
-/** 单次请求最长等待时间：到点就中止，交给上层重试/提示，别让按钮一直转圈 */
-export const REQUEST_TIMEOUT_MS = 15000
-
-/** 只读请求的连接类失败重试节奏（写入类不重试：可能重复插入记录） */
-const RETRY_DELAYS_MS = [400, 1200]
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-/** 只有幂等方法才允许在 fetch 层自动重试 */
-function isIdempotentMethod(method: string | undefined): boolean {
-  const m = (method ?? 'GET').toUpperCase()
-  return m === 'GET' || m === 'HEAD' || m === 'OPTIONS'
-}
-
 /**
- * 「连接根本没建立」类失败：DNS 解析不了、连不上、断网 —— 请求没到达服务端，重试安全。
- * 超时中止（AbortError）**不算**：那种情况下请求可能已经被服务端处理了。
+ * supabase-js 存放 session 的键：`sb-<project-ref>-auth-token`（其 createClient 里的默认值）。
+ * 算不出来时留空 —— 依赖它的 readPersistedUser 会安全地退化成「读不到」。
  */
-function isConnectionFailure(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false
-  const e = err as { name?: string; message?: string }
-  if (e.name === 'AbortError') return false
-  const m = (e.message ?? '').toLowerCase()
-  return e.name === 'TypeError' || m.includes('failed to fetch') || m.includes('network')
-}
-
-/** 单次请求 + 超时；调用方自带的 signal 也会被尊重 */
-async function fetchOnce(input: RequestInfo | URL, init: RequestInit | undefined): Promise<Response> {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
-  const outer = init?.signal
-  if (outer) {
-    if (outer.aborted) controller.abort()
-    else outer.addEventListener('abort', () => controller.abort(), { once: true })
-  }
+function storageKeyFor(url: string): string {
   try {
-    return await fetch(input, { ...init, signal: controller.signal })
-  } finally {
-    clearTimeout(timer)
+    return `sb-${new URL(url).hostname.split('.')[0]}-auth-token`
+  } catch {
+    return ''
   }
 }
 
-/**
- * 给 supabase-js 用的 fetch。
- *
- * 为什么需要它：手机（尤其医院里信号弱、或刚从 Wi-Fi 切到移动数据）首次请求要现做
- * DNS + TLS 握手，偶发会直接失败。supabase-js 默认既不超时也不重试 ——
- * 用户看到「网络连接失败」，再点一次（连接已建立）就好了，也就是反馈里的「要多点几次」。
- *
- * 写入类请求（POST 的 insert/upsert）不在这里重试，避免重试造成重复记录；
- * 登录/注册的重试放在 stores/auth.ts 里显式做。
- */
-export async function resilientFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const retriable = isIdempotentMethod(init?.method)
-  const attempts = retriable ? RETRY_DELAYS_MS.length + 1 : 1
-  let lastError: unknown
+const SESSION_STORAGE_KEY = supabaseUrl ? storageKeyFor(supabaseUrl) : ''
 
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fetchOnce(input, init)
-    } catch (err) {
-      lastError = err
-      if (!retriable || !isConnectionFailure(err) || i === attempts - 1) throw err
-      await sleep(RETRY_DELAYS_MS[i])
-    }
+/**
+ * 直接从持久化存储里读上次登录的用户 —— **不发任何网络请求**。
+ *
+ * 为什么需要它：`auth.getSession()` 在 access token 过期时会顺手去刷新，弱网下可能
+ * 长时间挂住。超时兜底时如果直接判定「未登录」，用户会被赶到登录页、以为自己被登出
+ * （实测：token 刷新被挂住时，打开 App 停在「正在打开…」10 秒后跳到登录页），
+ * 然后在弱网里反复重试登录 —— 而本地明明还存着登录态。
+ *
+ * 拿得到就先当已登录放行：真失效了，后续请求会 401，`onAuthStateChange` 会触发
+ * `SIGNED_OUT` 再清理一次，不会把无效状态留在界面上。
+ */
+export async function readPersistedUser(): Promise<User | null> {
+  if (!isCloudConfigured || !SESSION_STORAGE_KEY) return null
+  try {
+    const raw = isNative
+      ? await nativeStorage.getItem(SESSION_STORAGE_KEY)
+      : localStorage.getItem(SESSION_STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as { user?: User } | null
+    return parsed?.user ?? null
+  } catch {
+    // 存储读不出来（损坏、被清）与「没有登录态」在调用方看来是同一件事
+    return null
   }
-  throw lastError
 }
 
 export const supabase: SupabaseClient | null = isCloudConfigured

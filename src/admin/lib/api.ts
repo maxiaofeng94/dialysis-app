@@ -1,5 +1,6 @@
 import { ref } from 'vue'
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY, isConfigured } from './supabase'
+import { resilientFetch } from '../../lib/resilientFetch'
 import type {
   AdminUserRow,
   AuditRow,
@@ -74,13 +75,15 @@ export async function call<T>(action: string, payload: Record<string, unknown> =
 
   let res: Response
   try {
-    res = await fetch(`${SUPABASE_URL}/functions/v1/admin-api`, {
+    // 用 resilientFetch 拿 15 秒超时（非幂等 POST 不会被它重试）：
+    // 裸 fetch 在「连上了但服务端不响应」时永不返回，页面的 v-loading 会一直转、finally 永不执行。
+    res = await resilientFetch(`${SUPABASE_URL}/functions/v1/admin-api`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ action, payload }),
     })
   } catch {
-    // 断网 / DNS 失败 / 被拦截：浏览器只给 TypeError: Failed to fetch，转成中文提示
+    // 断网 / DNS 失败 / 被拦截 / 超时：浏览器只给 TypeError，转成中文提示
     throw new AdminApiError('网络连接失败，请检查网络后重试', 0)
   }
   const body = (await res.json().catch(() => ({}))) as { error?: string; data?: T; warning?: string }

@@ -24,8 +24,8 @@ import {
 const SUPABASE_URL = 'https://test-project.supabase.co'
 const ANON_KEY = 'test-anon-key'
 
-/** vi.mock 工厂是提升执行的，这里用一个提升出来的可变引用承载「当前假客户端」 */
-const state = vi.hoisted(() => ({ client: null as unknown }))
+/** vi.mock 工厂是提升执行的，这里用一个提升出来的可变引用承载「当前假客户端 / 当前登录用户」 */
+const state = vi.hoisted(() => ({ client: null as unknown, user: null as unknown }))
 
 vi.mock('../../src/lib/supabase', () => ({
   isCloudConfigured: true,
@@ -35,23 +35,40 @@ vi.mock('../../src/lib/supabase', () => ({
   get supabase() {
     return state.client
   },
+  // currentUid() 读本地持久化的登录态（不发网络请求，也不会被 token 刷新挂住）
+  readPersistedUser: async () => state.user,
+  // 真实实现就是「带超时的 fetch」，测试里直连全局 fetch —— stubFetch 打的桩仍然生效
+  resilientFetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
 }))
 
-/** 安装一个新的假 Supabase 客户端 */
+/** 安装一个新的假 Supabase 客户端（默认未登录，需要登录的用例显式调 login()） */
 function installFake(opts: FakeSupabaseOptions = {}): FakeSupabase {
   const fake = makeFakeSupabase(opts)
   state.client = fake.client
+  state.user = null
   return fake
 }
 
-/** 让 auth.getUser() 返回已登录用户 */
+/**
+ * 让「当前登录用户」为 uid。
+ *
+ * `currentUid()` 读的是持久化的登录态（readPersistedUser），`getSession()` 仍然要给 ——
+ * edgeHeaders() 用它取 access_token。
+ */
 function login(fake: FakeSupabase, uid = 'u1') {
-  fake.client.auth.getUser.mockResolvedValue({ data: { user: { id: uid } }, error: null })
+  state.user = { id: uid }
+  fake.client.auth.getSession.mockResolvedValue({
+    data: { session: { access_token: 'test-access-token', user: { id: uid } } },
+    error: null,
+  })
 }
 
-/** 让 auth.getSession() 返回带 access_token 的会话 */
+/** 让 auth.getSession() 返回带指定 access_token 的会话（Edge Function 调用要取它） */
 function withSession(fake: FakeSupabase, token: string) {
-  fake.client.auth.getSession.mockResolvedValue({ data: { session: { access_token: token } }, error: null })
+  fake.client.auth.getSession.mockResolvedValue({
+    data: { session: { access_token: token, user: { id: 'u1' } } },
+    error: null,
+  })
 }
 
 /** fetch 打桩 */
@@ -85,7 +102,7 @@ beforeEach(async () => {
 })
 
 describe('listMyPatients', () => {
-  it('未登录（auth.getUser 返回 null）→ 返回 [] 且不发查询', async () => {
+  it('未登录（auth.getSession 没有 session）→ 返回 [] 且不发查询', async () => {
     const fake = installFake()
 
     await expect(listMyPatients()).resolves.toEqual([])
@@ -537,5 +554,66 @@ describe('setMemberRole / removeMember', () => {
 
     expect(res.ok).toBe(false)
     expect(res.error).toContain('移除成员失败')
+  })
+})
+
+/**
+ * 这一组是「数据污染级」缺陷的回归防线：
+ *
+ * PostgREST 出错时 `data` 为 null，读接口如果不检查 error，`(data ?? []).map(...)`
+ * 会把「查询失败」静默变成「一个病人都没有」。首页据此显示
+ * 「还没有病人档案，去『设置』新建」，用户会真的去建一个重复档案。
+ * `stores/patient.ts` 的 `hasNoCloudPatient()` 里那句 `catch { return false }`
+ * 也因此形同虚设 —— 它压根等不到 throw。
+ *
+ * 之前只有 cloudRepository 全线做了检查，cloudAdmin 这三个读函数漏了。
+ */
+describe('cloudAdmin · 读接口必须把 error 抛出去', () => {
+  /** 让 patient_members / users 的查询返回错误 */
+  const failReads: FakeSupabaseOptions['failOn'] = (call) =>
+    call.op === 'select' ? { message: 'boom: 查询失败' } : null
+
+  it('listMyPatients 报错 → reject，而不是 resolve([])', async () => {
+    const fake = installFake({ failOn: failReads })
+    login(fake)
+
+    await expect(listMyPatients()).rejects.toMatchObject({ message: 'boom: 查询失败' })
+  })
+
+  it('listMyPatients 报错时不把空列表写进缓存（否则后续读取会一直「没有病人」）', async () => {
+    const fake = installFake({ failOn: failReads })
+    login(fake)
+
+    await expect(listMyPatients()).rejects.toThrow()
+
+    // 缓存里不该留下「空病人列表」
+    const cached = await cacheGet(`myPatients:u1`)
+    expect(cached).toBeNull()
+  })
+
+  it('listMembers 报错 → reject，而不是 resolve([])（否则成员页显示「暂无成员」）', async () => {
+    const fake = installFake({ failOn: failReads })
+    login(fake)
+
+    await expect(listMembers('p1')).rejects.toMatchObject({ message: 'boom: 查询失败' })
+  })
+
+  it('getMyProfile 报错 → reject，而不是 resolve(null)', async () => {
+    const fake = installFake({ failOn: failReads })
+    login(fake)
+
+    await expect(getMyProfile()).rejects.toMatchObject({ message: 'boom: 查询失败' })
+  })
+
+  it('查询正常时照常返回数据（别把正常路径一起 reject 了）', async () => {
+    const fake = installFake()
+    login(fake)
+    fake.tables.patient_members = [memberRow()]
+
+    const list = await listMyPatients()
+
+    expect(list).toHaveLength(1)
+    expect(list[0].patient.id).toBe('p1')
+    expect(list[0].role).toBe('owner')
   })
 })

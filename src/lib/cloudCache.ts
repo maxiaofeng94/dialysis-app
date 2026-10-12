@@ -24,6 +24,12 @@ class CloudCacheDB extends Dexie {
   constructor() {
     super('dialysis-cloud-cache')
     this.version(1).stores({ kv: 'key' })
+
+    // 同 db/database.ts：另一个标签页要求升级版本时主动让路，
+    // 否则本页会卡在 blocked 状态 —— 所有缓存读写永久 pending，页面只剩骨架。
+    this.on('versionchange', () => {
+      this.close()
+    })
   }
 }
 

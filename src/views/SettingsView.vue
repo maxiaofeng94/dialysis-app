@@ -108,16 +108,23 @@ const newPatientForm = reactive({ name: '', wheelchairWeight: '', rinseBackVolum
 
 /** 首次加载（本机还没有缓存）时的骨架占位 */
 const loading = ref(true)
+/** 加载失败：骨架必须收起并给出「重试」，否则用户只能杀进程（与首页/详情页保持一致） */
+const loadError = ref('')
 
 onMounted(async () => {
   await load()
-  if (isLoggedIn.value) {
+  if (!isLoggedIn.value) return
+  // 下面几项是锦上添花（我的病人 / 角色 / 我的账号）：拉不到不该挡住页面主体，
+  // 也不能让异常逃出去变成 unhandled rejection —— 更不能影响已经渲染出来的档案表单。
+  try {
     myPatients.value = await listMyPatients()
     // 角色决定「病人配置」能不能改（非 owner 的写入会被数据库静默拒绝）
     await refreshCurrentRole()
     const profile = await getMyProfile()
     myName.value = profile?.name ?? ''
     myPhone.value = profile?.phone ?? ''
+  } catch (err) {
+    console.error(err)
   }
 })
 
@@ -262,14 +269,24 @@ function fillForm(p: Patient | null) {
 }
 
 async function load(force = false) {
-  const pid = currentPatientId.value
-  const [p, dw] = await Promise.all([repository.getPatient(pid), repository.listDryWeights(pid)])
-  patient.value = p ?? null
-  if (force || formSnapshot === null || snapshotForm() === formSnapshot) {
-    fillForm(p ?? null)
+  loadError.value = ''
+  try {
+    const pid = currentPatientId.value
+    const [p, dw] = await Promise.all([repository.getPatient(pid), repository.listDryWeights(pid)])
+    patient.value = p ?? null
+    if (force || formSnapshot === null || snapshotForm() === formSnapshot) {
+      fillForm(p ?? null)
+    }
+    dryWeights.value = dw
+  } catch (err) {
+    console.error(err)
+    // 原来这里没有 catch，`loading` 只在成功路径置 false —— 本机还没有缓存时
+    // 一旦首次加载失败（弱网、令牌失效），设置页就永久停在骨架屏上，没有任何出口。
+    loadError.value = '加载失败，请检查网络后重试'
+  } finally {
+    // 无论成败都要收起骨架（首页/详情页/趋势页/报告页都是这么做的）
+    loading.value = false
   }
-  dryWeights.value = dw
-  loading.value = false
 }
 
 const currentDry = computed(() => getEffectiveDryWeight(dryWeights.value, todayStr()))
@@ -541,7 +558,13 @@ function showHelp() {
       <van-skeleton title :row="6" />
     </div>
 
-    <template v-if="!loading">
+    <!-- 加载失败：骨架与错误态互斥，且必须给出可点的「重试」 -->
+    <div v-else-if="loadError" class="card load-error">
+      <div class="load-error-text">{{ loadError }}</div>
+      <van-button type="primary" round size="small" @click="load()">重试</van-button>
+    </div>
+
+    <template v-else>
     <div class="card">
       <div class="card-title">病人档案</div>
       <van-field v-model="form.name" label="姓名" placeholder="请输入姓名" />
@@ -691,3 +714,19 @@ function showHelp() {
     </template>
   </div>
 </template>
+
+<style scoped>
+/* 加载失败态：与首页/详情页保持一致的观感 */
+.load-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 24px 14px;
+  text-align: center;
+}
+.load-error-text {
+  color: #969799;
+  font-size: 14px;
+}
+</style>

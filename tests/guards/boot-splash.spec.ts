@@ -131,9 +131,24 @@ describe('启动兜底 · index.html 的启动占位', () => {
 describe('启动兜底 · public/boot.js 的职责', () => {
   it('用 ES5 语法（老 WebView 解析不了就直接白屏）', () => {
     expect(boot.length, 'boot.js 是空的').toBeGreaterThan(0)
-    expect(boot, 'boot.js 不要用箭头函数').not.toMatch(/=>/)
-    expect(boot, 'boot.js 不要用模板字符串').not.toMatch(/`/)
-    expect(boot, 'boot.js 不要用 let / const').not.toMatch(/\b(let|const)\s/)
+
+    // 每一条都对应一个真实的语法门槛：命中任何一条，WebView 版本不够的设备
+    // 连「打开失败」的兜底都看不到，直接退回纯白屏 —— 正是这个文件要消灭的形态。
+    // ⚠️ 尾随逗号这条真踩过：文件头注释写着「必须是 ES5」，实际却因为函数实参尾随逗号
+    //    （ES2017，Chrome 58+）在更老的设备上整段解析失败。
+    const violations: Array<[RegExp, string]> = [
+      [/=>/, '箭头函数（ES2015）'],
+      [/`/, '模板字符串（ES2015）'],
+      [/\b(let|const)\s/, 'let / const（ES2015）'],
+      [/,\s*\)/, '函数实参尾随逗号（ES2017）'],
+      [/\.\.\./, '展开 / 剩余运算符（ES2015）'],
+      [/\bclass\s+[A-Za-z_$]/, 'class 声明（ES2015）'],
+      [/\basync\s|\bawait\s/, 'async / await（ES2017）'],
+      [/\?\?|\?\./, '可选链 / 空值合并（ES2020）'],
+    ]
+    const hit = violations.filter(([re]) => re.test(boot)).map(([, name]) => name)
+
+    expect(hit, `boot.js 里出现了非 ES5 语法：${hit.join('、')}`).toEqual([])
   })
 
   it('只在原生壳里清 Service Worker —— Web 端要靠它离线可用', () => {

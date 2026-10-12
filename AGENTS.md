@@ -184,8 +184,50 @@ Remove-Item Env:\DISABLE_SW
   - 登录 / 注册的重试放在 `stores/auth.ts` 里显式做（3 次，退避 500 / 1500ms）
 - **只有「网络类」失败才值得重试**，判定必须用 supabase 返回的**英文原文** ——
   `friendlyAuthMessage` 转成中文之后就认不出来了，会把密码错误也重试三遍
+- **后台管理端与 App 端必须用同一套超时**：`src/admin/lib/supabase.ts` 与
+  `src/admin/lib/api.ts` 曾经都没有超时（前者缺 `global.fetch`，后者是裸 fetch）——
+  弱网下后台页面会永久转圈，因为「超时是唯一能让 finally 跑起来的东西」。
+  `lib/resilientFetch.ts` **无依赖**，两边共用；改完记得对照两端别再走散
+- **`currentUid()` 只能读本地登录态**（`readPersistedUser()`）：`getUser()` 每次都要发
+  一趟 `/auth/v1/user`，失败时会被 `if (!uid) return []` 静默变成「一个病人都没有」；
+  换成 `getSession()` 也不够 —— 它在 token 过期时会顺手刷新，弱网下挂住会把路由守卫里的
+  病人校准一起拖住（实测进首页要 20 秒）
+- 后端返回的**业务错误不重试**：密码错、账号被禁、注册手机号已存在，重试一万次也一样
 - 验证手段：用 Playwright 的 `page.route` 把 `**/auth/v1/token**` 第一次 `abort`，
   断言请求数 = 2 且间隔 ≈500ms；再断言「密码错误」时请求数 = 1
+- **首屏耗时要有量化概念**：生产库（东京）实测**首次**请求 1489ms、后续 ~310ms ——
+  那 1.2 秒就是 DNS + TLS 握手的成本，也正是「再点一次就好了」的原因
+
+### 启动与白屏 · APK 还有一条独立成因
+
+- **产物语法门槛必须显式压下来**。Vite 8 默认 target 打出的入口 chunk 需要 **ES2022
+  （Chrome 94+）**，而 Capacitor 认为「WebView 够用」的门槛只有 **60**
+  （`Bridge.DEFAULT_ANDROID_WEBVIEW_VERSION`），`minSdkVersion` 又允许装到 Android 5.1 ——
+  中间那一整段设备打开就是入口脚本 SyntaxError → 白屏，且 Capacitor 不拦、只静默加载。
+  → `vite.config.ts` 显式 `build.target: 'es2017'`（实测入口压到 ES2020、体积只 +1%），
+  再用 `capacitor.config.json` 的 `minWebViewVersion` + `server.errorPath` 兜住真正太老的设备
+  （显示「请更新 Android System WebView」，而不是白屏）
+- **`public/boot.js` 必须是真 ES5**：它是最后一道兜底，语法不过关就跟着一起白屏。
+  踩过的坑是函数实参**尾随逗号**（ES2017，Chrome 58+）—— 文件头注释写着 ES5 也没用，
+  守卫已扩展到箭头函数 / 模板字符串 / let-const / 尾随逗号 / 展开符 / class / async / 可选链
+
+### 生产环境差异（dev 一切正常、线上或真机才暴露）
+
+- **CSP 才是产物的真实约束**：`_headers` 里是 `script-src 'self'`，**内联脚本会被直接拦掉**
+  （兜底逻辑等于没写）；dev 环境没有 CSP，所以这类问题**只有线上能发现**。
+  `boot.js` 必须保持外链，`tests/guards/boot-splash.spec.ts` 会断言
+  「index.html / admin/index.html 都没有内联 script」
+- **Cloudflare Pages 把「资源不存在」伪装成 `200 + text/html`**（连 `/assets/xxx.js` 也是），
+  配上 `nosniff` 就是 MIME 报错 + 白屏，而状态码是 200 —— 排查时先怀疑
+  「HTML 引用的 hash 资源在新部署里没了」，别被 200 骗了
+- **`/assets/*` 要长缓存**（文件名自带 hash，`_headers` 已配 `immutable`）；
+  但 `/`、`/boot.js`、`/sw.js` **绝不能**长缓存，否则再也更新不了
+- **字体要显式写进 `includeAssets`**：workbox 默认的 `globPatterns` 只覆盖 js/css/html，
+  漏掉 `fonts/vant-icon.*` 的话离线时图标全空白 —— 正好废掉「字体本地化」的初衷
+- **APK 里没有 CSP**（Capacitor 不读 `_headers`）：凡是 Web 端被 CSP 拦下的东西在 APK 里都照跑，
+  所以「APK 正常、网页白屏」这类差异会反复出现
+- **dev server 的局域网 IP 不是 secure context**：`navigator.share / canShare` 在
+  `http://192.168.x.x:5173` 下根本不存在，分享分支只能在 `localhost` 上测
 
 ### 前端缓存与数据
 

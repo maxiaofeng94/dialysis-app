@@ -37,6 +37,8 @@ export function fakeSupabaseModule(opts: {
   client?: unknown
   url?: string
   anonKey?: string
+  /** `readPersistedUser()` 的返回值（超时兜底时读本地登录态用），默认读不到 */
+  persistedUser?: unknown
 } = {}) {
   const configure = opts.configure ?? true
   return {
@@ -44,6 +46,10 @@ export function fakeSupabaseModule(opts: {
     supabase: configure ? (opts.client ?? null) : null,
     SUPABASE_URL: opts.url ?? (configure ? 'https://test-project.supabase.co' : ''),
     SUPABASE_ANON_KEY: opts.anonKey ?? (configure ? 'test-anon-key' : ''),
+    // 真实实现就是「带超时的 fetch」，测试里直连全局 fetch —— 这样
+    // vi.stubGlobal('fetch', ...) 打桩的响应仍然生效
+    resilientFetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
+    readPersistedUser: async () => opts.persistedUser ?? null,
   }
 }
 

@@ -21,6 +21,14 @@ export class DialysisDB extends Dexie {
       bloodFlows: 'id, sessionId',
       adverseReactions: 'id, sessionId',
     })
+
+    // 另一个标签页要求升级数据库版本时，必须主动让路：
+    // 旧连接不让位的话，新页面会一直停在 Dexie 的 `blocked` 状态 ——
+    // open() 既不 resolve 也不 reject，所有表操作全部 pending，
+    // 于是「缓存优先」的每个页面都永久骨架、连 catch 都进不去（web 端多标签页时会遇到）。
+    this.on('versionchange', () => {
+      this.close()
+    })
   }
 }
 

@@ -3,6 +3,10 @@
   "appName": "DialysisRecorder",
   "webDir": "dist",
   "android": {
-    "webContentsDebuggingEnabled": false
+    "webContentsDebuggingEnabled": false,
+    "minWebViewVersion": 80
+  },
+  "server": {
+    "errorPath": "webview-too-old.html"
   }
 }

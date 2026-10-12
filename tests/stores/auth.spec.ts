@@ -27,6 +27,8 @@ interface LoadOptions {
   session?: unknown | null
   /** 是否用自带的 signInWithPassword 实现 */
   signInError?: { message: string } | null
+  /** 超时兜底时从本地存储读到的用户（默认读不到） */
+  persistedUser?: unknown
 }
 
 /** 装载一份全新的 auth store（含可断言的依赖间谍） */
@@ -43,7 +45,13 @@ async function loadAuth(opts: LoadOptions = {}) {
   const cacheClear = vi.fn(async () => {})
   const clearCurrentPatient = vi.fn(async () => {})
 
-  vi.doMock('../../src/lib/supabase', () => fakeSupabaseModule({ configure: configured, client }))
+  vi.doMock('../../src/lib/supabase', () =>
+    fakeSupabaseModule({
+      configure: configured,
+      client,
+      persistedUser: opts.persistedUser ?? null,
+    }),
+  )
   vi.doMock('../../src/lib/cloudCache', () => ({ cacheClear, cacheVersion: { value: 0 } }))
   vi.doMock('../../src/stores/patient', () => ({
     clearCurrentPatient,
@@ -268,7 +276,7 @@ describe('useAuth · login', () => {
 })
 
 describe('useAuth · init 超时兜底', () => {
-  it('getSession() 挂住超过上限：当作未登录放行，而不是让路由守卫永久白屏', async () => {
+  it('getSession() 挂住超过上限也不会永久卡住（本地没有登录态 → 判定未登录）', async () => {
     // 回归：access token 过期时 getSession() 会顺手去刷新，弱网下可能长时间没有响应；
     // 路由守卫 await 它、router-view 又是空的 —— 没有上限就是永久白屏。
     vi.useFakeTimers()
@@ -284,6 +292,26 @@ describe('useAuth · init 超时兜底', () => {
     expect(store.initialized.value).toBe(true)
     expect(store.user.value).toBeNull()
     expect(store.isLoggedIn.value).toBe(false)
+  })
+
+  it('getSession() 挂住但本地存着登录态 → 按已登录放行，不能把人赶到登录页', async () => {
+    // 回归（实测过）：token 刷新被挂住时，超时兜底若直接判定「未登录」，
+    // 用户打开 App 会在 10 秒后被丢到登录页、以为自己被登出，
+    // 然后在弱网里反复重试登录 —— 而本地明明还存着登录态。
+    vi.useFakeTimers()
+    const user = makeUser('u-cached')
+    const { store, client } = await loadAuth({ session: null, persistedUser: user })
+    ;(client.auth.getSession as unknown as { mockImplementation: (f: () => unknown) => void }).mockImplementation(
+      () => new Promise(() => {}),
+    )
+
+    const promise = store.init()
+    await vi.advanceTimersByTimeAsync(11000)
+    await promise
+
+    expect(store.initialized.value).toBe(true)
+    expect(store.user.value).toEqual(user)
+    expect(store.isLoggedIn.value).toBe(true)
   })
 
   it('getSession() 正常返回时不受超时影响', async () => {

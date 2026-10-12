@@ -7,6 +7,10 @@
 #     不打算启用可以删掉 script-src / connect-src / frame-src 里的这一项。
 #   · 产物里没有内联 <script>、没有 eval/new Function（已核对），所以 script-src 不需要 'unsafe-inline'；
 #     style-src 必须保留 'unsafe-inline'，Vue 的 :style 绑定与 Vant/Element Plus 都依赖它。
+#     ⚠️ 这条约定有静态守卫（tests/guards/boot-splash.spec.ts）：往 index.html 里加内联脚本会被断言拦下。
+#   · /assets/* 的文件名自带内容 hash，可以放心长缓存；页内顺序不能反 ——
+#     更具体的规则要排在 /* 之后才会覆盖同名头。
+#     注意**不要**给 /、/boot.js、/sw.js 加长缓存：它们必须能及时更新。
 
 /*
   X-Content-Type-Options: nosniff
@@ -15,3 +19,7 @@
   Permissions-Policy: geolocation=(), camera=(), microphone=(), payment=(), usb=(), magnetometer=(), gyroscope=()
   Strict-Transport-Security: max-age=31536000; includeSubDomains
   Content-Security-Policy: default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://vbamprkcwrpsazkyknjq.supabase.co wss://vbamprkcwrpsazkyknjq.supabase.co https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; manifest-src 'self'; worker-src 'self' blob:
+
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+

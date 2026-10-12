@@ -1,6 +1,13 @@
 import { ref, computed } from 'vue'
 import type { User } from '@supabase/supabase-js'
-import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY, isCloudConfigured } from '../lib/supabase'
+import {
+  supabase,
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY,
+  isCloudConfigured,
+  resilientFetch,
+  readPersistedUser,
+} from '../lib/supabase'
 import { cacheClear } from '../lib/cloudCache'
 import { clearCurrentPatient } from './patient'
 import { withTimeout } from '../utils/timeout'
@@ -66,9 +73,18 @@ async function init(): Promise<void> {
       initialized.value = true
       return
     }
-    // 超时兜底成 null（= 未登录）而不是一直等：宁可让用户看到登录页，也不能白屏
+    // 超时兜底成 null 而不是一直等：宁可让用户看到登录页，也不能白屏
     const session = await withTimeout(supabase!.auth.getSession(), INIT_TIMEOUT_MS, null)
-    user.value = session?.data?.session?.user ?? null
+    if (session) {
+      user.value = session.data.session?.user ?? null
+    } else {
+      // 超时了。注意：`getSession()` 正常只读本地存储，需要发网络请求只可能是
+      // 「access token 过期、正在刷新」—— 也就是说本地明明还存着登录态。
+      // 这时候判定「未登录」会把人赶到登录页，他会以为自己被登出，然后在弱网里
+      // 反复重试登录（实测：刷新被挂住时 10 秒后跳登录页）。先按已登录放行：
+      // 真失效了后续请求会 401，onAuthStateChange 会触发 SIGNED_OUT 再清一次。
+      user.value = await readPersistedUser()
+    }
     supabase!.auth.onAuthStateChange((event, session) => {
       user.value = session?.user ?? null
       // 注意：主动登出也会触发 SIGNED_OUT，这里再清一次是幂等的
@@ -92,7 +108,8 @@ async function callFunction(name: string, body: unknown) {
   for (let i = 0; i < attempts; i++) {
     const last = i === attempts - 1
     try {
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/${name}`, {
+      // 用 resilientFetch 拿超时（非幂等 POST 不会被它重试，重试由上面的循环显式做）
+      const res = await resilientFetch(`${SUPABASE_URL}/functions/v1/${name}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

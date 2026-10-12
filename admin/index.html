@@ -7,9 +7,54 @@
     <!-- 后台管理页面：禁止搜索引擎收录 -->
     <meta name="robots" content="noindex, nofollow" />
     <title>透析记录 · 后台管理</title>
+    <style>
+      /* 启动占位样式必须内联：外链 CSS 到达前页面已经在渲染，否则是白屏。
+         CSP 的 style-src 保留了 'unsafe-inline'，不会被拦（但**不能**加内联 script） */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #f5f7fa;
+      }
+      #admin-boot {
+        position: fixed;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: #f5f7fa;
+        font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      }
+      #admin-boot .logo {
+        width: 48px;
+        height: 48px;
+        border-radius: 12px;
+        background: #409eff;
+        color: #fff;
+        font-size: 24px;
+        font-weight: 700;
+        line-height: 48px;
+        text-align: center;
+      }
+      #admin-boot .tip {
+        margin-top: 12px;
+        color: #909399;
+        font-size: 14px;
+      }
+    </style>
   </head>
   <body>
     <div id="admin-app"></div>
+    <!-- 由 src/admin/main.ts 在首次导航就绪后移除 -->
+    <div id="admin-boot">
+      <div class="logo">透</div>
+      <div class="tip">正在打开后台…</div>
+    </div>
     <!-- Vite root 是项目根，本页通过 / 或 /admin/index.html 访问；相对路径最终解析为 /src/admin/main.ts -->
     <script type="module" src="../src/admin/main.ts"></script>
   </body>

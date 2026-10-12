@@ -29,15 +29,22 @@ async function onSubmit() {
     return
   }
   loading.value = true
-  const res = await login(phone.value, password.value)
-  loading.value = false
-  if (!res.ok) {
-    error.value = res.message
-    return
+  // 必须用 finally 复位：login() 万一抛异常（例如存储不可用），
+  // 原来的写法会让按钮永久停在 loading 上，只能刷新页面。
+  try {
+    const res = await login(phone.value, password.value)
+    if (!res.ok) {
+      error.value = res.message
+      return
+    }
+    ElMessage.success('登录成功')
+    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
+    void router.replace(redirect)
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : '登录失败，请稍后再试'
+  } finally {
+    loading.value = false
   }
-  ElMessage.success('登录成功')
-  const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
-  void router.replace(redirect)
 }
 </script>
 

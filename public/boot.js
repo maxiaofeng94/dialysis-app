@@ -48,7 +48,7 @@
           function (regs) {
             for (var i = 0; i < regs.length; i++) regs[i].unregister()
           },
-          function () {},
+          function () {}
         )
       }
     } catch (e) {}
@@ -60,7 +60,7 @@
           function (keys) {
             for (var i = 0; i < keys.length; i++) caches['delete'](keys[i])
           },
-          function () {},
+          function () {}
         )
       } catch (e) {}
     })
@@ -70,11 +70,16 @@
     var box = splashEl()
     if (failed || mounted || !box) return
     failed = true
+    // 除了网络，还有一类原因是「系统 WebView 太旧、入口脚本解析不了」——
+    // 那种情况光说「检查网络」会把人带偏，所以这里给一条能自己动手的建议。
     box.innerHTML =
       '<div class="boot-logo">透</div>' +
       '<div class="boot-tip">打开失败，请检查网络后重试</div>' +
       '<button type="button" class="boot-retry" id="boot-retry">重新打开</button>' +
-      (detail ? '<div class="boot-detail">' + String(detail).slice(0, 120) + '</div>' : '')
+      '<div class="boot-detail">' +
+      '若反复失败，请在应用商店更新「Android System WebView」或 Chrome 后再试' +
+      (detail ? '<br>' + String(detail).slice(0, 120) : '') +
+      '</div>'
     var btn = document.getElementById('boot-retry')
     if (btn) btn.onclick = function () { location.reload() }
   }
@@ -97,7 +102,7 @@
       }
       fail(e && e.message)
     },
-    true,
+    true
   )
 
   // 脚本压根没跑起来（SW 换掉了、解析失败）时，页面上至少还留一个出口
