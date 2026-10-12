@@ -73,6 +73,9 @@ jobs:
         env:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          # 原生壳禁用 Service Worker：资源全在 APK 本地，SW 预缓存没有收益，
+          # 却会让「覆盖安装后旧 SW 返回旧 index.html + 旧 hash 资源已被清」变成白屏
+          DISABLE_SW: "1"
         run: |
           set -euo pipefail
           if [ -z "${VITE_SUPABASE_URL:-}" ] || [ -z "${VITE_SUPABASE_ANON_KEY:-}" ]; then
@@ -80,6 +83,11 @@ jobs:
             exit 1
           fi
           npm run build
+          # 兜底：sw.js / registerSW.js 一旦混进 APK，覆盖安装后又会回到白屏
+          if [ -e dist/sw.js ] || [ -e dist/registerSW.js ]; then
+            echo "::error title=APK 产物混入了 Service Worker::DISABLE_SW=1 没生效（dist 里出现了 sw.js / registerSW.js）"
+            exit 1
+          fi
 
       - name: 同步 web 产物到 Android 工程
         run: npx cap sync android

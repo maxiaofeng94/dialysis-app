@@ -54,12 +54,16 @@ https://github.com/maxiaofeng94/dialysis-app/releases/download/latest/dialysis-r
 仅在**没推送或 CI 不可用**时本地构建（必须先 `npm run build` + `npx cap sync android`，gradle **必须在 `android` 目录**执行）：
 
 ```powershell
-npm run build; npx cap sync android
+$env:DISABLE_SW = "1"   # 必须！原生壳不能带 Service Worker（见第五节「启动与白屏」）
+npm run build
+if (Test-Path dist\sw.js) { throw "DISABLE_SW 没生效：dist 里仍有 sw.js" }
+npx cap sync android
 $env:ANDROID_HOME = "D:\ai\project\android-sdk"; $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
 $env:JAVA_HOME = "D:\Program Files\jdk-17.0.14"
 Set-Location android
 & "D:\ai\project\android-build\gradle\gradle-8.7\bin\gradle.bat" assembleRelease --console=plain   # release，与 CI 同签名
 Set-Location ..
+Remove-Item Env:\DISABLE_SW
 ```
 
 - 产物在 `android/app/build/outputs/apk/{debug,release}/`，复制到项目根命名 `透析记录-多人版-<版本>.apk`，用 `present` 交付
@@ -142,6 +146,46 @@ Set-Location ..
 - **不要写别人的 `operator_id`**：`sessions_insert/update` 的 `with check` 强制 `operator_id = auth.uid()`，想"保留原记录人"反而让整条更新被拒（且静默）。记录人语义目前是「最后修改人」；要区分创建人得加列 + 触发器
 - **`patients_insert` 不给普通用户**：前端从不直接插病人（新建走 `create-patient` EF 用 service_role）。留成 `auth.uid() is not null` 等于人人可插，配上 upsert 语义，`currentPatientId` 是脏值时会在云端插出没有成员的「孤儿」档案
 - **本地默认 id 别拿去查云端**：`patient-default` 不是 uuid，PostgREST 直接 400 → 读接口抛错、首页显示成「加载失败」。`cloudRepository` 已对这类 id 短路返回空
+
+### 启动与白屏（用户反馈「打开经常一片空白」的根因）
+
+- **原生壳绝不能带 Service Worker**。覆盖安装后 WebView 里还是上一次的 SW 与预缓存，它用
+  `NavigationRoute` 返回**旧的 `index.html`**；而旧 HTML 引用的旧 hash 资源会被新 SW 的
+  `skipWaiting` + 预缓存清理删掉 → 脚本 404 → 白屏。
+  - 原生端：构建时关掉（`DISABLE_SW=1`，见 `vite.config.ts`；`build-apk.yml` 已设并有 dist 守卫）
+  - Web 端：保留 SW（离线可用），但必须在 `controllerchange` 后**自动 reload**（`src/main.ts`），
+    否则「旧页面 + 新 SW」同样 404。⚠️ 首次注册的 `controllerchange` 只是「SW 接管了本页」，
+    别 reload —— 每次第一次访问都会白刷一下
+- **老用户覆盖安装要清残留**：新 APK 里没有 `sw.js` 时，SW 的更新检查会 404 → 浏览器自动注销它，
+  但那一屏可能仍是旧的。真正的兜底是 **`MainActivity.onCreate` 在 WebView 创建前删掉
+  `app_webview/*/Default/Service Worker`** —— Web 侧的 unregister 要等页面脚本跑起来，
+  而白屏恰恰发生在脚本跑起来之前。⚠️ **只删这一棵子树**，IndexedDB（业务数据 / 云端缓存）与
+  SharedPreferences（登录态、当前病人）一概不能碰（`build-invariants.spec.ts` 有断言守着）
+- **`#app` 不能是空的**：2MB 的首屏包在低端机上要解析几秒，以前这段时间就是纯白。现在
+  `index.html` 里有内联样式的启动占位，以及「打开失败 → 重新打开」兜底（只对 SCRIPT /
+  stylesheet 的加载失败报错 —— 图标 404 不该把正常页面换成错误页）。
+  ⚠️ 占位必须在 `#app` **外面**，放里面会被 `app.mount()` 清掉
+- **不要在模块顶层 `app.mount()`**：路由守卫要 await 登录态恢复与病人校准，这期间 `router-view`
+  是空的 —— 提前挂载会先清掉占位、再渲染出一片空白，用户看到的仍是白屏。现在等
+  `router.isReady()` 再挂载，另有 12 秒兜底挂载 + `App.vue` 的 `routeReady` 占位
+- **守卫里每个 await 都要有上限**：`getSession()` 在 token 过期时会顺手刷新、`listMyPatients()`
+  是网络请求，弱网下都可能挂住 → 永久白屏。统一用 `utils/timeout.ts` 的 `withTimeout` 封顶
+- ⚠️ **内联引导脚本必须用 ES5**（老 WebView 解析不了箭头函数 / 模板字符串 = 直接白屏），
+  `tests/guards/boot-splash.spec.ts` 会断言这一点
+
+### 网络与登录（用户反馈「总要提示网络失败，多点几次才行」）
+
+- **supabase-js 既不超时也不重试**：手机上首次请求要现做 DNS + TLS 握手，偶发直接失败，
+  用户看到「网络连接失败」、再点一次（连接已建立）就好了。
+  - `lib/supabase.ts` 注入带超时的 `resilientFetch`（15 秒）；**只在 fetch 层对 GET/HEAD 的
+    连接类失败**自动重试
+  - 写入类（POST）与超时中止（AbortError）**一律不重试**：前者可能重复插入记录，
+    后者请求可能已经到达服务端并被处理
+  - 登录 / 注册的重试放在 `stores/auth.ts` 里显式做（3 次，退避 500 / 1500ms）
+- **只有「网络类」失败才值得重试**，判定必须用 supabase 返回的**英文原文** ——
+  `friendlyAuthMessage` 转成中文之后就认不出来了，会把密码错误也重试三遍
+- 验证手段：用 Playwright 的 `page.route` 把 `**/auth/v1/token**` 第一次 `abort`，
+  断言请求数 = 2 且间隔 ≈500ms；再断言「密码错误」时请求数 = 1
 
 ### 前端缓存与数据
 
@@ -231,6 +275,11 @@ Set-Location ..
 - **构建**：`npm run build`（App）/ `npm run build:admin`（后台）
 - **后台冒烟**：`npm run smoke:admin`（SSR 渲染 8 个页面，抓模板运行时错误）；再配合 `npm run check:admin-dev`（沿 import 递归请求，抓「200 但白屏」）
 - **线上产物连对库没有**：抓首页的 `/assets/index-*.js` 后 grep 项目 ref，确认是 `.env.production` 的生产库（不是测试库）
+- **白屏防线**：`tests/guards/boot-splash.spec.ts` 钉住了启动占位 / 兜底页 / 挂载时机。现场复现用 Playwright：
+  把入口脚本 `page.route` 成 `abort` → 应出现「打开失败 + 重新打开」，点一下要能恢复；
+  把入口脚本延迟 5 秒 → 这期间应看到「正在打开…」而不是纯白
+- **APK 里确实没有 SW**：`DISABLE_SW=1 npm run build` 后断言 `dist/sw.js` 与 `dist/registerSW.js` 都不存在
+  （`build-apk.yml` 里也有同样的守卫）；解包线上 APK 时 `ls assets/public` 不该出现 `sw.js`
 - **云端链路**：写 Node 脚本用 anon key + 测试账号跑「注册 → 建病人 → 写记录 → 邀请成员 → 跨账号可见 → 权限拦截」，比点 UI 更彻底
 - **Edge Function**：`GET /v1/projects/<ref>/functions` 看 status / verify_jwt 是否符合预期
 - **后台越权**：不带 token 调 `admin-api` 应 401；普通用户 token 应 403；管理员直连 PostgREST 查 `sessions` 应读不到别人的病历

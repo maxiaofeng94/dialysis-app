@@ -7,8 +7,13 @@
  *
  * cloudCache 与 stores/patient 同样被替换成间谍，用于断言「登出必须清本机残留」。
  */
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { fakeSupabaseModule, makeAuthClient } from '../helpers/cloud'
+
+// 网络重试用例用假定时器推进退避等待，别让真实等待把测试拖慢
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 /** 假 session 里的用户对象（只用到 id / email） */
 function makeUser(id: string, phone = '13800000000') {
@@ -190,9 +195,13 @@ describe('useAuth · login', () => {
   })
 
   it('网络类报错也转成中文提示', async () => {
+    vi.useFakeTimers()
     const { store } = await loadAuth({ session: null, signInError: { message: 'Failed to fetch' } })
 
-    const res = await store.login('13900000001', 'secret1')
+    const promise = store.login('13900000001', 'secret1')
+    // 网络类失败会重试，推进退避等待让整条链路走完
+    await vi.advanceTimersByTimeAsync(5000)
+    const res = await promise
 
     expect(res).toEqual({ ok: false, message: '网络连接失败，请检查网络后重试' })
   })
@@ -201,6 +210,90 @@ describe('useAuth · login', () => {
     const { store } = await loadAuth({ session: null, signInError: { message: 'boom' } })
     await store.login('13900000001', 'wrong')
     expect(store.user.value).toBeNull()
+  })
+
+  it('首次网络失败会自动重试，第二次成功 —— 用户不必自己再点一次', async () => {
+    // 回归：手机上首次请求要现做 DNS + TLS 握手，偶发直接失败。
+    // 以前一次失败就弹「网络连接失败」，用户要反复点才能登上（真实反馈）。
+    vi.useFakeTimers()
+    const { store, client } = await loadAuth({ session: null })
+    const signIn = client.auth.signInWithPassword as unknown as {
+      mockRejectedValueOnce: (v: unknown) => void
+      mockResolvedValueOnce: (v: unknown) => void
+    }
+    signIn.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    signIn.mockResolvedValueOnce({ data: {}, error: null })
+
+    const promise = store.login('13900000001', 'secret1')
+    await vi.advanceTimersByTimeAsync(1000)
+    const res = await promise
+
+    expect(res).toEqual({ ok: true, message: '登录成功' })
+    expect(client.auth.signInWithPassword).toHaveBeenCalledTimes(2)
+  })
+
+  it('连续网络失败：重试到上限后给出网络提示（不能误报成密码错误）', async () => {
+    vi.useFakeTimers()
+    const { store, client } = await loadAuth({ session: null })
+    ;(client.auth.signInWithPassword as unknown as { mockRejectedValue: (v: unknown) => void }).mockRejectedValue(
+      new TypeError('Failed to fetch'),
+    )
+
+    const promise = store.login('13900000001', 'secret1')
+    await vi.advanceTimersByTimeAsync(10000)
+    const res = await promise
+
+    expect(res).toEqual({ ok: false, message: '网络连接失败，请检查网络后重试' })
+    // 1 次原始 + 2 次重试
+    expect(client.auth.signInWithPassword).toHaveBeenCalledTimes(3)
+  })
+
+  it('密码错误立刻返回，不做重试（重试一万次也还是错的）', async () => {
+    const { store, client } = await loadAuth({ session: null, signInError: { message: 'Invalid login credentials' } })
+
+    const res = await store.login('13900000001', 'wrong')
+
+    expect(res).toEqual({ ok: false, message: '手机号或密码不正确' })
+    expect(client.auth.signInWithPassword).toHaveBeenCalledTimes(1)
+  })
+
+  it('没有 supabase（单机版）时直接给说明，不去调 signInWithPassword', async () => {
+    const { store, client } = await loadAuth({ configured: false })
+
+    const res = await store.login('13900000001', 'secret1')
+
+    expect(res).toEqual({ ok: false, message: '当前是单机版，无需登录' })
+    expect(client.auth.signInWithPassword).not.toHaveBeenCalled()
+  })
+})
+
+describe('useAuth · init 超时兜底', () => {
+  it('getSession() 挂住超过上限：当作未登录放行，而不是让路由守卫永久白屏', async () => {
+    // 回归：access token 过期时 getSession() 会顺手去刷新，弱网下可能长时间没有响应；
+    // 路由守卫 await 它、router-view 又是空的 —— 没有上限就是永久白屏。
+    vi.useFakeTimers()
+    const { store, client } = await loadAuth({ session: null })
+    ;(client.auth.getSession as unknown as { mockImplementation: (f: () => unknown) => void }).mockImplementation(
+      () => new Promise(() => {}),
+    )
+
+    const promise = store.init()
+    await vi.advanceTimersByTimeAsync(11000)
+    await promise
+
+    expect(store.initialized.value).toBe(true)
+    expect(store.user.value).toBeNull()
+    expect(store.isLoggedIn.value).toBe(false)
+  })
+
+  it('getSession() 正常返回时不受超时影响', async () => {
+    const user = makeUser('u1')
+    const { store } = await loadAuth({ session: { user } })
+
+    await store.init()
+
+    expect(store.user.value).toEqual(user)
+    expect(store.isLoggedIn.value).toBe(true)
   })
 })
 
@@ -256,10 +349,14 @@ describe('useAuth · register（走 Edge Function）', () => {
   })
 
   it('响应不是 JSON（网关 502 返回 HTML）→ 兜底失败文案，绝不提示「注册成功」', async () => {
+    vi.useFakeTimers()
     const { store } = await loadAuth({ session: null })
     stubFetch('<html>502 Bad Gateway</html>', 502, 'text/html')
 
-    const res = await store.register('13800000000', 'secret1')
+    const promise = store.register('13800000000', 'secret1')
+    // 5xx 会重试（网关抖动），推进退避等待
+    await vi.advanceTimersByTimeAsync(5000)
+    const res = await promise
 
     // 回归：res.json() 失败后 data 兜底为 {}，message 曾落到默认值「注册成功」，
     // 而 ok=false —— 用户看到「注册成功」却并没有注册上。
@@ -268,11 +365,43 @@ describe('useAuth · register（走 Edge Function）', () => {
   })
 
   it('网络异常不抛出，返回可展示的中文提示', async () => {
+    vi.useFakeTimers()
     const { store } = await loadAuth({ session: null })
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network down') }))
-    const res = await store.register('13800000000', 'secret1')
+
+    const promise = store.register('13800000000', 'secret1')
+    await vi.advanceTimersByTimeAsync(5000)
+    const res = await promise
+
     expect(res.ok).toBe(false)
     expect(res.message).toBe('网络连接失败，请检查网络后重试')
+  })
+
+  it('4xx 是明确的业务结果：不重试，直接把服务端文案交给用户', async () => {
+    const { store } = await loadAuth({ session: null })
+    const fetchMock = stubFetch(JSON.stringify({ error: '该手机号已注册，请直接登录' }), 400)
+
+    const res = await store.register('13800000000', 'secret1')
+
+    expect(res).toEqual({ ok: false, message: '该手机号已注册，请直接登录' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('5xx 自动重试，网关抖动时第二次成功就不再报错', async () => {
+    vi.useFakeTimers()
+    const { store } = await loadAuth({ session: null })
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('bad gateway', { status: 502 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const promise = store.register('13800000000', 'secret1')
+    await vi.advanceTimersByTimeAsync(5000)
+    const res = await promise
+
+    expect(res).toEqual({ ok: true, message: '注册成功' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 })
 

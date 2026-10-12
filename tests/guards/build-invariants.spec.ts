@@ -164,6 +164,75 @@ describe('静态守卫 · 构建与发布不变式', () => {
     })
   })
 
+  describe('Service Worker 与原生壳（白屏防线）', () => {
+    it('build-apk.yml 用 DISABLE_SW=1 构建 web 产物', () => {
+      const src = stripYamlComments(read('.github/workflows/build-apk.yml'))
+      expect(
+        /DISABLE_SW:\s*["']?1["']?/.test(src),
+        'build-apk.yml 没有给 web 产物设 DISABLE_SW=1：APK 里会带上 Service Worker，' +
+          '覆盖安装后旧 SW 返回旧 index.html、旧 hash 资源已被清 → 脚本 404 → 白屏',
+      ).toBe(true)
+    })
+
+    it('build-apk.yml 在 cap sync 前校验 dist 里没有 sw.js / registerSW.js', () => {
+      const src = stripYamlComments(read('.github/workflows/build-apk.yml'))
+      const checkAt = src.search(/dist\/sw\.js/)
+      const syncAt = src.search(/cap\s+sync\s+android/)
+
+      expect(checkAt, 'build-apk.yml 没有校验 dist 里的 Service Worker（DISABLE_SW 失效不会被发现）').toBeGreaterThanOrEqual(0)
+      expect(
+        checkAt < syncAt,
+        'sw.js 的存在性校验必须排在 cap sync android 之前，否则已经把 SW 拷进 android 工程了',
+      ).toBe(true)
+    })
+
+    it('vite.config.ts 按 DISABLE_SW 决定是否启用 VitePWA', () => {
+      const src = read('vite.config.ts')
+      expect(
+        /DISABLE_SW/.test(src),
+        'vite.config.ts 不认 DISABLE_SW：APK 构建关不掉 Service Worker',
+      ).toBe(true)
+      expect(
+        /VitePWA\(/.test(src),
+        'vite.config.ts 里没有 VitePWA：Web 端会失去离线能力',
+      ).toBe(true)
+    })
+
+    it('MainActivity 在 WebView 创建前清掉残留的 Service Worker 数据', () => {
+      const src = read('android/app/src/main/java/com/dialysis/record/MainActivity.java')
+
+      expect(
+        /Service Worker/.test(src),
+        'MainActivity 没有清 WebView 的 Service Worker 目录：老用户覆盖安装后仍会撞上旧 SW 白屏',
+      ).toBe(true)
+      expect(/app_webview/.test(src), 'MainActivity 没有定位到 app_webview 数据目录').toBe(true)
+
+      // 从 onCreate 方法体内部比较，避免匹配到方法上方的注释
+      const methodAt = src.search(/public void onCreate/)
+      const dropAt = src.indexOf('dropStaleServiceWorkerData();', methodAt)
+      const superAt = src.indexOf('super.onCreate(', methodAt)
+      expect(methodAt, 'MainActivity 没有覆写 onCreate').toBeGreaterThanOrEqual(0)
+      expect(dropAt, 'MainActivity 的 onCreate 里没有调用清理').toBeGreaterThanOrEqual(0)
+      expect(superAt, 'MainActivity 的 onCreate 里没有调用 super.onCreate').toBeGreaterThanOrEqual(0)
+      expect(
+        dropAt < superAt,
+        '清理必须排在 super.onCreate() 之前 —— 那之后 WebView 已经创建、目录会被占用',
+      ).toBe(true)
+
+      // 只清 Service Worker 子树：业务数据（IndexedDB）与登录态（SharedPreferences）不能动。
+      // 这里匹配的是**删除路径**而不是注释里的字样。
+      expect(
+        /Default\/Service Worker/.test(src),
+        'MainActivity 的删除目标不是 Default/Service Worker',
+      ).toBe(true)
+      expect(
+        !/Default\/(IndexedDB|Local Storage|Session Storage|Web Data|shared_prefs)/.test(src),
+        'MainActivity 的清理范围越界了：只允许删 Service Worker 目录，' +
+          'IndexedDB（本地业务数据 / 云端缓存）与 SharedPreferences（登录态、当前病人）一概不能碰',
+      ).toBe(true)
+    })
+  })
+
   describe('npm 脚本与 Vite 配置', () => {
     it('package.json 有 test / test:coverage / build / build:admin 四个脚本', () => {
       const pkg = JSON.parse(read('package.json')) as { scripts?: Record<string, string> }
