@@ -35,9 +35,36 @@
 - 新增功能补对应用例；行为变了就同步改已有用例
 - `npm test` 全绿，且 `npm run test:coverage` 不低于阈值（改了 `calc.ts` / `cloudRepository` / Edge Function 这类核心逻辑时尤其要补）
 
+### 第 3.5 步 · 提交前的深度自评（跑一遍测试 ≠ 评审）
+
+> 为什么单独立一步：曾经只给 `saveSession` 加了乐观锁，同一个模式在 `savePatient` /
+> `replaceAdverseReactions` 上漏了两处 —— 测试全绿、类型检查通过、CI 通过，
+> **没有任何一道自动防线提醒**，是用户追问「是不是所有写入都有」才发现的。
+> 更早那轮的「批量刷新串数据」则是改动**自己引入**的失败模式。
+> 所以每次提交前逐条回答下面 5 问，**答案写进提交信息**：
+
+1. **影响面**：改的这个函数 / 模块还有谁在调用？他们的假设还成立吗？
+   （动 `Repository` 接口、`cloudCache`、`patient` store 这类共用件时，逐个调用点看一遍）
+2. **同类问题**：同一个模式在别处还有吗？
+   （乐观锁漏两处就是这么漏的；`watch(isLoggedIn)`、写前量程校验、读接口的 `if (error) throw` 同理）
+3. **新失败模式**：这次改动**引入**了什么以前不存在的失败可能？
+   （`dedupe` 引入「单条读复用整批结果」；乐观锁引入「冲突后重新加载读到缓存旧值」）
+4. **反向验证**：如果我是审查者，会从哪里挑刺？边界 / 并发 / 失败路径 / 提示文案 / 数据可恢复性
+5. **验证强度**：证据是「测试通过」还是「实测过真实路径」？
+   - 只跑单测不够：`savingPatient` 挡住覆盖保存的重试、冲突后读缓存旧值，单测都漏了
+   - 只读代码也不够：`currentRole` 残留、`init()` 永久卡死，都是先写一个**会失败的用例**才坐实的
+
+**能自动化的部分已经写成守卫，跟着 pre-push 一起跑，不要只靠自觉**：
+
+- `tests/guards/optimistic-lock.spec.ts` —— 新增写方法必须**显式归类**「要不要乐观锁」；
+  并断言云端确实做了版本比对、缓存层确实回写了新版本、冲突恢复确实走 `fresh` 读
+- `tests/guards/session-expiry.spec.ts` —— 每个读云端数据的页面都必须处理「被踢下线」
+- 既有守卫 —— 敏感信息不入库、后台不碰病历表、数据库结构三处同步、启动占位与 ES5 语法
+
 ### 第 4 步 · 通过后自动推送部署
 
-- 推送前自查：`npm test` 全绿、`npm run build` 通过、`.env*` 与 token 未进提交
+- 推送前自查：`npm test` 全绿、`npm run build` 通过、`.env*` 与 token 未进提交，
+  以及**上面第 3.5 步的 5 问都有答案**
 - `git push origin main`（pre-push 钩子会再跑一次「类型检查 + 全部测试」，不过则中止）
 - CI 门禁：`deploy.yml` / `deploy-admin.yml` / `build-apk.yml` 都 `needs: test`，测试不过不会发布
 - **推送后必须回查结果**：`GET https://api.github.com/repos/maxiaofeng94/dialysis-app/actions/runs?per_page=20` 确认相关工作流 `success`；失败就按第五节「GitHub Actions / CI」排查、修复并重推
