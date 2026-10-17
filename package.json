@@ -19,7 +19,11 @@
     "test:coverage": "vitest run --coverage",
     "test:unit": "vitest run tests/unit",
     "test:edge": "vitest run tests/edge",
-    "verify": "npm run test && npm run build && npm run build:admin"
+    "verify": "npm run test && npm run build && npm run build:admin",
+    "review:start": "node scripts/review-gate.mjs start",
+    "review:pass": "node scripts/review-gate.mjs pass",
+    "review:check": "node scripts/review-gate.mjs check",
+    "review:status": "node scripts/review-gate.mjs status"
   },
   "dependencies": {
     "@capacitor/android": "^6.2.1",

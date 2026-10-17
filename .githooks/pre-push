@@ -5,8 +5,14 @@
 # 由 `npm run hooks:install` 注册（git config core.hooksPath .githooks）。
 # 目的：把「推上去 CI 红了再回来改」的来回，提前到本机拦住。
 #
+# 顺序（评审在最前，它最快、也最不该省）：
+#   ① 深度评审门禁   —— 本次改动必须通过评审（见 AGENTS.md 第 3.5 步）
+#   ② 类型检查
+#   ③ 全部测试
+#
 # 临时跳过（例如紧急修文档）：
-#   SKIP_TESTS=1 git push
+#   SKIP_TESTS=1 git push     # 跳过全部三项
+#   SKIP_REVIEW=1 git push    # 只跳过评审门禁
 # ============================================================
 
 if [ "${SKIP_TESTS}" = "1" ]; then
@@ -14,7 +20,20 @@ if [ "${SKIP_TESTS}" = "1" ]; then
   exit 0
 fi
 
-echo "[pre-push] ① 类型检查（vue-tsc）…"
+echo "[pre-push] ① 深度评审门禁（本次改动是否已通过评审 + 静态守卫）…"
+node scripts/review-gate.mjs check
+if [ $? -ne 0 ]; then
+  echo ""
+  echo "[pre-push] ❌ 评审门禁未通过，推送已中止。"
+  echo "           流程：开发 → 测试 → 评审（自己 5 问 + 独立评审 agent，问题需带佐证）"
+  echo "                 → 有问题就回到开发，改完重新评审 → 全部通过才推送"
+  echo "           开始一轮：node scripts/review-gate.mjs start"
+  echo "           通过记录：node scripts/review-gate.mjs pass --answers .review/answers.md"
+  echo "           确实要强行推送：SKIP_TESTS=1 git push（或只跳过评审：SKIP_REVIEW=1）"
+  exit 1
+fi
+
+echo "[pre-push] ② 类型检查（vue-tsc）…"
 npx vue-tsc -b
 if [ $? -ne 0 ]; then
   echo ""
@@ -23,7 +42,7 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-echo "[pre-push] ② 测试（vitest）…"
+echo "[pre-push] ③ 测试（vitest）…"
 npx vitest run --reporter=dot
 if [ $? -ne 0 ]; then
   echo ""
@@ -32,4 +51,4 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-echo "[pre-push] ✅ 通过（类型检查 + 全部测试）"
+echo "[pre-push] ✅ 通过（评审门禁 + 类型检查 + 全部测试）"

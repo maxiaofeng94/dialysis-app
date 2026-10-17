@@ -43,3 +43,6 @@ supabase/.branches
 # 打包产物
 *.apk
 *.zip
+
+# 提交前评审的本地记录（只在本机生效，不入库）
+.review/
