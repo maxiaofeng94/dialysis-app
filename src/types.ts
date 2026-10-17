@@ -41,6 +41,16 @@ export interface DialysisSession {
   notes: string | null
   createdAt: number
   updatedAt: number
+  /**
+   * 云端行的原始 `updated_at`（ISO 字符串；仅云端模式有值）。
+   *
+   * **乐观锁的版本号**：多人同时编辑同一条记录时，保存要带上「我读到的版本」，
+   * 服务端只在它没变时才允许覆盖。
+   *
+   * ⚠️ 必须原样回传库里的字符串，不能拿 `updatedAt`（毫秒时间戳）重新拼 ——
+   * `timestamptz` 是微秒精度，转成毫秒再传回去会永远匹配不上，变成「永远冲突」。
+   */
+  updatedAtIso?: string | null
 }
 
 export interface BloodPressure {

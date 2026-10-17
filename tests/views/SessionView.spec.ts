@@ -1037,6 +1037,95 @@ describe('SessionView · H1 写失败必须让用户看见', () => {
   })
 })
 
+/**
+ * 乐观锁：两个家属同时编辑同一个病人的同一条记录。
+ *
+ * 之前保存是整行 `upsert`（last-write-wins）：后点保存的人会把先保存的人刚填的体重 / 备注 /
+ * 中止原因整段抹掉，双方毫无察觉。现在保存带上「我读到的版本」，冲突时问用户怎么办。
+ */
+describe('SessionView · 乐观锁（多人同时编辑同一条记录）', () => {
+  const IRS = '2024-01-10T09:00:00.000000+00:00'
+
+  it('保存时带上「我读到的版本」（否则会静默抹掉对方的改动）', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const w = await mountSession(defaultData({ session: makeSession({ id: 'session-1', updatedAtIso: IRS }) }))
+    vi.mocked(repository.saveSession).mockClear()
+
+    await fieldInput(w, '记录人').setValue('李护士')
+    await vi.advanceTimersByTimeAsync(400)
+
+    expect(repository.saveSession).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(repository.saveSession).mock.calls[0][1]).toBe(IRS)
+    vi.useRealTimers()
+  })
+
+  it('保存成功后用返回值更新本地版本（否则下一次自动保存会「自己跟自己冲突」）', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const w = await mountSession(defaultData({ session: makeSession({ id: 'session-1', updatedAtIso: IRS }) }))
+    vi.mocked(repository.saveSession).mockClear()
+    vi.mocked(repository.saveSession).mockResolvedValue('2024-01-10T10:00:00.000000+00:00')
+
+    await fieldInput(w, '记录人').setValue('李护士')
+    await vi.advanceTimersByTimeAsync(400)
+    await fieldInput(w, '记录人').setValue('王护士')
+    await vi.advanceTimersByTimeAsync(400)
+
+    expect(vi.mocked(repository.saveSession).mock.calls[1][1]).toBe('2024-01-10T10:00:00.000000+00:00')
+    vi.useRealTimers()
+  })
+
+  it('版本冲突：弹确认让用户选；选「重新加载」则重新拉取远端内容，不硬覆盖', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const w = await mountSession(defaultData({ session: makeSession({ id: 'session-1', updatedAtIso: IRS }) }))
+    vi.mocked(repository.getSession).mockClear()
+    vi.mocked(repository.saveSession).mockRejectedValueOnce(Object.assign(new Error('冲突'), { name: 'ConflictError' }))
+    mocks.showConfirmDialog.mockResolvedValueOnce(undefined)
+
+    await fieldInput(w, '记录人').setValue('李护士')
+    await vi.advanceTimersByTimeAsync(400)
+    await flushPromises()
+
+    expect(mocks.showConfirmDialog).toHaveBeenCalled()
+    expect(repository.getSession).toHaveBeenCalled() // 重新加载
+    vi.useRealTimers()
+  })
+
+  it('版本冲突选「覆盖保存」：这次不带版本条件写入，用户刚填的内容不能丢', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const w = await mountSession(defaultData({ session: makeSession({ id: 'session-1', updatedAtIso: IRS }) }))
+    vi.mocked(repository.saveSession).mockClear()
+    vi.mocked(repository.saveSession)
+      .mockRejectedValueOnce(Object.assign(new Error('冲突'), { name: 'ConflictError' }))
+      .mockResolvedValue('2024-01-10T11:00:00.000000+00:00')
+    mocks.showConfirmDialog.mockRejectedValueOnce(new Error('cancel')) // 点「覆盖保存」
+
+    await fieldInput(w, '记录人').setValue('李护士')
+    await vi.advanceTimersByTimeAsync(400)
+    await flushPromises()
+
+    expect(repository.saveSession).toHaveBeenCalledTimes(2)
+    // ⚠️ 覆盖时必须传 null（不带版本条件）。曾经这里传的是「刚取回的版本号」，
+    // 而 getSession 是缓存优先的、拿回来的还是旧版本 → 又冲突一次、再弹一次窗，
+    // 用户点了「覆盖保存」却什么都没写进去（实测：界面显示 62.5，库里还是 62）。
+    expect(vi.mocked(repository.saveSession).mock.calls[1][1]).toBeNull()
+    vi.useRealTimers()
+  })
+
+  it('记录已被另一端删除：提示并回首页（重试没有意义）', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const w = await mountSession(defaultData())
+    vi.mocked(repository.saveSession).mockRejectedValueOnce(Object.assign(new Error('没了'), { name: 'NotFoundError' }))
+
+    await fieldInput(w, '记录人').setValue('李护士')
+    await vi.advanceTimersByTimeAsync(400)
+    await flushPromises()
+
+    expect(mocks.showToast).toHaveBeenCalledWith('这条记录已被删除')
+    expect(router.currentRoute.value.path).toBe('/')
+    vi.useRealTimers()
+  })
+})
+
 describe('SessionView · H2 多设备：只在未改动时合并远端新值', () => {
   it('另一端刚改了体重并标记完成：本机未改动时会合并显示新值', async () => {
     const w = await mountSession()

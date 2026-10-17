@@ -8,6 +8,7 @@ import { currentPatientId, isReadOnly, refreshCurrentRole } from '../stores/pati
 import { isLoggedIn } from '../stores/auth'
 import { cacheVersion } from '../lib/cloudCache'
 import { useSessionExpiryRedirect } from '../lib/sessionExpiry'
+import { isConflictError, isNotFoundError } from '../lib/errors'
 import { todayStr, parseNum, fmt, formatTime, combineDateTime, dateStr, formatDateTimeCN, formatDateCN } from '../utils/format'
 import { getEffectiveDryWeight, calcWeights } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
@@ -174,10 +175,20 @@ function stateSnapshot(): string {
 let knownSnapshot = ''
 /** 已知状态的 updatedAt：只有真正更新的远端数据才允许合并进来，防止旧的后台刷新把刚保存的值顶回去 */
 let knownUpdatedAt = 0
+/**
+ * **乐观锁版本号**：本页面读到的云端 `updated_at`（原始 ISO 字符串）。
+ *
+ * 多人可能同时编辑同一个病人的同一条记录。整行覆盖的写法下，「后点保存的人」会把
+ * 「先保存的人」填的内容整段抹掉，而且双方都毫无察觉 —— 对透析记录来说这等于数据丢失。
+ * 每次保存都把版本带上，云端只在它没变时才写入；变了就抛 ConflictError，由页面问用户
+ * 是「重新加载」还是「覆盖保存」。
+ */
+let knownUpdatedAtIso: string | null = null
 
 function markStateKnown() {
   knownSnapshot = stateSnapshot()
   knownUpdatedAt = session.value?.updatedAt ?? 0
+  knownUpdatedAtIso = session.value?.updatedAtIso ?? null
 }
 
 async function loadSub() {
@@ -305,11 +316,15 @@ async function mergeRemoteIfUntouched() {
 /**
  * 保存表单到当前记录
  * - 被 setTimeout 裸调用，内部必须自己兜住异常（H1），否则失败 = unhandled rejection + 静默丢数据；
- * - 用户没改动过就直接返回（H2），不做无谓的整行回写。
+ * - 用户没改动过就直接返回（H2），不做无谓的整行回写；
+ * - 带**乐观锁版本号**：多人同时编辑时不会静默覆盖对方的改动。
+ *
+ * `force` = true 时忽略「没改动过」的短路（用户已经选了「覆盖保存」，要用最新版本重试一次）。
+ * `override` = true 时不带版本条件写入 —— 用户已明确选择「用我的内容盖掉对方的」。
  */
-async function persistSession(): Promise<void> {
+async function persistSession(opts: { force?: boolean; override?: boolean } = {}): Promise<void> {
   if (!session.value || !loaded) return
-  if (stateSnapshot() === knownSnapshot) return
+  if (!opts.force && stateSnapshot() === knownSnapshot) return
   const rangeTip = formRangeTip()
   if (rangeTip) {
     // 越界不写库；同一句提示只弹一次，别让每次防抖保存都骚扰用户
@@ -329,11 +344,51 @@ async function persistSession(): Promise<void> {
     s.postWeightMeasured = parseNum(form.postWeight)
     s.doctorUf = parseNum(form.doctorUf)
     s.updatedAt = Date.now()
-    await repository.saveSession(s)
+    // override：用户已经明确选了「覆盖保存」，这次就**不带版本条件**写入。
+    // ⚠️ 别想着「先取回最新版本号再带条件写」——`getSession` 是缓存优先的，
+    // 拿回来的往往还是旧版本，于是又冲突一次、再弹一次窗，用户点了覆盖却什么也没写进去
+    // （实测踩到：界面显示 62.5，库里还是 62）。
+    const iso = await repository.saveSession(s, opts.override ? null : knownUpdatedAtIso)
+    // 保存成功后版本号必须跟着更新，否则下一次自动保存（400ms 防抖）会拿旧版本去比，
+    // 变成「自己跟自己冲突」，用户会莫名其妙被问「记录已被他人修改」
+    if (iso) s.updatedAtIso = iso
     markStateKnown()
   } catch (err) {
     console.error(err)
+    if (isConflictError(err)) {
+      await resolveSaveConflict()
+      return
+    }
+    if (isNotFoundError(err)) {
+      showToast('这条记录已被删除')
+      router.replace('/')
+      return
+    }
     showToast('保存失败，请检查网络后重试')
+  }
+}
+
+/**
+ * 版本冲突：编辑期间别人也保存了这条记录。
+ *
+ * 这里**不能**自作主张选一个 —— 两种做法都会让人丢数据：
+ * 直接覆盖会抹掉对方刚填的内容，直接丢弃又会让本机用户白填一场。
+ * 所以交给用户选，并把两个选项的后果写清楚。
+ */
+async function resolveSaveConflict(): Promise<void> {
+  try {
+    await showConfirmDialog({
+      title: '这条记录已被其他人修改',
+      message:
+        '你编辑期间，另一位家属也保存了这条记录。\n\n「重新加载」：放弃你刚才的修改，看对方保存的内容。\n「覆盖保存」：用你屏幕上的内容盖掉对方的。',
+      confirmButtonText: '重新加载',
+      cancelButtonText: '覆盖保存',
+      messageAlign: 'left',
+    })
+    await load() // 重新加载 = 放弃本地修改
+  } catch {
+    // 覆盖保存：用户已明确要用屏幕上的内容盖掉对方的 → 这次不带版本条件写
+    await persistSession({ force: true, override: true })
   }
 }
 
@@ -381,7 +436,27 @@ async function persistStatus(status: DialysisSession['status'], tip: string) {
   }
   s.status = status
   s.updatedAt = Date.now()
-  const ok = await tryWrite(() => repository.saveSession(s), '状态保存失败，请检查网络后重试')
+  let ok = true
+  try {
+    const iso = await repository.saveSession(s, knownUpdatedAtIso)
+    if (iso) s.updatedAtIso = iso
+  } catch (err) {
+    console.error(err)
+    ok = false
+    if (isConflictError(err)) {
+      Object.assign(s, prev) // 先回滚界面，再让用户决定怎么处理
+      statusBusy.value = false
+      await resolveSaveConflict()
+      return
+    }
+    if (isNotFoundError(err)) {
+      statusBusy.value = false
+      showToast('这条记录已被删除')
+      router.replace('/')
+      return
+    }
+    showToast('状态保存失败，请检查网络后重试')
+  }
   if (ok) {
     markStateKnown()
     showToast(tip)

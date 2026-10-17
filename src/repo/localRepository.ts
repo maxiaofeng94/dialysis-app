@@ -103,8 +103,10 @@ class LocalRepository implements Repository {
     const s = await db.sessions.get(id)
     return s ? normalizeSession(s) : undefined
   }
-  async saveSession(session: DialysisSession) {
+  async saveSession(session: DialysisSession, _expectedUpdatedAt?: string | null): Promise<string | null> {
+    // 单机模式只有一个使用者，不存在并发覆盖，用不上乐观锁（签名保持与云端一致）
     await db.sessions.put({ ...normalizeSession(session) })
+    return null
   }
   async deleteSession(id: string) {
     await db.transaction('rw', db.sessions, db.bloodPressures, db.bloodGlucoses, db.bloodFlows, db.adverseReactions, async () => {

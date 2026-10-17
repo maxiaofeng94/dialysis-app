@@ -1,4 +1,5 @@
 import { supabase, readPersistedUser } from './supabase'
+import { ConflictError, NotFoundError } from './errors'
 import { DEFAULT_PATIENT_ID } from '../constants'
 import type { Repository } from '../repo/repository'
 import type {
@@ -92,6 +93,9 @@ function sessionFromRow(r: any): DialysisSession {
     notes: r.notes,
     createdAt: new Date(r.created_at).getTime(),
     updatedAt: new Date(r.updated_at).getTime(),
+    // 乐观锁版本号：保留库里的原始字符串（timestamptz 是微秒精度，
+    // 转换过的毫秒时间戳回传过去永远匹配不上 → 变成「永远冲突」）
+    updatedAtIso: r.updated_at ?? null,
   }
 }
 
@@ -303,7 +307,7 @@ class CloudRepository implements Repository {
     return data ? sessionFromRow(data) : undefined
   }
 
-  async saveSession(session: DialysisSession) {
+  async saveSession(session: DialysisSession, expectedUpdatedAt?: string | null): Promise<string | null> {
     const row = sessionToRow(session)
     // 必须写当前用户：schema.sql 的 sessions_insert / sessions_update 策略带
     // `with check (... and operator_id = auth.uid())`，写成别人（哪怕是「保留原记录人」）
@@ -318,8 +322,41 @@ class CloudRepository implements Repository {
     const uid = (await readPersistedUser())?.id
     if (!uid) throw new Error('登录状态已失效，请重新登录后再试')
     row.operator_id = uid
-    const { error } = await this.client().from('sessions').upsert(row)
+
+    const nextIso = new Date().toISOString()
+    row.updated_at = nextIso
+
+    // 没有版本要求（新建记录 / 本地模式）→ 沿用 upsert
+    if (!expectedUpdatedAt) {
+      const { error } = await this.client().from('sessions').upsert(row)
+      if (error) throw error
+      return nextIso
+    }
+
+    // 乐观锁：只有库里的 updated_at 还是「我读到的那个版本」时才允许整行覆盖。
+    // 两个家属同时编辑时，后点保存的人不会静默抹掉先保存的内容。
+    const { data, error } = await this.client()
+      .from('sessions')
+      .update(row)
+      .eq('id', session.id)
+      .eq('updated_at', expectedUpdatedAt)
+      .select('updated_at')
     if (error) throw error
+
+    if (!data?.length) {
+      // 命中 0 行：要么别人改过（版本变了），要么这条已经被删了。
+      // 两者给用户的引导完全不同，所以再查一次把「不存在」分辨出来。
+      const { data: exists, error: checkError } = await this.client()
+        .from('sessions')
+        .select('id')
+        .eq('id', session.id)
+        .maybeSingle()
+      if (checkError) throw checkError
+      if (!exists) throw new NotFoundError()
+      throw new ConflictError()
+    }
+
+    return (data[0] as { updated_at: string }).updated_at ?? nextIso
   }
 
   async deleteSession(id: string) {

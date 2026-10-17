@@ -10,7 +10,19 @@ export interface Repository {
 
   listSessions(patientId: string): Promise<DialysisSession[]>
   getSession(id: string): Promise<DialysisSession | undefined>
-  saveSession(session: DialysisSession): Promise<void>
+  /**
+   * 保存一条透析记录（整行覆盖）。
+   *
+   * **乐观锁**：多人可能同时编辑同一个病人的同一条记录，整行覆盖会「后保存的把先保存的抹掉」
+   * 且双方都毫无察觉。`expectedUpdatedAt` 传「我读到的版本」（`DialysisSession.updatedAtIso`），
+   * 云端只在库里的版本仍是它时才允许写入；否则抛 `ConflictError`，由页面询问用户
+   * 「重新加载」还是「覆盖保存」。
+   *
+   * - `expectedUpdatedAt` 省略/为 null：不做版本检查（新建记录，以及本地单机模式）
+   * - 返回值：写入后的新版本（`updatedAtIso`），调用方必须用它更新本地版本，
+   *   否则下一次保存会拿旧版本去比 → 自己跟自己冲突
+   */
+  saveSession(session: DialysisSession, expectedUpdatedAt?: string | null): Promise<string | null>
   deleteSession(id: string): Promise<void>
 
   listBloodPressures(sessionId: string): Promise<BloodPressure[]>

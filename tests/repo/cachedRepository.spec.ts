@@ -605,7 +605,8 @@ describe('cachedRepository · 写操作：先落云端再更新缓存', () => {
 
     await cachedCloudRepository.saveSession(saved)
 
-    expect(cloud.saveSession).toHaveBeenCalledWith(saved)
+    // 第二个参数是乐观锁版本号（这里没传 = 不做版本检查，如新建记录）
+    expect(cloud.saveSession).toHaveBeenCalledWith(saved, undefined)
     expect((await cacheGet<typeof saved>('session:s-mid'))?.value).toEqual(saved)
     const list = (await cacheGet<{ id: string }[]>('sessions:p1'))!.value
     expect(list.map((s) => s.id)).toEqual(['s-newest', 's-mid', 's-old'])

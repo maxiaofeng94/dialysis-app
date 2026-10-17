@@ -232,10 +232,14 @@ export const cachedCloudRepository: Repository = {
     const v = await cacheFirst<DialysisSession | null>(K.session(id), async () => (await cloudRepository.getSession(id)) ?? null)
     return v ?? undefined
   },
-  async saveSession(session) {
-    await cloudRepository.saveSession(session)
+  async saveSession(session, expectedUpdatedAt) {
+    const iso = await cloudRepository.saveSession(session, expectedUpdatedAt)
+    // 保存成功后必须把**新版本号**写回对象与缓存：页面下一次自动保存（防抖 400ms）
+    // 如果还拿旧版本去比，会立刻「自己跟自己冲突」，用户莫名其妙被问「记录已被他人修改」。
+    if (iso) session.updatedAtIso = iso
     await cacheSet(K.session(session.id), session)
     await upsertInto(K.sessions(session.patientId), session, byDateDesc)
+    return iso
   },
   async deleteSession(id) {
     await cloudRepository.deleteSession(id)

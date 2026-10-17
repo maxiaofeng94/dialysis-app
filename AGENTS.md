@@ -278,6 +278,29 @@ Remove-Item Env:\DISABLE_SW
   造场景用 `page.route('**/rest/v1/**', …)` 延迟，别只看「首页能打开」
 - **导入备份要「先整份校验 → 再在事务里清库写入」**：先 `clear()` 再 `bulkPut()` 时，JSON 能解析但字段不合法，数据已全清空、界面只说「格式不正确」
 
+### 多人同时编辑（乐观锁）
+
+- **整行 `upsert` = last-write-wins，会静默丢数据**：两个家属同时开着同一条透析记录，
+  后点保存的人会把先保存的人刚填的体重 / 备注 / 中止原因整段抹掉，双方都毫无察觉。
+  → `saveSession(session, expectedUpdatedAt?)` 带版本条件：
+  `update … .eq('id', id).eq('updated_at', expected)`，只在版本没变时才写入
+- **版本号是 `DialysisSession.updatedAtIso`（库里的原始 ISO 字符串），不是 `updatedAt`**：
+  `timestamptz` 是微秒精度，换算成毫秒时间戳再回传会**永远匹配不上** → 变成「永远冲突」。
+  读取时 `sessionFromRow` 保留原始字符串，保存成功后必须把它更新成返回值
+  （`cachedRepository.saveSession` 负责写回对象与缓存）——否则页面下一次 400ms 防抖保存
+  就会拿旧版本去比，**自己跟自己冲突**
+- 冲突要给**可操作**的选择，不能替用户决定：
+  `ConflictError` → 弹「重新加载（放弃我的修改）/ 覆盖保存（用我的盖掉对方的）」；
+  `NotFoundError`（另一端删掉了）→ 提示并回首页，重试没有意义
+- ⚠️ **「覆盖保存」必须不带版本条件写（传 `null`）**。曾经写成「先 `getSession()` 取回最新版本号
+  再带条件重试」，而 `getSession` 是**缓存优先**的、拿回来的往往还是旧版本 → 又冲突一次、
+  再弹一次窗，用户点了覆盖却什么都没写进去（实测：界面显示 62.5，库里还是 62）。
+  用户既然明确选了覆盖，就 `upsert` 无条件写
+- 判断冲突用 `err.name`（`lib/errors.ts` 的 `isConflictError`），不要用 `instanceof` ——
+  同一份代码可能被打进不同 chunk，跨 bundle 的 `instanceof` 会失效
+- 子表不需要乐观锁：血压 / 血糖 / 血流量是按 id **追加删除**（不会互相覆盖）；
+  只有不良反应是「整表替换」，用 `savingReactions` 串行化 + 失败回滚勾选
+
 ### 移动端输入与不可逆操作
 
 - **输入清洗要处理全角标点**：`replace(/,/g,'.')` 只认半角，中文输入法的「，」会被 `[^\d.]` 删掉 → `70，5` 变成 `705`（**10 倍体重误差**）。用 `/[,，]/g` 并写进测试

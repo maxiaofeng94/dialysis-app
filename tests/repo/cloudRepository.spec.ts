@@ -520,6 +520,87 @@ describe('cloudRepository · saveSession 写入行', () => {
   })
 })
 
+/**
+ * 乐观锁：两个家属同时编辑同一个病人的同一条记录。
+ *
+ * 之前是整行 `upsert`（last-write-wins）—— 后点保存的人会把先保存的人刚填的体重、备注、
+ * 中止原因整段抹掉，双方都毫无察觉，等于静默丢数据。现在保存要带上「我读到的版本」，
+ * 服务端只在它没变时才写入，变了就抛 ConflictError 交给页面问用户。
+ */
+describe('cloudRepository · 乐观锁（多人同时编辑同一条记录）', () => {
+  const IRS = '2024-05-01T10:00:00.000000+00:00'
+
+  it('带版本号保存：用 update + updated_at 条件（不是无脑 upsert）', async () => {
+    const { fake } = setupFake({
+      tables: { sessions: [{ id: 's1', patient_id: 'p1', updated_at: IRS, date: '2024-05-01' }] },
+    })
+    loginAs(fake)
+
+    const next = await cloudRepository.saveSession(makeSession({ id: 's1' }), IRS)
+
+    const call = fake.lastCall('sessions')!
+    expect(call.op).toBe('update')
+    expect(call.filters).toEqual([
+      { col: 'id', val: 's1' },
+      { col: 'updated_at', val: IRS },
+    ])
+    // 返回值是写入后的新版本，页面必须用它更新本地版本（否则下一次保存会自己跟自己冲突）
+    expect(typeof next).toBe('string')
+    expect(next).toBeTruthy()
+  })
+
+  it('版本已变（对方先保存了）：抛 ConflictError，绝不覆盖对方的内容', async () => {
+    const { fake } = setupFake({
+      tables: { sessions: [{ id: 's1', updated_at: '2024-05-01T11:00:00.000000+00:00' }] },
+    })
+    loginAs(fake)
+
+    await expect(cloudRepository.saveSession(makeSession({ id: 's1' }), IRS)).rejects.toMatchObject({
+      name: 'ConflictError',
+    })
+  })
+
+  it('记录已被另一端删除：抛 NotFoundError（重试多少次都不会成功）', async () => {
+    const { fake } = setupFake({ tables: { sessions: [] } })
+    loginAs(fake)
+
+    await expect(cloudRepository.saveSession(makeSession({ id: 's1' }), IRS)).rejects.toMatchObject({
+      name: 'NotFoundError',
+    })
+  })
+
+  it('不带版本号（新建记录）：沿用 upsert，不做冲突判定', async () => {
+    const { fake } = setupFake({ tables: { sessions: [] } })
+    loginAs(fake)
+
+    await cloudRepository.saveSession(makeSession({ id: 's-new' }))
+
+    expect(fake.lastCall('sessions')!.op).toBe('upsert')
+  })
+
+  it('读取时保留库里的原始 updated_at 字符串（毫秒时间戳回传会永远匹配不上）', async () => {
+    setupFake({
+      tables: {
+        sessions: [
+          {
+            id: 's1',
+            patient_id: 'p1',
+            date: '2024-05-01',
+            status: 'ongoing',
+            created_at: '2024-05-01T09:00:00.000000+00:00',
+            updated_at: IRS,
+            abort_tags: [],
+          },
+        ],
+      },
+    })
+
+    const s = await cloudRepository.getSession('s1')
+
+    expect(s?.updatedAtIso).toBe(IRS)
+  })
+})
+
 describe('cloudRepository · 子表映射与排序', () => {
   it('血压：session_id → sessionId，measured_at → 时间戳，按 measured_at 升序', async () => {
     const { log } = setupFake({
