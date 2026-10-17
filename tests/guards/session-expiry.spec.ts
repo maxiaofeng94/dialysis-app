@@ -16,6 +16,15 @@ import { resolve } from 'node:path'
 
 const read = (p: string) => readFileSync(resolve(process.cwd(), p), 'utf8')
 
+/**
+ * 必须剥掉注释再匹配。
+ * 评审指出：只用字符串包含判断的话，把调用挪进注释或 `if (false)` 里照样能骗过守卫 ——
+ * 同目录的 `cloud-error-handling.spec.ts` 早就用了这个办法，这里漏了。
+ */
+function stripComments(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+}
+
 /** 用公用 composable 的页面 */
 const VIA_COMPOSABLE = ['HomeView', 'SessionView', 'ReportView', 'TrendView']
 
@@ -24,19 +33,21 @@ const VIA_OWN_WATCH = ['SettingsView', 'MembersView']
 
 describe('会话失效处理守卫', () => {
   it.each(VIA_COMPOSABLE)('%s 调用了 useSessionExpiryRedirect()', (name) => {
-    const src = read(`src/views/${name}.vue`)
+    // 剥注释后匹配：把调用注释掉 / 写进 if (false) 都要能被发现
+    const src = stripComments(read(`src/views/${name}.vue`))
     expect(src).toContain("from '../lib/sessionExpiry'")
-    expect(src).toMatch(/useSessionExpiryRedirect\(\)/)
+    // 必须是 setup 顶层的真实调用（行首零缩进），不能缩进在某段死代码里
+    expect(src).toMatch(/^useSessionExpiryRedirect\(\)/m)
   })
 
   it.each(VIA_OWN_WATCH)('%s 自己监听 isLoggedIn 并跳登录页', (name) => {
-    const src = read(`src/views/${name}.vue`)
-    expect(src).toMatch(/watch\(\s*isLoggedIn/)
-    expect(src).toContain("'/login'")
+    const src = stripComments(read(`src/views/${name}.vue`))
+    // 要求 watch 回调体里同时出现方向判断与跳转，删空函数体就过不了
+    expect(src).toMatch(/watch\(\s*isLoggedIn[\s\S]{0,400}?'\/login'/)
   })
 
   it('composable 只在「已登录 → 未登录」时跳转（避免主动登出误报）', () => {
-    const src = read('src/lib/sessionExpiry.ts')
+    const src = stripComments(read('src/lib/sessionExpiry.ts'))
     // 必须有 old && !val 这个方向判断
     expect(src).toMatch(/if\s*\(old\s*&&\s*!val\)/)
     expect(src).toContain("router.replace('/login')")

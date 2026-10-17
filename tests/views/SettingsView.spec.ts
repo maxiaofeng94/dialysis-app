@@ -1094,6 +1094,46 @@ describe('SettingsView · 新建病人与迁移（防重复提交 + 列表刷新
     expect(errSpy).toHaveBeenCalled()
   })
 
+  /**
+   * 回归：进页面时「我的病人」拉取失败，**绝不能**落到「暂无病人，点『＋ 新建』创建」——
+   * 用户云端明明有病人，会照着提示建出重复档案（App 内删不掉，只能上后台/跑 SQL）。
+   * 评审指出这一整个修复当时零测试覆盖。
+   */
+  it('「我的病人」拉取失败：显示错误态 + 重试，绝不显示「暂无病人」、也不让新建', async () => {
+    isLoggedInRef.value = true
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(listMyPatients).mockRejectedValueOnce(new Error('Failed to fetch'))
+
+    const w = await mountSettings()
+    await flushPromises()
+
+    expect(w.text()).toContain('病人列表加载失败')
+    expect(w.text()).not.toContain('暂无病人，点「＋ 新建」创建')
+    // 失败时「＋ 新建」必须禁用，否则用户会顺手建出重复档案
+    const newBtn = w.findAll('button').find((b) => b.text().includes('＋ 新建'))!
+    expect(newBtn.classes()).toContain('van-button--disabled')
+    expect(errSpy).toHaveBeenCalled()
+  })
+
+  it('「我的病人」失败后点「重试」能恢复出列表', async () => {
+    isLoggedInRef.value = true
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.mocked(listMyPatients).mockRejectedValueOnce(new Error('Failed to fetch'))
+
+    const w = await mountSettings()
+    await flushPromises()
+    expect(w.text()).toContain('病人列表加载失败')
+
+    vi.mocked(listMyPatients).mockResolvedValueOnce([
+      { patient: makePatient({ id: 'p1', name: '王五' }), role: 'owner' },
+    ])
+    await buttonByText(w, '重试').trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('王五')
+    expect(w.text()).not.toContain('病人列表加载失败')
+  })
+
   it('迁移过程中抛异常也要复位按钮并提示（不永久转圈）', async () => {
     isLoggedInRef.value = true
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})

@@ -451,9 +451,14 @@ async function persistStatus(status: DialysisSession['status'], tip: string) {
     console.error(err)
     ok = false
     if (isConflictError(err)) {
-      Object.assign(s, prev) // 先回滚界面，再让用户决定怎么处理
+      Object.assign(s, prev) // 先回滚界面
       statusBusy.value = false
-      await resolveSaveConflict()
+      // ⚠️ 这里**不能**走 resolveSaveConflict：它的「覆盖保存」最终调用 persistSession，
+      // 而 persistSession 只写表单字段（日期/体重/备注…），**不含 status / 中止信息** ——
+      // 用户点了「覆盖保存」会看到「已保存」，可这次的状态改动其实被丢掉了。
+      // 状态类写入冲突后只能让用户重新加载、重新操作。
+      showToast('这条记录已被其他人修改，已为你重新加载，请重新操作')
+      await load({ fresh: true })
       return
     }
     if (isNotFoundError(err)) {
@@ -552,15 +557,29 @@ async function confirmAbort() {
   s.status = 'aborted'
   s.updatedAt = Date.now()
   statusBusy.value = true
-  const ok = await tryWrite(() => repository.saveSession(s), '保存失败，请检查网络后重试')
-  statusBusy.value = false
-  if (!ok) {
-    Object.assign(s, prev) // 弹窗不关：用户填的内容还在，可以直接重试
-    return
+  try {
+    // ⚠️ 这也是一次**整行覆盖**（状态 + 中止信息），必须带乐观锁版本号：
+    // 不带的话，另一位家属刚改的体重会被这次保存整段抹掉。
+    // 也不能用 tryWrite —— 它会把 ConflictError 一起吞成 false，分不出冲突与网络失败。
+    const iso = await repository.saveSession(s, knownUpdatedAtIso)
+    if (iso) s.updatedAtIso = iso
+    markStateKnown()
+    showAbort.value = false
+    showToast('已标记中止')
+  } catch (err) {
+    console.error(err)
+    Object.assign(s, prev) // 弹窗不关：用户填的内容还在，可以重试
+    if (isNotFoundError(err)) {
+      showToast('这条记录已被删除')
+      router.replace('/')
+      return
+    }
+    // 不做「覆盖保存」：覆盖走的是 persistSession，它只写表单字段，
+    // 会把这次的状态改动丢掉却提示成功 —— 那是在骗用户
+    showToast(isConflictError(err) ? '这条记录已被其他人修改，请重新打开后再试' : '保存失败，请检查网络后重试')
+  } finally {
+    statusBusy.value = false
   }
-  markStateKnown()
-  showAbort.value = false
-  showToast('已标记中止')
 }
 
 function openBp() {

@@ -95,4 +95,30 @@ describe('乐观锁覆盖守卫', () => {
     const settings = readFileSync(resolve(process.cwd(), 'src/views/SettingsView.vue'), 'utf8')
     expect(settings).toMatch(/load\(true, \{ fresh: true \}\)/)
   })
+
+  /**
+   * 读取时**必须原样保留**库里的 `updated_at` 字符串。
+   *
+   * 评审用真实 PostgREST 验过：`Z` 与 `+00:00` 等价、`.071` 与 `.071000` 等价，
+   * 但**微秒一旦被截断**（`new Date(r.updated_at).toISOString()` 就是毫秒精度）就 0 命中 ——
+   * 那会变成「每次保存都假冲突」，而且只在这种极端组合下才暴露。
+   */
+  it('读取时不得把 updated_at 转成毫秒（截断微秒 → 每次保存都假冲突）', () => {
+    const cloud = readFileSync(resolve(process.cwd(), 'src/lib/cloudRepository.ts'), 'utf8')
+    expect(cloud).toMatch(/updatedAtIso: r\.updated_at \?\? null/)
+    expect(cloud).not.toMatch(/updatedAtIso: new Date/)
+  })
+
+  /**
+   * 整行覆盖的每一处调用点都要带版本号（或明确是「新建」不需要）。
+   * 曾经漏了 `confirmAbort` 的 `saveSession(s)` —— 它会把对方刚改的体重整段抹掉。
+   */
+  it('SessionView 里所有整行写入都带版本号', () => {
+    const session = readFileSync(resolve(process.cwd(), 'src/views/SessionView.vue'), 'utf8')
+    const calls = [...session.matchAll(/repository\.saveSession\(([^)]*)\)/g)].map((m) => m[1])
+    expect(calls.length).toBeGreaterThanOrEqual(3)
+    for (const args of calls) {
+      expect(args, `saveSession(${args}) 没有带乐观锁版本号`).toMatch(/knownUpdatedAtIso|override/)
+    }
+  })
 })

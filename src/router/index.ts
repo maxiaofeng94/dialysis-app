@@ -35,6 +35,16 @@ const SYNC_PATIENT_TIMEOUT_MS = 10000
 
 // 已建立病人上下文的账号 id（换账号后自动重建）
 let patientContextUid: string | null | undefined
+/**
+ * 上一次校准是否**真的跑完**了。
+ *
+ * 不能只用 `currentPatientId === DEFAULT_PATIENT_ID` 判断「没校准过」——
+ * 账号确实一个病人都没有时，`ensureCloudPatient()` 不会改动它，
+ * 于是每次导航都会重新拉一次病人列表（实测：4 次导航打出 2 次 `patient_members`，
+ * 受 FRESH_MS 闸门限制才没变成风暴）。
+ * 守卫超时（`withTimeout` 兜底）时也不算校准完成，下次导航会重试。
+ */
+let patientContextSynced = false
 
 /**
  * 是否需要重建「病人上下文」（恢复上次选的病人 + 校准到本账号可访问的病人）。
@@ -48,10 +58,11 @@ let patientContextUid: string | null | undefined
  * 表现就是「重新登录后一个病人都没有、也看不到任何记录」
  * （Web 端一直登录着走的是冷启动路径，所以看不出来；手机上退出再登录必现）。
  *
- * 所以第二个条件同样重要：当前病人 id 还停在默认值时，就是「没校准」，必须重建。
+ * 所以第二个条件同样重要：当前病人 id 还停在默认值**且这次还没校准成功**时，必须重建。
  */
 function needsPatientContext(uid: string | null): boolean {
-  return patientContextUid !== uid || currentPatientId.value === DEFAULT_PATIENT_ID
+  if (patientContextUid !== uid) return true
+  return !patientContextSynced && currentPatientId.value === DEFAULT_PATIENT_ID
 }
 
 // 多人版登录守卫：云端模式下未登录跳转登录页；本地模式（未配置 Supabase）不受影响
@@ -61,11 +72,15 @@ router.beforeEach(async (to) => {
   if (!isCloudConfigured) return true
   if (to.path === '/login') {
     // 回到登录页（主动登出 / 被踢下线）＝ 病人上下文作废，下次登录必须重新校准
-    if (!isLoggedIn.value) patientContextUid = undefined
+    if (!isLoggedIn.value) {
+      patientContextUid = undefined
+      patientContextSynced = false
+    }
     return isLoggedIn.value ? '/' : true
   }
   if (!isLoggedIn.value) {
     patientContextUid = undefined
+    patientContextSynced = false
     return '/login'
   }
   // 恢复上次选中的病人，并校准到当前账号可访问的病人（首次登录/换账号/重新登录/被移出成员）。
@@ -73,8 +88,15 @@ router.beforeEach(async (to) => {
   const uid = user.value?.id ?? null
   if (needsPatientContext(uid)) {
     await withTimeout(restorePatientId(), RESTORE_PATIENT_TIMEOUT_MS, undefined)
-    await withTimeout(ensureCloudPatient(), SYNC_PATIENT_TIMEOUT_MS, undefined)
+    // 用 then(() => true) 把「成功」与「超时」区分开：两者都返回 undefined 的话，
+    // 超时会被误当成校准完成，于是再也不会重试
+    const synced = await withTimeout(
+      ensureCloudPatient().then(() => true),
+      SYNC_PATIENT_TIMEOUT_MS,
+      false,
+    )
     patientContextUid = uid
+    patientContextSynced = synced
   }
   return true
 })

@@ -7,7 +7,22 @@
  * 的 cacheClear()（它会触发 Dexie 首次打开并建表）。
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { cacheGet, cacheSet, cacheStale, cacheDelete, cacheKeysByPrefix, cacheClear, cacheVersion, FRESH_MS } from '../../src/lib/cloudCache'
+import {
+  cacheGet,
+  cacheSet,
+  cacheStale,
+  cacheDelete,
+  cacheKeysByPrefix,
+  cacheClear,
+  cacheVersion,
+  dedupe,
+  shareRefresh,
+  isRefreshing,
+  isBatchRefreshing,
+  cacheFirstWithRevalidate,
+  WAIT_INFLIGHT_MS,
+  FRESH_MS,
+} from '../../src/lib/cloudCache'
 
 interface RawRow {
   key: string
@@ -242,6 +257,97 @@ describe('cloudCache · cacheClear', () => {
     await cacheClear()
 
     expect(cacheVersion.value).toBe(before + 1)
+  })
+
+  /**
+   * 登出后再登录同一账号时缓存 key 是一样的（`sessions:<同一个 pid>`）。
+   * 在途表不清的话，`dedupe` 会复用登出前那个**带旧 token** 的请求 —— 回来 401，
+   * 首屏直接显示「加载失败，请检查网络后重试」。
+   */
+  it('作废在途刷新登记（否则重登后会复用带旧 token 的请求）', async () => {
+    let release: (v: string[]) => void = () => {}
+    const pending = dedupe('sessions:p1', () => new Promise<string[]>((resolve) => (release = resolve)))
+    expect(isRefreshing('sessions:p1')).toBe(true)
+
+    await cacheClear()
+
+    expect(isRefreshing('sessions:p1')).toBe(false)
+    expect(isBatchRefreshing('sessions:p1')).toBe(false)
+    release([])
+    await pending
+  })
+})
+
+/**
+ * 批量刷新与单条读的相互作用。
+ *
+ * 这一组用**纯内存、无 IndexedDB** 的确定性时序：先把批量任务挂起，
+ * 再在同一个 key 上发起单条读，最后才让批量完成。
+ * 之前那条集成用例（`cachedRepository.spec.ts`）依赖宏任务轮数，
+ * `release()` 常常抢在单条读之前，于是**修复前也照样绿** —— 等于没有防线。
+ */
+describe('cloudCache · 批量任务与单条读（防串数据）', () => {
+  it('批量在途时，同一个 key 的单条 dedupe 不会复用它的返回值', async () => {
+    let releaseBatch: (v: string[]) => void = () => {}
+    const batch = shareRefresh(['bps:s1'], () => new Promise<string[]>((resolve) => (releaseBatch = resolve)))
+    expect(isBatchRefreshing('bps:s1')).toBe(true)
+
+    // 关键时序：单条读必须在批量完成**之前**发起
+    const single = dedupe('bps:s1', async () => ['only-mine'])
+
+    releaseBatch(['b1', 'b2'])
+    await batch
+
+    // 修复前 dedupe 无条件复用 inflight → 这里会拿到 ['b1','b2']（30 条记录的血压混进单条）
+    expect(await single).toEqual(['only-mine'])
+  })
+
+  it('单条任务在途时，同一个 key 的第二次 dedupe 复用它是安全的（同一个 loader 语义）', async () => {
+    let calls = 0
+    let release: (v: string) => void = () => {}
+    const first = dedupe('k', () => {
+      calls++
+      return new Promise<string>((resolve) => (release = resolve))
+    })
+    const second = dedupe('k', async () => {
+      calls++
+      return 'second'
+    })
+
+    release('first')
+    expect(await first).toBe('first')
+    expect(await second).toBe('first') // 复用了同一个任务
+    expect(calls).toBe(1)
+  })
+
+  it('一个 key 都没认领到（全被别的路径接手）时 shareRefresh 抛错，不拿别人的结果去写缓存', async () => {
+    let release: (v: string[]) => void = () => {}
+    const running = shareRefresh(['bps:s1'], () => new Promise<string[]>((resolve) => (release = resolve)))
+
+    await expect(shareRefresh(['bps:s1'], async () => ['别人的结果'])).rejects.toThrow('已在刷新中')
+
+    release(['ok'])
+    await running
+  })
+
+  it('批量在途且超时未落库时，无缓存的单条读会自己发请求（不会永久挂起）', async () => {
+    vi.useFakeTimers()
+    try {
+      // 批量任务永远不完成
+      void shareRefresh(['bps:s1'], () => new Promise<string[]>(() => {}))
+      expect(isBatchRefreshing('bps:s1')).toBe(true)
+
+      const loader = vi.fn(async () => ['fresh'])
+      const pending = cacheFirstWithRevalidate('bps:s1', loader)
+
+      // 等到超过等待上限
+      await vi.advanceTimersByTimeAsync(WAIT_INFLIGHT_MS + 100)
+
+      expect(await pending).toEqual(['fresh'])
+      expect(loader).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

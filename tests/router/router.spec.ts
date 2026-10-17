@@ -10,7 +10,11 @@
  */
 import { describe, it, expect, vi } from 'vitest'
 import { ref, computed } from 'vue'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { fakeSupabaseModule } from '../helpers/cloud'
+
+const read = (p: string) => readFileSync(resolve(process.cwd(), p), 'utf8')
 
 /** 需要打桩的视图（避免 import 真组件） */
 const VIEW_NAMES = [
@@ -335,21 +339,37 @@ describe('云端模式 · 已登录', () => {
     expect(ensureCloudPatient).toHaveBeenCalledTimes(2)
   })
 
-  it('当前病人还停在本地默认 id 时，即使 uid 没变也要重新校准（第三道防线）', async () => {
-    const { router, ensureCloudPatient, user, currentPatientId } = await loadRouter({
+  /**
+   * 回归（本轮评审发现）：**账号确实一个病人都没有**时，`currentPatientId` 会一直是默认值。
+   * 如果「当前病人是默认值」被当成「没校准过」，那每次导航都会重新拉一次病人列表
+   * （评审实测：4 次导航打出 2 次 `patient_members`，只是被 FRESH_MS 闸门压住了）。
+   * 现在用「本次是否真的校准成功」来区分。
+   */
+  it('账号一个病人都没有时，不会每次导航都重新拉病人列表', async () => {
+    const { router, ensureCloudPatient, currentPatientId, user } = await loadRouter({
       configured: true,
       initialized: true,
       user: { id: 'u1' },
     })
+    // 模拟「这个账号没有病人」：校准跑完但当前病人仍是默认值
+    ensureCloudPatient.mockImplementation(async () => {})
+    currentPatientId.value = 'patient-default'
 
     await go(router, '/')
-    expect(ensureCloudPatient).toHaveBeenCalledTimes(1)
-
-    // 模拟「未经过登录页、当前病人却回到默认值」（守卫超时/被绕过等）
-    currentPatientId.value = 'patient-default'
     await go(router, '/trend')
+    await go(router, '/settings')
 
-    expect(ensureCloudPatient).toHaveBeenCalledTimes(2)
-    expect(currentPatientId.value).toBe(REAL_PATIENT_ID)
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(1)
+    expect(user.value).toEqual({ id: 'u1' })
+  })
+
+  /**
+   * 守卫超时（`withTimeout` 兜底）时不能把「没跑完」当成「校准成功」——
+   * 否则再也不会重试，用户会一直停在「没有病人 / 没有记录」的假象上。
+   * 这里做静态断言而不是真等 10 秒超时（那会让整个套件慢十几秒）。
+   */
+  it('守卫把「成功」与「超时」区分开（超时不算校准成功）', () => {
+    expect(read('src/router/index.ts')).toMatch(/ensureCloudPatient\(\)\.then\(\(\) => true\)/)
+    expect(read('src/router/index.ts')).toMatch(/patientContextSynced = synced/)
   })
 })

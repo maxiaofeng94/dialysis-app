@@ -538,7 +538,7 @@ describe('cloudRepository · 乐观锁（多人同时编辑同一条记录）', 
     })
     loginAs(fake)
 
-    const next = await cloudRepository.saveSession(makeSession({ id: 's1' }), IRS)
+    const next = await cloudRepository.saveSession(makeSession({ id: 's1', preWeightMeasured: 61.5 }), IRS)
 
     const call = fake.lastCall('sessions')!
     expect(call.op).toBe('update')
@@ -546,9 +546,13 @@ describe('cloudRepository · 乐观锁（多人同时编辑同一条记录）', 
       { col: 'id', val: 's1' },
       { col: 'updated_at', val: IRS },
     ])
-    // 返回值是写入后的新版本，页面必须用它更新本地版本（否则下一次保存会自己跟自己冲突）
+    // B 路评审指出：只断言 toBeTruthy() 不够 —— 若 payload 漏了字段或用错列名，照样绿。
+    // 必须核对「真的写进了库，且值是对的」。
+    const row = fake.tables.sessions.find((r) => r.id === 's1')!
+    expect(row.pre_weight_measured).toBe(61.5)
+    // 返回值必须是这一行的新版本（页面要拿它更新本地版本）
+    expect(next).toBe(row.updated_at)
     expect(typeof next).toBe('string')
-    expect(next).toBeTruthy()
   })
 
   it('版本已变（对方先保存了）：抛 ConflictError，绝不覆盖对方的内容', async () => {
@@ -578,6 +582,29 @@ describe('cloudRepository · 乐观锁（多人同时编辑同一条记录）', 
     await cloudRepository.saveSession(makeSession({ id: 's-new' }))
 
     expect(fake.lastCall('sessions')!.op).toBe('upsert')
+  })
+
+  /**
+   * upsert 分支也必须返回**库里的** updated_at，不能返回本地 `new Date().toISOString()`。
+   *
+   * 本地 ISO 是毫秒精度，而 timestamptz 是微秒 —— 拿它当版本号回传会匹配不上，
+   * 下一次保存就变成「假冲突」（实测：`...58.295Z` 匹配 0 行，`...58.29576+00` 匹配 1 行）。
+   */
+  it('不带版本号保存：返回值取自响应里的 updated_at（不是本地毫秒时间）', async () => {
+    const DB_ISO = '2024-05-01 10:00:00.123456+00'
+    hoisted.state.client = {
+      ...makeAuthClient(),
+      from: () => ({
+        upsert: () => ({
+          select: () => ({ maybeSingle: async () => ({ data: { updated_at: DB_ISO }, error: null }) }),
+        }),
+      }),
+    }
+
+    const next = await cloudRepository.saveSession(makeSession({ id: 's1' }))
+
+    expect(next).toBe(DB_ISO)
+    expect(next).not.toMatch(/T.*Z$/) // 不是 toISOString() 的产物
   })
 
   it('读取时保留库里的原始 updated_at 字符串（毫秒时间戳回传会永远匹配不上）', async () => {
@@ -614,7 +641,7 @@ describe('cloudRepository · 乐观锁（病人档案）', () => {
     const { fake } = setupFake({ tables: { patients: [{ id: 'p1', name: '张三', updated_at: IRS }] } })
     loginAs(fake)
 
-    const next = await cloudRepository.savePatient(makePatient({ id: 'p1' }), IRS)
+    const next = await cloudRepository.savePatient(makePatient({ id: 'p1', wheelchairWeight: 22.5 }), IRS)
 
     const call = fake.lastCall('patients')!
     expect(call.op).toBe('update')
@@ -622,7 +649,10 @@ describe('cloudRepository · 乐观锁（病人档案）', () => {
       { col: 'id', val: 'p1' },
       { col: 'updated_at', val: IRS },
     ])
-    expect(next).toBeTruthy()
+    // 同样核对「写进去的值对不对」，不能只看有没有返回
+    const row = fake.tables.patients.find((r) => r.id === 'p1')!
+    expect(row.wheelchair_weight).toBe(22.5)
+    expect(next).toBe(row.updated_at)
   })
 
   it('对方先改了档案：抛 ConflictError', async () => {
@@ -648,6 +678,20 @@ describe('cloudRepository · 乐观锁（病人档案）', () => {
     await cloudRepository.savePatient(makePatient({ id: 'p1' }))
 
     expect(fake.lastCall('patients')!.op).toBe('upsert')
+  })
+
+  it('不带版本号保存档案：返回值同样取自响应里的 updated_at', async () => {
+    const DB_ISO = '2024-05-01 10:00:00.123456+00'
+    hoisted.state.client = {
+      ...makeAuthClient(),
+      from: () => ({
+        upsert: () => ({
+          select: () => ({ maybeSingle: async () => ({ data: { updated_at: DB_ISO }, error: null }) }),
+        }),
+      }),
+    }
+
+    expect(await cloudRepository.savePatient(makePatient({ id: 'p1' }))).toBe(DB_ISO)
   })
 })
 

@@ -265,10 +265,11 @@ class CloudRepository implements Repository {
     // 没有版本要求（新建档案 / 本地模式）→ 沿用 upsert。
     // 必须 upsert：update 命中 0 行时 PostgREST 不报错（行不存在、或被 RLS 静默过滤），
     // 档案改动会「看起来保存成功但其实没写进去」。
+    // 也必须回读库里的 updated_at（毫秒精度的本地时间回传会变成假冲突，同 saveSession）。
     if (!expectedUpdatedAt) {
-      const { error } = await this.client().from('patients').upsert(row)
+      const { data, error } = await this.client().from('patients').upsert(row).select('updated_at').maybeSingle()
       if (error) throw error
-      return nextIso
+      return (data as { updated_at?: string } | null)?.updated_at ?? nextIso
     }
 
     // 乐观锁：两人同时改档案（轮椅重量 / 回水量）时，后保存的人不该静默抹掉对方的改动
@@ -287,7 +288,8 @@ class CloudRepository implements Repository {
         .eq('id', patient.id)
         .maybeSingle()
       if (checkError) throw checkError
-      if (!exists) throw new NotFoundError('这个病人档案已被删除')
+      // 同 saveSession：查不到也可能是被 RLS 过滤，别写死「已被删除」
+      if (!exists) throw new NotFoundError('这个病人档案不存在，或你已无权访问')
       throw new ConflictError('病人档案已被其他人修改')
     }
 
@@ -360,9 +362,12 @@ class CloudRepository implements Repository {
 
     // 没有版本要求（新建记录 / 本地模式）→ 沿用 upsert
     if (!expectedUpdatedAt) {
-      const { error } = await this.client().from('sessions').upsert(row)
+      // ⚠️ 必须回读**库里的** updated_at，不能返回本地 `new Date().toISOString()`：
+      // 那是毫秒精度，而 timestamptz 是微秒 —— 拿它当版本号回传会匹配不上，
+      // 下一次保存变成「假冲突」（实测：`...58.295Z` 匹配 0 行，`...58.29576+00` 匹配 1 行）。
+      const { data, error } = await this.client().from('sessions').upsert(row).select('updated_at').maybeSingle()
       if (error) throw error
-      return nextIso
+      return (data as { updated_at?: string } | null)?.updated_at ?? nextIso
     }
 
     // 乐观锁：只有库里的 updated_at 还是「我读到的那个版本」时才允许整行覆盖。
@@ -384,7 +389,9 @@ class CloudRepository implements Repository {
         .eq('id', session.id)
         .maybeSingle()
       if (checkError) throw checkError
-      if (!exists) throw new NotFoundError()
+      // 查不到有两种可能：真被删了，或**被 RLS 过滤**（不再是成员 / 权限被收回）。
+      // 文案不要写死「已被删除」—— 用户会去问「谁删的」，而实际只是没有权限了。
+      if (!exists) throw new NotFoundError('这条记录不存在，或你已无权访问')
       throw new ConflictError()
     }
 
@@ -522,8 +529,11 @@ class CloudRepository implements Repository {
       .eq('session_id', sessionId)
     if (readErr) throw readErr
 
-    // 乐观锁：只在「现在库里的这批 id」与我打开页面时读到的一致时才允许整表替换。
-    // 不一致说明另一位家属也动过这份列表 —— 继续替换会把他勾的那项按「列表外」删掉。
+    // 乐观锁（best-effort）：只在「现在库里的这批 id」与我打开页面时读到的一致时才替换。
+    // ⚠️ 这是 **check-then-act**：比对与写入之间隔着网络往返，PostgREST 没法把两者放进一个事务，
+    // 所以它不是原子保证 —— 极端时序下（比对通过后、写入前对方刚好插入一条）仍可能删掉对方新增的。
+    // 要真正原子，得把「比对 + 替换」搬进数据库函数（RPC）；那属于改生产库结构，先不做。
+    // 窗口只有几十毫秒，且后果是「少一项」而不是写坏数据，比整表覆盖强得多。
     if (expectedIds) {
       const currentIds = (existing ?? []).map((r: { id: string }) => r.id).sort()
       const expected = [...expectedIds].sort()
