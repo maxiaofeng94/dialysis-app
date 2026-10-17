@@ -252,15 +252,22 @@ if (mode === 'check' || mode === undefined) {
   const sha = headSha()
   const state = readState()
 
-  // 「有没有东西要推」要看与**上游**的差距，而不是与评审基线的差距 ——
-  // 正常流程（提交 → 评审 → 推送）下评审基线就等于 HEAD，
-  // 拿它算会得到「0 个提交」，于是静态守卫永远不会被执行。
+  // 「有没有东西要推」只能看与**上游**的差距，不能看与评审基线的差距 ——
+  // 正常流程（提交 → 评审 → 推送）下评审基线就等于 HEAD，拿它算会得到「0 个提交」，
+  // 于是静态守卫永远不会被执行。
+  //
+  // ⚠️ 没有上游时**不能**推断「没有东西要推」：那种情况（新分支首次推送、本地仓库刚加 remote
+  // 还没 fetch）恰恰是要推东西的。此时保守要求评审 —— 探针复现过：无上游 + 只有 1 个提交
+  // （没有父提交可当基线）会算出空范围而静默放行，方向错了。
   const upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'])
-  const pushBase = upstream ? (git(['merge-base', 'HEAD', upstream]) ?? upstream) : resolveBaseline([])
-  const pushing = scopeOf(pushBase)
-  if (pushing.commits.length === 0) {
+  const pushBase = upstream ? (git(['merge-base', 'HEAD', upstream]) ?? upstream) : null
+  const pushing = pushBase ? scopeOf(pushBase) : null
+  if (pushing && pushing.commits.length === 0) {
     console.log(C.dim('[review-gate] 没有待推送的提交，跳过'))
     process.exit(0)
+  }
+  if (!upstream) {
+    console.log(C.yellow('[review-gate] 当前分支没有上游分支，无法判定要推什么 —— 按「有内容要推」处理'))
   }
 
   if (!state || !state.passed) {
@@ -305,7 +312,8 @@ if (mode === 'check' || mode === undefined) {
   }
 
   const { range, commits } = scopeOf(state.baseline)
-  console.log(C.green(`[review-gate] ✅ 评审门禁通过（要推送 ${pushing.commits.length} 个提交：${pushing.range}）`))
+  const scope = pushing ?? scopeOf(state.baseline)
+  console.log(C.green(`[review-gate] ✅ 评审门禁通过（要推送 ${scope.commits.length} 个提交：${scope.range}）`))
   console.log(C.dim(`           评审基线：${range}（${commits.length} 个提交）`))
   process.exit(0)
 }
