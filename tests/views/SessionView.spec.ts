@@ -1158,6 +1158,63 @@ describe('SessionView · 乐观锁（多人同时编辑同一条记录）', () =
 
     expect(vi.mocked(repository.replaceAdverseReactions).mock.calls[0][2]).toEqual(['r1', 'r2'])
   })
+
+  /**
+   * 「标记中止」也是一次**整行覆盖**（状态 + 中止信息）。
+   * 曾经它调 `repository.saveSession(s)` **完全没带版本号** —— 无条件覆盖，
+   * 会把另一位家属刚改的体重整段抹掉；而且用 `tryWrite` 吞掉了 ConflictError，
+   * 分不清「冲突」和「网络失败」。评审发现后修复，这里钉住。
+   */
+  it('标记中止也必须带乐观锁版本号', async () => {
+    const IRS = '2024-01-10T09:00:00.000000+00:00'
+    const w = await mountSession(defaultData({ session: makeSession({ id: 'session-1', updatedAtIso: IRS }) }))
+
+    await buttonByText(w.find('.status-actions'), '中止透析').trigger('click')
+    await flushPromises()
+    const popup = popupByText(w, '常用原因（可多选）')
+    await buttonByText(popup, '确认中止').trigger('click')
+    await flushPromises()
+
+    // 只要**存在**一次带版本号的中止写入即可（挂载时表单回填还可能触发一次防抖保存）
+    const statusCall = vi
+      .mocked(repository.saveSession)
+      .mock.calls.find((c) => (c[0] as { status: string }).status === 'aborted')
+    expect(statusCall, '没有发出「中止」的保存请求').toBeTruthy()
+    expect(statusCall![1]).toBe(IRS)
+  })
+
+  /**
+   * 状态类写入冲突时**不能**走「覆盖保存」：那条路径最终调 `persistSession`，
+   * 而它只写表单字段（日期/体重/备注），**不含 status / 中止信息** ——
+   * 用户会看到「已保存」，可这次的状态改动其实被丢掉了。
+   */
+  it('状态保存冲突：提示重新操作，不倒「覆盖保存」也不谎报「已保存」', async () => {
+    // 表单回填会挂一次 400ms 防抖保存，先用假定时器放它过去，
+    // 否则它会先消耗掉下面的 mock，测的就不是「状态保存」这条路径了
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const w = await mountSession(
+      defaultData({
+        // 注意：patch 会整个替换 session，必须自己把下机后体重带上，
+        // 否则「标记完成」会走「请先填写下机后体重」那条分支
+        session: makeSession({ id: 'session-1', postWeightMeasured: 77, updatedAtIso: '2024-01-10T09:00:00Z' }),
+      }),
+    )
+    await vi.advanceTimersByTimeAsync(500)
+
+    vi.mocked(repository.saveSession).mockClear()
+    vi.mocked(repository.saveSession).mockRejectedValue(Object.assign(new Error('冲突'), { name: 'ConflictError' }))
+    mocks.showToast.mockClear()
+    mocks.showConfirmDialog.mockClear()
+
+    await buttonByText(w.find('.status-actions'), '标记完成').trigger('click')
+    await flushPromises()
+
+    expect(mocks.showToast).toHaveBeenCalledWith(expect.stringContaining('请重新操作'))
+    expect(mocks.showToast).not.toHaveBeenCalledWith('已保存')
+    // 不该弹「重新加载 / 覆盖保存」的选择框 —— 覆盖在这条路径上会丢数据
+    expect(mocks.showConfirmDialog).not.toHaveBeenCalled()
+    vi.useRealTimers()
+  })
 })
 
 describe('SessionView · H2 多设备：只在未改动时合并远端新值', () => {
