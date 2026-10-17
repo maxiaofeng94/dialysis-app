@@ -503,6 +503,45 @@ describe('cachedRepository · 批量读取子表（趋势页一次拉回 30 条�
     release([])
     await flushAsync()
   })
+
+  /**
+   * 边界：某条记录正被别的路径（例如详情页的单条读）刷新时，批量读不能把它算进自己这一批 ——
+   * 否则 shareRefresh 会复用到别人的任务，按那个（只覆盖部分 key 的）结果写回，
+   * 会把没请求到的 key 写成空数组，页面显示「暂无数据」。
+   */
+  it('某条记录正被别的路径刷新时，批量读不会把它的缓存写成空数组', async () => {
+    await putRawCache('bps:s1', [makeBp({ id: 'old-1', sessionId: 's1' })], 0)
+    await putRawCache('bps:s2', [makeBp({ id: 'old-2', sessionId: 's2' })], 0)
+
+    let releaseSingle: (v: unknown[]) => void = () => {}
+    cloud.listBloodPressures.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseSingle = resolve as (v: unknown[]) => void
+        }),
+    )
+    cloud.listBloodPressuresMany.mockResolvedValue([makeBp({ id: 'new-2', sessionId: 's2' })])
+
+    // 详情页先给 s1 发起单条刷新（在途）
+    void cachedCloudRepository.listBloodPressures('s1')
+    await flushAsync()
+
+    const got = await cachedCloudRepository.listBloodPressuresMany(['s1', 's2'])
+
+    // 两条都先用旧值渲染（陈旧刷新的新值是后台写回的，不阻塞这次返回）
+    expect(got.map((x) => x.id)).toEqual(['old-1', 'old-2'])
+    // 关键：批量请求只带没被接手的 s2，不能把在途的 s1 也算进来
+    expect(cloud.listBloodPressuresMany).toHaveBeenCalledWith(['s2'])
+
+    await vi.waitFor(async () => {
+      expect((await cacheGet<unknown[]>('bps:s2'))?.value).toEqual([makeBp({ id: 'new-2', sessionId: 's2' })])
+    })
+    // s1 的缓存不能被批量结果（只含 s2）覆盖成空
+    expect((await cacheGet<unknown[]>('bps:s1'))?.value).toHaveLength(1)
+
+    releaseSingle([])
+    await flushAsync()
+  })
 })
 
 describe('cachedRepository · 写操作：先落云端再更新缓存', () => {

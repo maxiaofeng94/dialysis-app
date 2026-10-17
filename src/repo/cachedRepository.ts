@@ -152,24 +152,46 @@ async function listManyBySession<T extends { sessionId: string }>(
     )
   }
 
+  /**
+   * 真正要发请求的 key：把「在这一步之前刚被别的路径接手刷新」的滤掉。
+   *
+   * 不能不过滤就交给 shareRefresh —— 它会复用到别人的任务，而那个任务的返回结果
+   * 未必覆盖本次的 key，按它写回会把多余的 key 写成空数组（页面于是显示「暂无数据」）。
+   * 被滤掉的那些读一次缓存就好：它们正在刷，马上就有新值。
+   */
+  const claim = async (candidates: string[]): Promise<string[]> => {
+    const mine = candidates.filter((id) => !isRefreshing(keyOf(id)))
+    const taken = new Set(mine)
+    for (const id of candidates) {
+      if (taken.has(id)) continue
+      const cached = await cacheGet<T[]>(keyOf(id))
+      if (cached) values.set(id, cached.value)
+    }
+    return mine
+  }
+
   if (missing.length) {
-    // shareRefresh：这一批 id 一起登记在途，写回途中页面重读也不会再发一次
-    const rows = await shareRefresh(missing.map(keyOf), () => fetchMany(missing))
-    await writeBack(missing, rows)
+    const targets = await claim(missing)
+    if (targets.length) {
+      // shareRefresh：这一批 id 一起登记在途，写回途中页面重读也不会再发一次
+      const rows = await shareRefresh(targets.map(keyOf), () => fetchMany(targets))
+      await writeBack(targets, rows)
+    }
   }
 
   if (stale.length) {
-    void shareRefresh(stale.map(keyOf), async () => {
-      const rows = await fetchMany(stale)
-      await writeBack(stale, rows)
-      return rows
-    })
-      .then(() => {
+    void claim(stale).then((targets) => {
+      if (!targets.length) return
+      return shareRefresh(targets.map(keyOf), async () => {
+        const rows = await fetchMany(targets)
+        await writeBack(targets, rows)
+        return rows
+      }).then(() => {
         cacheVersion.value++
       })
-      .catch(() => {
-        // 后台刷新失败继续用旧缓存，不打扰用户
-      })
+    }).catch(() => {
+      // 后台刷新失败继续用旧缓存，不打扰用户
+    })
   }
 
   // 按调用方给的顺序拼回去（每次 load 的 session 顺序一致，图表点位才稳定）

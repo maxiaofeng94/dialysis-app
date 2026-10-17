@@ -149,6 +149,10 @@ export function refreshInFlight(key: string): Promise<unknown> | undefined {
  * 于是又发一次批量请求；而它完成时又可能撞上下一次重读……实测把延迟设成 3 秒（= FRESH_MS）时，
  * 趋势页会稳定地每 3.2 秒刷一轮、几十秒都停不下来。按 key 登记后，任何一条读路径
  * （单条读、批量读、页面重读）看到的都是「这个 key 正在刷新」，不会重复发。
+ *
+ * ⚠️ 调用前必须用 `isRefreshing` 把「已经在刷」的 key 滤掉：否则 `dedupe` 会复用到
+ * **别人**的任务，而那个任务的返回结果未必覆盖本次要写的 key —— 按它写回会把多余的 key
+ * 写成空数组（页面于是显示「暂无数据」）。
  */
 export function shareRefresh<T>(keys: string[], task: () => Promise<T>): Promise<T> {
   let running: Promise<T> | null = null
