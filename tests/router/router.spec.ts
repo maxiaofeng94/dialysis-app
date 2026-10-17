@@ -62,12 +62,21 @@ async function loadRouter(scenario: Scenario = {}) {
     currentPatientId.value = REAL_PATIENT_ID
   })
 
-  vi.doMock('../../src/stores/auth', () => ({
-    useAuth: () => ({ user, initialized, isLoggedIn, init, register: vi.fn(), login: vi.fn(), logout: vi.fn() }),
-    user,
-    initialized,
-    isLoggedIn,
-  }))
+  vi.doMock('../../src/stores/auth', async () => {
+    // onLoggedOut 用**真实的 watch** 实现，且与 isLoggedIn 同一个 Vue 实例 ——
+    // 这样才测得出守卫「登出即作废上下文」的逻辑（用 spy 替身的话永远是绿的）
+    const { watch } = await import('vue')
+    return {
+      useAuth: () => ({ user, initialized, isLoggedIn, init, register: vi.fn(), login: vi.fn(), logout: vi.fn() }),
+      user,
+      initialized,
+      isLoggedIn,
+      onLoggedOut: (fn: () => void) =>
+        watch(isLoggedIn, (val, old) => {
+          if (old && !val) fn()
+        }),
+    }
+  })
   vi.doMock('../../src/stores/patient', () => ({
     restorePatientId,
     ensureCloudPatient,

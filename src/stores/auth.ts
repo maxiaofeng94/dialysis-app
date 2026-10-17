@@ -1,4 +1,4 @@
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import type { User } from '@supabase/supabase-js'
 import {
   supabase,
@@ -241,4 +241,18 @@ async function logout() {
 
 export function useAuth() {
   return { user, initialized, isLoggedIn, init, register, login, logout }
+}
+
+/**
+ * 订阅「登录态失效」（由已登录变为未登录）。
+ *
+ * ⚠️ 必须放在这个模块里，而不是让调用方自己 `watch(isLoggedIn)` ——
+ * watch 与 isLoggedIn 要来自**同一个 Vue 实例**。测试里 `vi.resetModules()` 之后，
+ * 调用方模块拿到的 `watch` 与注入的 mock `computed` 分属两个实例，订阅**不会触发**：
+ * 表现就是那段「登出即作废」的逻辑悄悄失效，而这正是「重新登录后一条记录都没有」的成因。
+ */
+export function onLoggedOut(fn: () => void): void {
+  watch(isLoggedIn, (val, old) => {
+    if (old && !val) fn()
+  })
 }
