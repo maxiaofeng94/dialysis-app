@@ -59,6 +59,8 @@ function patientFromRow(r: any): Patient {
     rinseBackVolume: Number(r.rinse_back_volume ?? 300),
     createdAt: new Date(r.created_at).getTime(),
     updatedAt: new Date(r.updated_at).getTime(),
+    // 乐观锁版本号：原样保留库里的字符串（同 DialysisSession.updatedAtIso）
+    updatedAtIso: r.updated_at ?? null,
   }
 }
 
@@ -255,11 +257,41 @@ class CloudRepository implements Repository {
     return data ? patientFromRow(data) : undefined
   }
 
-  async savePatient(patient: Patient) {
+  async savePatient(patient: Patient, expectedUpdatedAt?: string | null): Promise<string | null> {
+    const row = patientToRow(patient)
+    const nextIso = new Date().toISOString()
+    row.updated_at = nextIso
+
+    // 没有版本要求（新建档案 / 本地模式）→ 沿用 upsert。
     // 必须 upsert：update 命中 0 行时 PostgREST 不报错（行不存在、或被 RLS 静默过滤），
-    // 档案改动会「看起来保存成功但其实没写进去」。其它写方法也都是 upsert，这里保持一致。
-    const { error } = await this.client().from('patients').upsert(patientToRow(patient))
+    // 档案改动会「看起来保存成功但其实没写进去」。
+    if (!expectedUpdatedAt) {
+      const { error } = await this.client().from('patients').upsert(row)
+      if (error) throw error
+      return nextIso
+    }
+
+    // 乐观锁：两人同时改档案（轮椅重量 / 回水量）时，后保存的人不该静默抹掉对方的改动
+    const { data, error } = await this.client()
+      .from('patients')
+      .update(row)
+      .eq('id', patient.id)
+      .eq('updated_at', expectedUpdatedAt)
+      .select('updated_at')
     if (error) throw error
+
+    if (!data?.length) {
+      const { data: exists, error: checkError } = await this.client()
+        .from('patients')
+        .select('id')
+        .eq('id', patient.id)
+        .maybeSingle()
+      if (checkError) throw checkError
+      if (!exists) throw new NotFoundError('这个病人档案已被删除')
+      throw new ConflictError('病人档案已被其他人修改')
+    }
+
+    return (data[0] as { updated_at: string }).updated_at ?? nextIso
   }
 
   async listDryWeights(patientId: string) {
@@ -475,7 +507,11 @@ class CloudRepository implements Repository {
     return (data ?? []).map(reactionFromRow)
   }
 
-  async replaceAdverseReactions(sessionId: string, reactions: AdverseReaction[]) {
+  async replaceAdverseReactions(
+    sessionId: string,
+    reactions: AdverseReaction[],
+    expectedIds?: string[],
+  ): Promise<void> {
     const client = this.client()
 
     // 顺序很关键：先查旧 id → 再写新数据 → 最后删掉「旧的但这次不在列表里」的。
@@ -486,6 +522,15 @@ class CloudRepository implements Repository {
       .eq('session_id', sessionId)
     if (readErr) throw readErr
 
+    // 乐观锁：只在「现在库里的这批 id」与我打开页面时读到的一致时才允许整表替换。
+    // 不一致说明另一位家属也动过这份列表 —— 继续替换会把他勾的那项按「列表外」删掉。
+    if (expectedIds) {
+      const currentIds = (existing ?? []).map((r: { id: string }) => r.id).sort()
+      const expected = [...expectedIds].sort()
+      const same = currentIds.length === expected.length && currentIds.every((id, i) => id === expected[i])
+      if (!same) throw new ConflictError('不良反应已被其他人修改')
+    }
+
     if (reactions.length) {
       const { error: upsertErr } = await client.from('adverse_reactions').upsert(reactions.map(reactionToRow))
       if (upsertErr) throw upsertErr
@@ -494,6 +539,8 @@ class CloudRepository implements Repository {
     const keep = new Set(reactions.map((r) => r.id))
     const removeIds = (existing ?? []).map((r: { id: string }) => r.id).filter((id: string) => !keep.has(id))
     if (removeIds.length) {
+      // 不用 assertDeleted 复查行数：这些 id 可能刚被另一位家属删掉了，
+      // 命中 0 行属于「结果已经是我要的」，报错反而会让用户以为没保存成功
       const { error: delErr } = await client.from('adverse_reactions').delete().in('id', removeIds)
       if (delErr) throw delErr
     }

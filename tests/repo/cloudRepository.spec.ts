@@ -126,6 +126,8 @@ describe('cloudRepository · 病人映射（snake_case → camelCase）', () => 
       rinseBackVolume: 300,
       createdAt: new Date('2024-01-01T00:00:00.000Z').getTime(),
       updatedAt: new Date('2024-02-01T00:00:00.000Z').getTime(),
+      // 乐观锁版本号：保留库里的原始字符串
+      updatedAtIso: '2024-02-01T00:00:00.000Z',
     })
     expect(fake.lastCall('patients')!.filters).toEqual([{ col: 'id', val: 'p1' }])
   })
@@ -598,6 +600,95 @@ describe('cloudRepository · 乐观锁（多人同时编辑同一条记录）', 
     const s = await cloudRepository.getSession('s1')
 
     expect(s?.updatedAtIso).toBe(IRS)
+  })
+})
+
+/**
+ * 同样的乐观锁也要覆盖「病人档案」：两个人同时改轮椅重量 / 回水量，
+ * 后保存的人不该静默抹掉对方刚改的值。
+ */
+describe('cloudRepository · 乐观锁（病人档案）', () => {
+  const IRS = '2024-05-01T10:00:00.000000+00:00'
+
+  it('带版本号保存档案：用 update + updated_at 条件', async () => {
+    const { fake } = setupFake({ tables: { patients: [{ id: 'p1', name: '张三', updated_at: IRS }] } })
+    loginAs(fake)
+
+    const next = await cloudRepository.savePatient(makePatient({ id: 'p1' }), IRS)
+
+    const call = fake.lastCall('patients')!
+    expect(call.op).toBe('update')
+    expect(call.filters).toEqual([
+      { col: 'id', val: 'p1' },
+      { col: 'updated_at', val: IRS },
+    ])
+    expect(next).toBeTruthy()
+  })
+
+  it('对方先改了档案：抛 ConflictError', async () => {
+    setupFake({ tables: { patients: [{ id: 'p1', updated_at: '2024-05-01T11:00:00.000000+00:00' }] } })
+
+    await expect(cloudRepository.savePatient(makePatient({ id: 'p1' }), IRS)).rejects.toMatchObject({
+      name: 'ConflictError',
+    })
+  })
+
+  it('档案已被删除：抛 NotFoundError', async () => {
+    setupFake({ tables: { patients: [] } })
+
+    await expect(cloudRepository.savePatient(makePatient({ id: 'p1' }), IRS)).rejects.toMatchObject({
+      name: 'NotFoundError',
+    })
+  })
+
+  it('不带版本号（新建档案）：沿用 upsert', async () => {
+    const { fake } = setupFake({ tables: { patients: [] } })
+    loginAs(fake)
+
+    await cloudRepository.savePatient(makePatient({ id: 'p1' }))
+
+    expect(fake.lastCall('patients')!.op).toBe('upsert')
+  })
+})
+
+/**
+ * 不良反应是**整表替换**（「列表之外的全删」）：两个家属各勾一项时，
+ * 后保存的人会把先保存的人勾的那项当「已取消」删掉 —— 前端串行化只防得住同一台设备。
+ */
+describe('cloudRepository · 乐观锁（不良反应整表替换）', () => {
+  const base = { session_id: 's1', type: 'cramp', detail: null, severity: null, recorded_at: '2024-05-01T10:00:00.000Z' }
+
+  it('库里的 id 集合与我读到的不一致：抛 ConflictError，绝不按自己的列表去删', async () => {
+    const { fake } = setupFake({
+      tables: { adverse_reactions: [{ id: 'a1', ...base }, { id: 'a2', ...base }] },
+    })
+
+    await expect(
+      cloudRepository.replaceAdverseReactions('s1', [makeReaction({ id: 'a1', sessionId: 's1' })], ['a1']),
+    ).rejects.toMatchObject({ name: 'ConflictError' })
+
+    // 冲突时不应发出任何写入
+    expect(fake.calls.some((c) => c.table === 'adverse_reactions' && c.op !== 'select')).toBe(false)
+  })
+
+  it('id 集合一致：正常替换（新增我勾的、删掉我取消的）', async () => {
+    const { fake } = setupFake({ tables: { adverse_reactions: [{ id: 'a1', ...base }] } })
+
+    await cloudRepository.replaceAdverseReactions(
+      's1',
+      [makeReaction({ id: 'a1', sessionId: 's1' }), makeReaction({ id: 'a2', sessionId: 's1' })],
+      ['a1'],
+    )
+
+    expect(fake.calls.some((c) => c.table === 'adverse_reactions' && c.op === 'upsert')).toBe(true)
+  })
+
+  it('不传快照（如首次记录）：不做比对，照常写入', async () => {
+    const { fake } = setupFake({ tables: { adverse_reactions: [] } })
+
+    await cloudRepository.replaceAdverseReactions('s1', [makeReaction({ id: 'a1', sessionId: 's1' })])
+
+    expect(fake.calls.some((c) => c.table === 'adverse_reactions' && c.op === 'upsert')).toBe(true)
   })
 })
 

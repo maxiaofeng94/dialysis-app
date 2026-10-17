@@ -1189,3 +1189,52 @@ describe('SettingsView · 版本号', () => {
     expect(w.text()).toContain('网页版 · 自动更新')
   })
 })
+
+/**
+ * 乐观锁：两个人同时改同一个病人的档案（轮椅重量 / 回水量）。
+ * 整行覆盖的写法下，后保存的人会把先保存的人刚改的值静默抹掉。
+ */
+describe('SettingsView · 乐观锁（多人同时改病人档案）', () => {
+  const IRS = '2024-01-10T09:00:00.000000+00:00'
+
+  it('保存档案带上「我读到的版本」；冲突时弹确认、且绝不提示「已保存」', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', updatedAtIso: IRS }) })
+    mocks.showConfirmDialog.mockResolvedValueOnce(undefined) // 选「重新加载」
+    vi.mocked(repository.savePatient).mockRejectedValueOnce(
+      Object.assign(new Error('冲突'), { name: 'ConflictError' }),
+    )
+
+    await fieldInput(w, '轮椅重量').setValue('25')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    expect(vi.mocked(repository.savePatient).mock.calls[0][1]).toBe(IRS)
+    expect(mocks.showConfirmDialog).toHaveBeenCalled()
+    expect(mocks.showToast).not.toHaveBeenCalledWith('已保存')
+  })
+
+  it('冲突选「覆盖保存」：这次不带版本条件重写一次，用户改的值不丢', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', updatedAtIso: IRS }) })
+    mocks.showConfirmDialog.mockRejectedValueOnce(new Error('cancel')) // 选「覆盖保存」
+    vi.mocked(repository.savePatient)
+      .mockRejectedValueOnce(Object.assign(new Error('冲突'), { name: 'ConflictError' }))
+      .mockResolvedValue('2024-01-10T11:00:00.000000+00:00')
+
+    await fieldInput(w, '轮椅重量').setValue('26')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    expect(repository.savePatient).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(repository.savePatient).mock.calls[1][1]).toBeNull()
+    expect(vi.mocked(repository.savePatient).mock.calls[1][0]).toMatchObject({ wheelchairWeight: 26 })
+  })
+
+  it('没读到版本号时（本地模式 / 新建档案）不带条件，照常保存', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
+
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    expect(vi.mocked(repository.savePatient).mock.calls[0][1]).toBeNull()
+  })
+})

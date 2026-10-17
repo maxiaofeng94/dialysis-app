@@ -266,13 +266,14 @@ describe('SessionView · 加载与兜底', () => {
   it('并发请求会话/病人/干体重与四张子表', async () => {
     await mountSession()
 
-    expect(repository.getSession).toHaveBeenCalledWith('session-1')
+    // 正常加载走缓存（opts 为空对象）；冲突后的「重新加载」才会带 { fresh: true }
+    expect(repository.getSession).toHaveBeenCalledWith('session-1', {})
     expect(repository.getPatient).toHaveBeenCalledWith('patient-default')
     expect(repository.listDryWeights).toHaveBeenCalledWith('patient-default')
     expect(repository.listBloodPressures).toHaveBeenCalledWith('session-1')
     expect(repository.listBloodGlucoses).toHaveBeenCalledWith('session-1')
     expect(repository.listBloodFlows).toHaveBeenCalledWith('session-1')
-    expect(repository.listAdverseReactions).toHaveBeenCalledWith('session-1')
+    expect(repository.listAdverseReactions).toHaveBeenCalledWith('session-1', {})
   })
 })
 
@@ -1086,7 +1087,9 @@ describe('SessionView · 乐观锁（多人同时编辑同一条记录）', () =
     await flushPromises()
 
     expect(mocks.showConfirmDialog).toHaveBeenCalled()
-    expect(repository.getSession).toHaveBeenCalled() // 重新加载
+    // 必须 fresh：缓存里是冲突前那份数据，走缓存等于什么都没刷新
+    // （实测踩到：提示「已被他人修改」后重新加载，看到的还是自己原来的内容）
+    expect(repository.getSession).toHaveBeenCalledWith('session-1', { fresh: true })
     vi.useRealTimers()
   })
 
@@ -1123,6 +1126,37 @@ describe('SessionView · 乐观锁（多人同时编辑同一条记录）', () =
     expect(mocks.showToast).toHaveBeenCalledWith('这条记录已被删除')
     expect(router.currentRoute.value.path).toBe('/')
     vi.useRealTimers()
+  })
+
+  /**
+   * 不良反应是整表替换（「列表之外的全删」）：另一位家属同时勾了一项时，
+   * 按我这份列表去替换会把他勾的当「已取消」删掉。
+   */
+  it('不良反应被其他人改过：提示并重新加载，不按我这份列表去删', async () => {
+    const w = await mountSession(defaultData({ reactions: [makeReaction({ id: 'r1', sessionId: 'session-1' })] }))
+    vi.mocked(repository.replaceAdverseReactions).mockRejectedValueOnce(
+      Object.assign(new Error('冲突'), { name: 'ConflictError' }),
+    )
+    vi.mocked(repository.listAdverseReactions).mockClear()
+
+    await w.findAll('.chip').find((c) => c.text() === '抽筋')!.trigger('click')
+    await flushPromises()
+
+    expect(mocks.showToast).toHaveBeenCalledWith('不良反应已被其他人修改，已为你重新加载')
+    // 同样必须 fresh，否则读回的还是冲突前那份列表
+    expect(repository.listAdverseReactions).toHaveBeenCalledWith('session-1', { fresh: true })
+  })
+
+  it('不良反应保存时带上「我读到的 id 快照」（整表替换的乐观锁）', async () => {
+    const w = await mountSession(
+      defaultData({ reactions: [makeReaction({ id: 'r1', sessionId: 'session-1' }), makeReaction({ id: 'r2', sessionId: 'session-1' })] }),
+    )
+    vi.mocked(repository.replaceAdverseReactions).mockClear()
+
+    await w.findAll('.chip').find((c) => c.text() === '抽筋')!.trigger('click')
+    await flushPromises()
+
+    expect(vi.mocked(repository.replaceAdverseReactions).mock.calls[0][2]).toEqual(['r1', 'r2'])
   })
 })
 

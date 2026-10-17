@@ -711,22 +711,27 @@ describe('cachedRepository · 写操作：先落云端再更新缓存', () => {
     expect((await cacheGet<{ id: string }[]>('bfs:s1'))!.value.map((f) => f.id)).toEqual(['bf-1', 'bf-2'])
   })
 
-  it('savePatient 只更新单条缓存（不走列表）', async () => {
-    const p = makePatient({ id: 'p1', name: '张三' })
+  it('savePatient 更新单条缓存，并同步「我的病人」列表里的那份副本', async () => {
+    await cacheSet('myPatients:u1', [{ patient: makePatient({ id: 'p1', name: '张三' }), role: 'owner' }])
+    const p = makePatient({ id: 'p1', name: '张三', wheelchairWeight: 21 })
 
     await cachedCloudRepository.savePatient(p)
 
-    expect(cloud.savePatient).toHaveBeenCalledWith(p)
+    // 第二个参数是乐观锁版本号（这里没传 = 不做版本检查）
+    expect(cloud.savePatient).toHaveBeenCalledWith(p, undefined)
     expect((await cacheGet<typeof p>('patient:p1'))?.value).toEqual(p)
+    // 列表页显示的还是旧轮椅重量的话，用户会以为没保存上
+    const list = (await cacheGet<{ patient: { wheelchairWeight: number } }[]>('myPatients:u1'))!.value
+    expect(list[0].patient.wheelchairWeight).toBe(21)
   })
 
-  it('replaceAdverseReactions 用新数组整体覆盖缓存', async () => {
+  it('replaceAdverseReactions 用新数组整体覆盖缓存，并把乐观锁快照透传给云端', async () => {
     await cacheSet('ars:s1', [makeReaction({ id: 'old', sessionId: 's1' })])
     const next = [makeReaction({ id: 'a1', sessionId: 's1' }), makeReaction({ id: 'a2', sessionId: 's1' })]
 
-    await cachedCloudRepository.replaceAdverseReactions('s1', next)
+    await cachedCloudRepository.replaceAdverseReactions('s1', next, ['old'])
 
-    expect(cloud.replaceAdverseReactions).toHaveBeenCalledWith('s1', next)
+    expect(cloud.replaceAdverseReactions).toHaveBeenCalledWith('s1', next, ['old'])
     expect((await cacheGet<typeof next>('ars:s1'))?.value).toEqual(next)
   })
 

@@ -9,6 +9,8 @@ export interface Patient {
   rinseBackVolume: number
   createdAt: number
   updatedAt: number
+  /** 云端原始 `updated_at`（ISO），乐观锁用；含义同 DialysisSession.updatedAtIso */
+  updatedAtIso?: string | null
 }
 
 export interface DryWeight {

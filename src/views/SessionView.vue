@@ -110,12 +110,12 @@ onMounted(async () => {
   await load()
 })
 
-async function load() {
+async function load(opts: { fresh?: boolean } = {}) {
   try {
     const pid = currentPatientId.value
     // 并行拉取，避免 7 次网络往返串行叠加
     const [s, p, dw] = await Promise.all([
-      repository.getSession(sessionId),
+      repository.getSession(sessionId, opts),
       repository.getPatient(pid),
       repository.listDryWeights(pid),
     ])
@@ -126,7 +126,7 @@ async function load() {
     }
     patient.value = p ?? null
     dryWeights.value = dw
-    await loadSub()
+    await loadSub(opts)
     applySessionToForm(session.value)
     selectedReactions.value = reactions.value.map((r) => r.type)
     otherDetail.value = reactions.value.find((r) => r.type === 'other')?.detail ?? ''
@@ -191,19 +191,25 @@ function markStateKnown() {
   knownUpdatedAtIso = session.value?.updatedAtIso ?? null
 }
 
-async function loadSub() {
+async function loadSub(opts: { fresh?: boolean } = {}) {
   // 四个子表并行拉取
   const [bp, bg, bf, ar] = await Promise.all([
     repository.listBloodPressures(sessionId),
     repository.listBloodGlucoses(sessionId),
     repository.listBloodFlows(sessionId),
-    repository.listAdverseReactions(sessionId),
+    repository.listAdverseReactions(sessionId, opts),
   ])
   bps.value = bp
   glucoses.value = bg
   flows.value = bf
   reactions.value = ar
+  // 不良反应的**乐观锁**快照：整表替换的语义是「列表之外的全删」，
+  // 保存前要拿这份 id 集合跟库里比对，否则会把另一位家属同时勾的那项删掉
+  knownReactionIds = ar.map((r) => r.id)
 }
+
+/** 我读到的不良反应 id 集合（乐观锁用，见 persistReactions） */
+let knownReactionIds: string[] = []
 
 const effectiveDry = computed(() => getEffectiveDryWeight(dryWeights.value, form.date || todayStr()))
 
@@ -385,7 +391,8 @@ async function resolveSaveConflict(): Promise<void> {
       cancelButtonText: '覆盖保存',
       messageAlign: 'left',
     })
-    await load() // 重新加载 = 放弃本地修改
+    // fresh：缓存里是冲突前那份数据，重新加载必须绕过它，否则用户以为对方没改过
+    await load({ fresh: true })
   } catch {
     // 覆盖保存：用户已明确要用屏幕上的内容盖掉对方的 → 这次不带版本条件写
     await persistSession({ force: true, override: true })
@@ -776,10 +783,25 @@ async function persistReactions(): Promise<boolean> {
     }))
   savingReactions = true
   try {
-    return await tryWrite(
-      () => repository.replaceAdverseReactions(sessionId, list),
-      '不良反应保存失败，请检查网络后重试',
-    )
+    // 不用 tryWrite：它会把 ConflictError 一起吞成 false，这里需要分辨冲突与普通失败
+    await repository.replaceAdverseReactions(sessionId, list, knownReactionIds)
+    knownReactionIds = list.map((r) => r.id)
+    return true
+  } catch (err) {
+    console.error(err)
+    // 「列表之外全删」的整表替换遇到并发：另一位家属也动过这份列表。
+    // 这里**不提供**「覆盖」—— 覆盖会把他勾的那项当「已取消」删掉，
+    // 直接重新加载、以合并后的库内容为准更安全。
+    if (isConflictError(err)) {
+      showToast('不良反应已被其他人修改，已为你重新加载')
+      // 必须 fresh：缓存里存的正是冲突前那份列表，照常读缓存等于什么都没刷新
+      await loadSub({ fresh: true })
+      selectedReactions.value = reactions.value.map((r) => r.type)
+      otherDetail.value = reactions.value.find((r) => r.type === 'other')?.detail ?? ''
+      return false
+    }
+    showToast('不良反应保存失败，请检查网络后重试')
+    return false
   } finally {
     savingReactions = false
   }

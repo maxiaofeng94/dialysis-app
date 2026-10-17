@@ -9,6 +9,7 @@ import { Filesystem, Directory, Encoding } from '@capacitor/filesystem'
 import { Share } from '@capacitor/share'
 import { repository } from '../repo'
 import { cacheDelete } from '../lib/cloudCache'
+import { isConflictError, isNotFoundError } from '../lib/errors'
 import { DEFAULT_RINSE_BACK_ML } from '../constants'
 import {
   currentPatientId,
@@ -294,6 +295,11 @@ function goMembers() {
  * 只在「表单没被改过」时才回填；force = 用户主动换病人/整份导入后无条件回填。
  */
 let formSnapshot: string | null = null
+/**
+ * **乐观锁版本号**：本页面读到的病人档案版本（云端原始 `updated_at`）。
+ * 两人同时改档案（轮椅重量 / 回水量）时，后保存的人不该静默抹掉对方的改动。
+ */
+let knownPatientUpdatedAtIso: string | null = null
 
 function snapshotForm(): string {
   return JSON.stringify([form.name, form.birthday, form.wheelchairWeight, form.rinseBackVolume])
@@ -307,12 +313,13 @@ function fillForm(p: Patient | null) {
   formSnapshot = snapshotForm()
 }
 
-async function load(force = false) {
+async function load(force = false, opts: { fresh?: boolean } = {}) {
   loadError.value = ''
   try {
     const pid = currentPatientId.value
-    const [p, dw] = await Promise.all([repository.getPatient(pid), repository.listDryWeights(pid)])
+    const [p, dw] = await Promise.all([repository.getPatient(pid, opts), repository.listDryWeights(pid)])
     patient.value = p ?? null
+    knownPatientUpdatedAtIso = p?.updatedAtIso ?? null
     if (force || formSnapshot === null || snapshotForm() === formSnapshot) {
       fillForm(p ?? null)
     }
@@ -357,7 +364,14 @@ function rangeError(label: string, value: number, min: number, max: number): str
   return null
 }
 
-async function savePatient() {
+/**
+ * 保存病人档案。
+ *
+ * `override` = true：用户已经明确选了「覆盖保存」，这次**不带版本条件**写入。
+ * ⚠️ 别改成「先取回最新版本号再带条件重试」—— `getPatient` 是缓存优先的，
+ * 拿回来的往往还是旧版本，于是又冲突一次、再弹一次窗，用户点了覆盖却什么也没写进去。
+ */
+async function savePatient(opts: { override?: boolean } = {}) {
   // 非 owner 的保存会被数据库 RLS 静默拦成 0 行，绝不能提示「已保存」（假值还会污染本机缓存）
   if (!canEditConfig.value) {
     showToast('仅创建者可修改病人配置')
@@ -384,18 +398,52 @@ async function savePatient() {
     rinseBackVolume,
     createdAt: patient.value?.createdAt ?? now,
     updatedAt: now,
+    updatedAtIso: knownPatientUpdatedAtIso,
   }
   savingPatient.value = true
   try {
-    await repository.savePatient(p)
+    const iso = await repository.savePatient(p, opts.override ? null : knownPatientUpdatedAtIso)
+    if (iso) {
+      p.updatedAtIso = iso
+      knownPatientUpdatedAtIso = iso
+    }
     patient.value = p
     formSnapshot = snapshotForm() // 保存后表单就是「服务端值」，后续 load 可正常回填
     showToast('已保存')
   } catch (err) {
     console.error(err)
+    if (isConflictError(err)) {
+      // ⚠️ 必须先放开 in-flight 守卫再问用户：否则用户选「覆盖保存」时，
+      // 那次重试会被 savingPatient 自己挡掉，点了覆盖什么也没发生
+      savingPatient.value = false
+      await resolvePatientConflict()
+      return
+    }
+    if (isNotFoundError(err)) {
+      showToast('这个病人档案已被删除')
+      return
+    }
     showToast(`保存失败：${errorText(err)}`)
   } finally {
     savingPatient.value = false
+  }
+}
+
+/** 档案版本冲突：编辑期间别人也保存过 —— 让用户选「重新加载」还是「覆盖保存」 */
+async function resolvePatientConflict(): Promise<void> {
+  try {
+    await showConfirmDialog({
+      title: '病人档案已被其他人修改',
+      message:
+        '你编辑期间，另一位家属也改了这份档案。\n\n「重新加载」：放弃你刚才的修改，看对方保存的内容。\n「覆盖保存」：用你屏幕上的内容盖掉对方的。',
+      confirmButtonText: '重新加载',
+      cancelButtonText: '覆盖保存',
+      messageAlign: 'left',
+    })
+    // 必须绕过缓存：缓存里是冲突前那份档案，照常读会让用户以为对方没改过
+    await load(true, { fresh: true })
+  } catch {
+    await savePatient({ override: true })
   }
 }
 

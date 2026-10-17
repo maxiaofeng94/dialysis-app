@@ -72,11 +72,13 @@ function validateBackup(data: unknown): asserts data is BackupData {
 }
 
 class LocalRepository implements Repository {
-  getPatient(id: string) {
+  getPatient(id: string, _opts?: { fresh?: boolean }) {
     return db.patients.get(id)
   }
-  async savePatient(patient: Patient) {
+  async savePatient(patient: Patient, _expectedUpdatedAt?: string | null): Promise<string | null> {
+    // 单机模式只有一个使用者，不存在并发覆盖，用不上乐观锁（签名与云端保持一致）
     await db.patients.put({ ...patient })
+    return null
   }
 
   async listDryWeights(patientId: string) {
@@ -99,7 +101,7 @@ class LocalRepository implements Repository {
       return b.createdAt - a.createdAt
     })
   }
-  async getSession(id: string) {
+  async getSession(id: string, _opts?: { fresh?: boolean }) {
     const s = await db.sessions.get(id)
     return s ? normalizeSession(s) : undefined
   }
@@ -161,11 +163,16 @@ class LocalRepository implements Repository {
     await db.bloodFlows.delete(id)
   }
 
-  async listAdverseReactions(sessionId: string) {
+  async listAdverseReactions(sessionId: string, _opts?: { fresh?: boolean }) {
     const list = await db.adverseReactions.where('sessionId').equals(sessionId).toArray()
     return list.sort((a, b) => a.recordedAt - b.recordedAt)
   }
-  async replaceAdverseReactions(sessionId: string, reactions: AdverseReaction[]) {
+  async replaceAdverseReactions(
+    sessionId: string,
+    reactions: AdverseReaction[],
+    _expectedIds?: string[],
+  ): Promise<void> {
+    // 单机模式无并发，忽略乐观锁参数
     await db.transaction('rw', db.adverseReactions, async () => {
       await db.adverseReactions.where('sessionId').equals(sessionId).delete()
       await db.adverseReactions.bulkPut(reactions)

@@ -73,6 +73,23 @@ async function removeFromListsById(id: string, prefixes: string[]): Promise<void
 }
 
 /**
+ * 更新「我的病人」列表缓存里的病人副本。
+ *
+ * 这个列表的元素是 `{ patient, role }`（没有顶层 `id`），用不了 `upsertInto`。
+ * 不更新的话，在设置页改完档案（轮椅重量 / 回水量）看到的还是旧值，用户会以为没保存上。
+ */
+async function updateMyPatientsCache(patient: Patient): Promise<void> {
+  for (const key of await cacheKeysByPrefix('myPatients:')) {
+    const cached = await cacheGet<{ patient: Patient; role: string }[]>(key)
+    if (!cached || !Array.isArray(cached.value)) continue
+    await cacheSet(
+      key,
+      cached.value.map((item) => (item.patient?.id === patient.id ? { ...item, patient } : item)),
+    )
+  }
+}
+
+/**
  * 子表（血压 / 血糖 / 血流量）的**批量**读法 —— 趋势页一次要最近 30 条记录的数据。
  *
  * 以前是 `Promise.all(recent.map(listBloodPressures))`：30 条记录 × 2 类 = 60 次往返，
@@ -202,13 +219,21 @@ const byMeasuredAsc = (a: { measuredAt: number }, b: { measuredAt: number }) => 
 
 export const cachedCloudRepository: Repository = {
   // ---------- 病人 ----------
-  async getPatient(id) {
+  async getPatient(id, opts) {
+    // fresh：乐观锁冲突后的「重新加载」必须绕过缓存
+    if (opts?.fresh) await cacheDelete([K.patient(id)])
     const v = await cacheFirst<Patient | null>(K.patient(id), async () => (await cloudRepository.getPatient(id)) ?? null)
     return v ?? undefined
   },
-  async savePatient(patient) {
-    await cloudRepository.savePatient(patient)
+  async savePatient(patient, expectedUpdatedAt) {
+    const iso = await cloudRepository.savePatient(patient, expectedUpdatedAt)
+    // 保存成功后把新版本号写回对象与缓存，否则下一次保存会拿旧版本去比 → 自己跟自己冲突
+    if (iso) patient.updatedAtIso = iso
     await cacheSet(K.patient(patient.id), patient)
+    // 顺手更新「我的病人」列表里的那份副本：列表页显示的还是改动前的轮椅重量 / 回水量，
+    // 用户会以为没保存上
+    await updateMyPatientsCache(patient)
+    return iso
   },
 
   // ---------- 干体重 ----------
@@ -228,7 +253,9 @@ export const cachedCloudRepository: Repository = {
   async listSessions(patientId) {
     return cacheFirst(K.sessions(patientId), () => cloudRepository.listSessions(patientId))
   },
-  async getSession(id) {
+  async getSession(id, opts) {
+    // fresh：乐观锁冲突后的「重新加载」必须绕过缓存 —— 缓存里正是冲突前那份旧数据
+    if (opts?.fresh) await cacheDelete([K.session(id)])
     const v = await cacheFirst<DialysisSession | null>(K.session(id), async () => (await cloudRepository.getSession(id)) ?? null)
     return v ?? undefined
   },
@@ -295,11 +322,12 @@ export const cachedCloudRepository: Repository = {
   },
 
   // ---------- 不良反应 ----------
-  async listAdverseReactions(sessionId) {
+  async listAdverseReactions(sessionId, opts) {
+    if (opts?.fresh) await cacheDelete([K.ars(sessionId)])
     return cacheFirst(K.ars(sessionId), () => cloudRepository.listAdverseReactions(sessionId))
   },
-  async replaceAdverseReactions(sessionId, reactions) {
-    await cloudRepository.replaceAdverseReactions(sessionId, reactions)
+  async replaceAdverseReactions(sessionId, reactions, expectedIds) {
+    await cloudRepository.replaceAdverseReactions(sessionId, reactions, expectedIds)
     await cacheSet(K.ars(sessionId), reactions)
   },
 

@@ -1,15 +1,30 @@
 import type { Patient, DryWeight, DialysisSession, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
 
 export interface Repository {
-  getPatient(id: string): Promise<Patient | undefined>
-  savePatient(patient: Patient): Promise<void>
+  /** 读病人档案；`opts.fresh` 含义同 `getSession`（乐观锁冲突后重新加载要用） */
+  getPatient(id: string, opts?: { fresh?: boolean }): Promise<Patient | undefined>
+  /**
+   * 保存病人档案（轮椅重量 / 回水量 / 姓名 / 生日，**整行覆盖**）。
+   *
+   * 乐观锁的用法与 `saveSession` 完全一致：`expectedUpdatedAt` 传
+   * `Patient.updatedAtIso`，只有库里的版本没变时才写入，否则抛 `ConflictError`。
+   * 两人同时改档案时，后保存的人不会静默抹掉对方刚改的轮椅重量。
+   */
+  savePatient(patient: Patient, expectedUpdatedAt?: string | null): Promise<string | null>
 
   listDryWeights(patientId: string): Promise<DryWeight[]>
   saveDryWeight(dryWeight: DryWeight): Promise<void>
   deleteDryWeight(id: string): Promise<void>
 
   listSessions(patientId: string): Promise<DialysisSession[]>
-  getSession(id: string): Promise<DialysisSession | undefined>
+  /**
+   * 读一条透析记录。
+   *
+   * `opts.fresh` = true 时**跳过本地缓存直接读云端**：乐观锁冲突后的「重新加载」必须用它 ——
+   * 缓存里存的正是冲突前那份旧数据，照常走缓存会让用户以为对方根本没改过
+   * （实测踩到：提示「已被其他人修改」后重新加载，看到的还是自己原来的内容）。
+   */
+  getSession(id: string, opts?: { fresh?: boolean }): Promise<DialysisSession | undefined>
   /**
    * 保存一条透析记录（整行覆盖）。
    *
@@ -46,8 +61,21 @@ export interface Repository {
   saveBloodFlow(flow: BloodFlow): Promise<void>
   deleteBloodFlow(id: string): Promise<void>
 
-  listAdverseReactions(sessionId: string): Promise<AdverseReaction[]>
-  replaceAdverseReactions(sessionId: string, reactions: AdverseReaction[]): Promise<void>
+  /** 读一条记录的不良反应；`opts.fresh` 含义同 `getSession`（冲突后重新加载要用） */
+  listAdverseReactions(sessionId: string, opts?: { fresh?: boolean }): Promise<AdverseReaction[]>
+  /**
+   * 整表替换一条记录的不良反应。
+   *
+   * **乐观锁**：这个接口的语义是「列表之外的全删」，两个家属各勾一项时，
+   * 后保存的人会把先保存的人勾的那项当成「已被取消」删掉（前端串行化只能防同一台设备）。
+   * `expectedIds` 传「我打开页面时读到的全部 id」，云端比对现在库里的 id 集合，
+   * 不一致就抛 `ConflictError`。
+   */
+  replaceAdverseReactions(
+    sessionId: string,
+    reactions: AdverseReaction[],
+    expectedIds?: string[],
+  ): Promise<void>
 
   exportAll(): Promise<string>
   importAll(json: string): Promise<void>
