@@ -16,6 +16,9 @@ import { fakeSupabaseModule } from '../helpers/cloud'
 
 const read = (p: string) => readFileSync(resolve(process.cwd(), p), 'utf8')
 
+/** 等一轮宏任务：Vue 的 watch 是异步 flush 的，改完登录态要让它跑完 */
+const flushWatch = () => new Promise((r) => setTimeout(r, 0))
+
 /** 需要打桩的视图（避免 import 真组件） */
 const VIEW_NAMES = [
   'HomeView',
@@ -361,6 +364,35 @@ describe('云端模式 · 已登录', () => {
 
     expect(ensureCloudPatient).toHaveBeenCalledTimes(1)
     expect(user.value).toEqual({ id: 'u1' })
+  })
+
+  /**
+   * 回归：作废病人上下文**绑在登录态上**，而不是依赖「有没有导航到 /login」。
+   *
+   * 守卫里那两处重置只在确实发生过一次导航时才执行。将来若有人加了新的登出入口
+   * 却忘了 `router.replace('/login')`，`patientContextUid` 会停在上一个账号上 ——
+   * 「重新登录后没有任何记录」就会原样复现。这条用例只改登录态、**不做任何导航**。
+   */
+  it('登出立即作废病人上下文（即使一次导航都没发生）', async () => {
+    const { router, ensureCloudPatient, user } = await loadRouter({
+      configured: true,
+      initialized: true,
+      user: { id: 'u1' },
+    })
+    await go(router, '/')
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(1)
+
+    // 只把登录态置空，不导航（模拟「某个登出入口忘了跳 /login」）
+    user.value = null
+    await flushWatch() // 等 watch 触发
+
+    // 同一账号重新登录 → 必须重新校准。
+    // 注意：这里必须导航到**不同**路径 —— push 到与当前相同的路由时
+    // Vue Router 会忽略这次导航，守卫根本不会执行（这条用例第一版就踩了）
+    user.value = { id: 'u1' }
+    await go(router, '/trend')
+
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(2)
   })
 
   /**

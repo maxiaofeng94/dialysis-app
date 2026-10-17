@@ -1,4 +1,5 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
+import { watch } from 'vue'
 import HomeView from '../views/HomeView.vue'
 import SessionView from '../views/SessionView.vue'
 import ReportView from '../views/ReportView.vue'
@@ -6,7 +7,7 @@ import TrendView from '../views/TrendView.vue'
 import SettingsView from '../views/SettingsView.vue'
 import LoginView from '../views/LoginView.vue'
 import MembersView from '../views/MembersView.vue'
-import { useAuth } from '../stores/auth'
+import { useAuth, isLoggedIn } from '../stores/auth'
 import { currentPatientId, restorePatientId, ensureCloudPatient } from '../stores/patient'
 import { isCloudConfigured } from '../lib/supabase'
 import { DEFAULT_PATIENT_ID } from '../constants'
@@ -64,6 +65,21 @@ function needsPatientContext(uid: string | null): boolean {
   if (patientContextUid !== uid) return true
   return !patientContextSynced && currentPatientId.value === DEFAULT_PATIENT_ID
 }
+
+/**
+ * 登出即作废病人上下文 —— **绑定在登录态变化上，而不是依赖「有没有导航到 /login」**。
+ *
+ * 守卫里那两处重置只在「确实发生过一次导航」时才执行；万一将来有人加了新的登出入口
+ * 却忘了 `router.replace('/login')`，`patientContextUid` 会停在上一个账号上，
+ * 「重新登录无数据」就会原样复现（`synced` 还是 true，第二道防线也兜不住）。
+ * 绑在 `isLoggedIn` 上则无论走哪条路都会作废。
+ */
+watch(isLoggedIn, (val, old) => {
+  if (old && !val) {
+    patientContextUid = undefined
+    patientContextSynced = false
+  }
+})
 
 // 多人版登录守卫：云端模式下未登录跳转登录页；本地模式（未配置 Supabase）不受影响
 router.beforeEach(async (to) => {
