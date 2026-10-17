@@ -405,6 +405,39 @@ describe('云端模式 · 已登录', () => {
   })
 
   /**
+   * 竞态回归（独立评审发现）：校准还在 await 时用户登出了 ——
+   * 守卫**不能**把旧账号的上下文写回。
+   *
+   * 写回的话 `patientContextUid` 会停在一个已经登出的账号上、`synced = true`；
+   * 重新登录同一账号时 `needsPatientContext()` 判成「上下文已建好」而跳过校准，
+   * 而 `clearCurrentPatient()` 已把当前病人抹成 `patient-default`（不是 uuid）→
+   * 首页查云端短路为空 —— 「重新登录后一条记录都没有」就从这条窄窗口复发。
+   */
+  it('校准途中登出：守卫不得把旧账号的上下文写回', async () => {
+    const { router, ensureCloudPatient, user } = await loadRouter({
+      configured: true,
+      initialized: true,
+      user: { id: 'u1' },
+    })
+    let release!: () => void
+    ensureCloudPatient.mockImplementation(() => new Promise<void>((r) => (release = r)))
+
+    const nav = router.push('/') // 故意不 await：让守卫停在校准里
+    await vi.waitFor(() => expect(ensureCloudPatient).toHaveBeenCalledTimes(1))
+
+    user.value = null // 弱网期间被登出（或被踢下线）
+    await flushWatch()
+    release() // 守卫这才拿到校准结果
+    await nav
+
+    user.value = { id: 'u1' } // 同一账号重新登录
+    await go(router, '/trend')
+
+    // 必须重新校准（写回旧上下文的话这里只会是 1 次）
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(2)
+  })
+
+  /**
    * 守卫超时（`withTimeout` 兜底）时不能把「没跑完」当成「校准成功」——
    * 否则再也不会重试，用户会一直停在「没有病人 / 没有记录」的假象上。
    * 这里做静态断言而不是真等 10 秒超时（那会让整个套件慢十几秒）。

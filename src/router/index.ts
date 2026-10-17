@@ -45,6 +45,21 @@ let patientContextUid: string | null | undefined
  * 守卫超时（`withTimeout` 兜底）时也不算校准完成，下次导航会重试。
  */
 let patientContextSynced = false
+/**
+ * 「病人上下文代次」：每次登出都自增。
+ *
+ * 守卫里的校准是 **await** 的（弱网下 `ensureCloudPatient()` 最长 10 秒）。
+ * 这期间用户完全可能登出（或被踢下线）：`onLoggedOut` 刚把上下文清空，
+ * 守卫却还按旧结果无条件写回 `patientContextUid = uid; synced = true` ——
+ * 于是 `patientContextUid` 停在一个**已经登出**的账号上。
+ * 用户重新登录同一账号时会被判成「上下文已建好」而跳过校准，
+ * 而 `clearCurrentPatient()` 已把当前病人抹成 `patient-default`（不是 uuid）→
+ * 首页查云端短路为空，「重新登录后一条记录都没有」就从这条窄窗口复发。
+ *
+ * 只比对 `isLoggedIn` / uid 不够：**登出后立刻登录同一账号**时两者都会匹配上，
+ * 但那是新一轮，必须重新校准 —— 所以用代次。
+ */
+let patientContextGeneration = 0
 
 /**
  * 是否需要重建「病人上下文」（恢复上次选的病人 + 校准到本账号可访问的病人）。
@@ -78,6 +93,8 @@ function needsPatientContext(uid: string | null): boolean {
 onLoggedOut(() => {
   patientContextUid = undefined
   patientContextSynced = false
+  // 让「正在 await 的那次校准」作废（见 patientContextGeneration 的说明）
+  patientContextGeneration++
 })
 
 // 多人版登录守卫：云端模式下未登录跳转登录页；本地模式（未配置 Supabase）不受影响
@@ -102,6 +119,7 @@ router.beforeEach(async (to) => {
   // 两步都加了超时：这里的 await 直接决定首屏能不能出来，不能让网络把导航挂死。
   const uid = user.value?.id ?? null
   if (needsPatientContext(uid)) {
+    const generation = patientContextGeneration
     await withTimeout(restorePatientId(), RESTORE_PATIENT_TIMEOUT_MS, undefined)
     // 用 then(() => true) 把「成功」与「超时」区分开：两者都返回 undefined 的话，
     // 超时会被误当成校准完成，于是再也不会重试
@@ -110,8 +128,12 @@ router.beforeEach(async (to) => {
       SYNC_PATIENT_TIMEOUT_MS,
       false,
     )
-    patientContextUid = uid
-    patientContextSynced = synced
+    // ⚠️ 只有「还是同一代」才写回：这中间可能已经登出（或被踢下线），
+    // 那时 onLoggedOut 刚清空上下文，无条件写回等于又填回去 —— 见 patientContextGeneration
+    if (generation === patientContextGeneration) {
+      patientContextUid = uid
+      patientContextSynced = synced
+    }
   }
   return true
 })
