@@ -10,6 +10,7 @@
  * promise 回调放完」，不依赖真实时间（fresh/stale 用 updatedAt 精确构造，不 sleep）。
  */
 import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest'
+import { watch } from 'vue'
 import { makePatient, makeDryWeight, makeSession, makeBp, makeBg, makeBf, makeReaction } from '../helpers/factories'
 
 /** 云端仓储桩：所有方法都可在用例里改实现 / 断言调用 */
@@ -24,9 +25,11 @@ const cloud = vi.hoisted(() => ({
   saveSession: vi.fn(),
   deleteSession: vi.fn(),
   listBloodPressures: vi.fn(),
+  listBloodPressuresMany: vi.fn(),
   saveBloodPressure: vi.fn(),
   deleteBloodPressure: vi.fn(),
   listBloodGlucoses: vi.fn(),
+  listBloodGlucosesMany: vi.fn(),
   saveBloodGlucose: vi.fn(),
   deleteBloodGlucose: vi.fn(),
   listBloodFlows: vi.fn(),
@@ -90,9 +93,11 @@ function resetCloudMocks() {
   cloud.saveSession.mockResolvedValue(undefined)
   cloud.deleteSession.mockResolvedValue(undefined)
   cloud.listBloodPressures.mockResolvedValue([])
+  cloud.listBloodPressuresMany.mockResolvedValue([])
   cloud.saveBloodPressure.mockResolvedValue(undefined)
   cloud.deleteBloodPressure.mockResolvedValue(undefined)
   cloud.listBloodGlucoses.mockResolvedValue([])
+  cloud.listBloodGlucosesMany.mockResolvedValue([])
   cloud.saveBloodGlucose.mockResolvedValue(undefined)
   cloud.deleteBloodGlucose.mockResolvedValue(undefined)
   cloud.listBloodFlows.mockResolvedValue([])
@@ -301,6 +306,202 @@ describe('cachedRepository · 过期缓存的「先返回旧值 + 后台刷新�
 
     expect(cacheVersion.value).toBe(versionBefore)
     expect((await cacheGet<typeof oldList>('sessions:p1'))?.value).toEqual(oldList)
+  })
+})
+
+/**
+ * 请求风暴回归（用户反馈「web 端长期打开后手机发烫、耗电激增」的根因）
+ *
+ * 实测：模拟 800ms 网络延迟后打开趋势页，30 秒内打出 **131614 个请求**
+ * （血压 63028 次 + 血糖 62603 次），页面停不下来。链路是：
+ * 命中陈旧缓存 → 每个 key 发起后台刷新 → 刷新成功让 cacheVersion 自增 →
+ * 页面 watch 到就重新 load → 重新 load 时**还在途**的 key 依旧是陈旧的
+ * （FRESH_MS 只看「上次写入时间」，管不住在途）→ 再次发起刷新 → 又自增……
+ *
+ * 修法是在 cloudCache 里给每个 key 的刷新加「在途去重」。下面两个用例是防线。
+ */
+describe('cachedRepository · 请求风暴（在途去重）', () => {
+  it('刷新还在途中时反复读取同一个 key，只会发出一次请求', async () => {
+    const oldList = [makeSession({ id: 'old', patientId: 'p1' })]
+    await putRawCache('sessions:p1', oldList, 0)
+
+    let release: (v: unknown[]) => void = () => {}
+    cloud.listSessions.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve as (v: unknown[]) => void
+        }),
+    )
+
+    // 页面在「上次刷新还没回来」的窗口里反复重读（watch(cacheVersion) → refresh）
+    for (let i = 0; i < 20; i++) {
+      expect(await cachedCloudRepository.listSessions('p1')).toEqual(oldList)
+    }
+
+    expect(cloud.listSessions).toHaveBeenCalledTimes(1)
+
+    release([])
+    await flushAsync()
+
+    // 刷新落地后缓存变新鲜，继续读也不会再发请求
+    for (let i = 0; i < 20; i++) await cachedCloudRepository.listSessions('p1')
+    expect(cloud.listSessions).toHaveBeenCalledTimes(1)
+  })
+
+  it('30 个子表 key 全部陈旧时，页面重读循环不会把请求放大（修复前是 30+29+28… 的平方级增长）', async () => {
+    const ids = Array.from({ length: 30 }, (_, i) => `s${i}`)
+    for (const id of ids) await putRawCache(`bps:${id}`, [], Date.now() - FRESH_MS - 1000)
+
+    // 每次请求 5ms：制造出「刷新在途时页面又重读」的窗口（弱网下这个窗口很长，所以会失控）
+    cloud.listBloodPressures.mockImplementation(
+      (sessionId: string) =>
+        new Promise((resolve) => setTimeout(() => resolve([makeBp({ id: `bp-${sessionId}`, sessionId })]), 5)),
+    )
+
+    // 趋势页的写法：watch(cacheVersion, load) —— 任何 key 刷新成功都会让它重跑
+    const loadAll = () => Promise.all(ids.map((id) => cachedCloudRepository.listBloodPressures(id)))
+    const stop = watch(cacheVersion, () => {
+      void loadAll()
+    })
+
+    await loadAll()
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    stop()
+
+    // 每个 key 最多一次：修复前这里会是几百次（且随网络变慢无限增长）
+    expect(cloud.listBloodPressures).toHaveBeenCalledTimes(ids.length)
+  })
+})
+
+describe('cachedRepository · 批量读取子表（趋势页一次拉回 30 条记录的血压/血糖）', () => {
+  it('没有缓存时合并成一次批量请求，并按 session 分组回填各自的缓存 key', async () => {
+    cloud.listBloodPressuresMany.mockResolvedValue([
+      makeBp({ id: 'bp1', sessionId: 's1' }),
+      makeBp({ id: 'bp2', sessionId: 's2' }),
+      makeBp({ id: 'bp3', sessionId: 's2' }),
+    ])
+
+    const got = await cachedCloudRepository.listBloodPressuresMany(['s1', 's2', 's3'])
+
+    expect(cloud.listBloodPressuresMany).toHaveBeenCalledTimes(1)
+    expect(cloud.listBloodPressuresMany).toHaveBeenCalledWith(['s1', 's2', 's3'])
+    expect(got.map((x) => x.id)).toEqual(['bp1', 'bp2', 'bp3'])
+    // 分组回填：详情页随后打开这些记录时直接命中缓存
+    expect((await cacheGet<unknown[]>('bps:s1'))?.value).toHaveLength(1)
+    expect((await cacheGet<unknown[]>('bps:s2'))?.value).toHaveLength(2)
+    // 确实没有数据的 session 也要写空数组，否则每次都会重新拉它
+    expect((await cacheGet<unknown[]>('bps:s3'))?.value).toEqual([])
+    expect(cloud.listBloodPressures).not.toHaveBeenCalled()
+  })
+
+  it('全部命中新鲜缓存时不发任何请求', async () => {
+    await cacheSet('bgs:s1', [makeBg({ id: 'bg1', sessionId: 's1' })])
+    await cacheSet('bgs:s2', [])
+
+    const got = await cachedCloudRepository.listBloodGlucosesMany(['s1', 's2'])
+
+    expect(got.map((x) => x.id)).toEqual(['bg1'])
+    expect(cloud.listBloodGlucosesMany).not.toHaveBeenCalled()
+  })
+
+  it('陈旧缓存先用旧值渲染，再补一次批量后台刷新（而不是逐个 key 发请求）', async () => {
+    await putRawCache('bps:s1', [makeBp({ id: 'old', sessionId: 's1' })], 0)
+    await putRawCache('bps:s2', [makeBp({ id: 'old2', sessionId: 's2' })], 0)
+    cloud.listBloodPressuresMany.mockResolvedValue([
+      makeBp({ id: 'new1', sessionId: 's1' }),
+      makeBp({ id: 'new2', sessionId: 's2' }),
+    ])
+    const versionBefore = cacheVersion.value
+
+    const got = await cachedCloudRepository.listBloodPressuresMany(['s1', 's2'])
+
+    expect(got.map((x) => x.id)).toEqual(['old', 'old2'])
+    await vi.waitFor(() => expect(cacheVersion.value).toBe(versionBefore + 1))
+    expect(cloud.listBloodPressuresMany).toHaveBeenCalledTimes(1)
+    expect(cloud.listBloodPressures).not.toHaveBeenCalled()
+    expect((await cacheGet<unknown[]>('bps:s1'))?.value).toEqual([makeBp({ id: 'new1', sessionId: 's1' })])
+  })
+
+  it('批量刷新在途时重复读取不会再发一次（同一条防线）', async () => {
+    await putRawCache('bps:s1', [makeBp({ id: 'old', sessionId: 's1' })], 0)
+
+    let release: (v: unknown[]) => void = () => {}
+    cloud.listBloodPressuresMany.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve as (v: unknown[]) => void
+        }),
+    )
+
+    for (let i = 0; i < 10; i++) await cachedCloudRepository.listBloodPressuresMany(['s1'])
+
+    expect(cloud.listBloodPressuresMany).toHaveBeenCalledTimes(1)
+    release([])
+    await flushAsync()
+  })
+
+  it('批量请求失败时向调用方抛错（趋势页要能显示失败态，而不是静默显示「暂无数据」）', async () => {
+    cloud.listBloodPressuresMany.mockRejectedValue(new Error('查询失败（血压）：Failed to fetch'))
+
+    await expect(cachedCloudRepository.listBloodPressuresMany(['s1'])).rejects.toThrow('查询失败')
+  })
+
+  /**
+   * 回归：800ms 弱网修掉之后，把延迟提到 3 秒（= FRESH_MS）仍会「每 3.2 秒刷一轮、几十秒不停」。
+   *
+   * 根因是批量刷新只用一个「这一批的 id 列表」当去重键 —— 写回是逐个 key 落库的，
+   * 写到一半时页面因别的刷新重读，看到的陈旧集合少几个 id、键就变了，于是又发一次，
+   * 无限循环。现在改成按 key 登记在途，任何读路径看到的都是「这个 key 正在刷新」。
+   */
+  it('批量刷新在途时，单条读取同一个 key 也不会再发一次请求（跨路径共用「在刷」登记）', async () => {
+    await putRawCache('bps:s1', [makeBp({ id: 'old', sessionId: 's1' })], 0)
+
+    let release: (v: unknown[]) => void = () => {}
+    cloud.listBloodPressuresMany.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve as (v: unknown[]) => void
+        }),
+    )
+
+    // 趋势页发起批量刷新（在途），此刻详情页/别的路径读同一条记录
+    void cachedCloudRepository.listBloodPressuresMany(['s1'])
+    await flushAsync()
+
+    const got = await cachedCloudRepository.listBloodPressures('s1')
+    expect(got.map((x) => x.id)).toEqual(['old'])
+    await flushAsync()
+
+    // 没有额外的单条请求，也没有第二次批量请求
+    expect(cloud.listBloodPressures).not.toHaveBeenCalled()
+    expect(cloud.listBloodPressuresMany).toHaveBeenCalledTimes(1)
+
+    release([])
+    await flushAsync()
+  })
+
+  it('批量刷新在途时，页面反复重读批量接口始终只发一次', async () => {
+    const ids = ['s1', 's2', 's3']
+    for (const id of ids) await putRawCache(`bgs:${id}`, [makeBg({ id: `old-${id}`, sessionId: id })], 0)
+
+    let release: (v: unknown[]) => void = () => {}
+    cloud.listBloodGlucosesMany.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve as (v: unknown[]) => void
+        }),
+    )
+
+    // 模拟「写回途中页面被别的缓存刷新唤醒、又重读一轮」：拿到的陈旧集合每轮都可能少几个 id
+    for (let round = 0; round < 5; round++) {
+      const got = await cachedCloudRepository.listBloodGlucosesMany(ids)
+      expect(got.map((x) => x.id)).toEqual(['old-s1', 'old-s2', 'old-s3'])
+      await flushAsync()
+    }
+
+    expect(cloud.listBloodGlucosesMany).toHaveBeenCalledTimes(1)
+    release([])
+    await flushAsync()
   })
 })
 

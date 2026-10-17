@@ -104,16 +104,55 @@ describe('静态守卫 · 删除必须复查影响行数（RLS 静默过滤）',
   })
 })
 
-describe('静态守卫 · 缓存读函数必须有 FRESH_MS 闸门', () => {
-  it('cloudAdmin 的 listMyPatients / listMembers 都带闸门', () => {
+describe('静态守卫 · 缓存读函数必须带 FRESH_MS 闸门与在途去重', () => {
+  it('cloudAdmin 的两个读函数统一走 cacheFirstWithRevalidate，不自己写一份闸门', () => {
     const src = stripComments(read('src/lib/cloudAdmin.ts'))
-    const gates = src.match(/Date\.now\(\) - cached\.updatedAt >= FRESH_MS/g) ?? []
+    const uses = src.match(/cacheFirstWithRevalidate\(/g) ?? []
 
     expect(
-      gates.length,
-      'cloudAdmin 里命中缓存就无条件后台刷新 + cacheVersion++ 的话，会和页面的 watch(cacheVersion)\n' +
-        '  组成自激循环（成员页曾每轮打一次 join 查询）。两个读函数都必须有 FRESH_MS 判断',
+      uses.length,
+      'listMyPatients / listMembers 必须调用 cloudCache 的统一实现：各写一份迟早走散\n' +
+        '  （历史上就是一边漏了闸门、另一边漏了 error 检查）',
     ).toBe(2)
+    expect(
+      src.match(/Date\.now\(\) - cached\.updatedAt/g) ?? [],
+      '不要在 cloudAdmin 里自己判断新鲜度，改由 cacheFirstWithRevalidate 统一负责',
+    ).toHaveLength(0)
+  })
+
+  /**
+   * 这一条对应真实事故：用户反馈「web 端长期打开后手机发烫、耗电激增」。
+   * 实测把库请求延迟 800ms 后打开趋势页，30 秒内打出 131614 个请求且停不下来 ——
+   * 命中陈旧缓存 → 每个 key 后台刷新 → 成功就 cacheVersion++ → 页面 watch 重跑 →
+   * 重跑时**还在途**的 key 依旧陈旧（FRESH_MS 只看写入时间）→ 再刷新……无限循环。
+   */
+  it('cloudCache 的统一读法同时具备「新鲜度闸门」和「在途去重」', () => {
+    const src = stripComments(read('src/lib/cloudCache.ts'))
+
+    expect(
+      src,
+      '缺少新鲜度闸门：刚写完又会被判定为陈旧，反复触发后台刷新',
+    ).toMatch(/Date\.now\(\) - cached\.updatedAt >= FRESH_MS/)
+    expect(
+      src,
+      '缺少在途去重（inflight）：同一 key 在刷新返回前会被重复触发，和 watch(cacheVersion) 组成请求风暴',
+    ).toMatch(/const inflight = new Map/)
+    expect(src, '必须导出 dedupe 供批量刷新复用').toMatch(/export function dedupe/)
+    expect(src, '去重登记必须在任务结束后清理，否则失败后再也不会重试').toMatch(/inflight\.delete\(key\)/)
+  })
+
+  it('cachedRepository 的后台刷新也走去重，不自己 void 一个裸异步', () => {
+    const src = stripComments(read('src/repo/cachedRepository.ts'))
+
+    expect(
+      src.match(/void \(async \(\) => \{/g) ?? [],
+      '裸的 `void (async () => …)()` 刷新没有在途去重 —— 这正是请求风暴的来源，改走 dedupe / cacheFirstWithRevalidate',
+    ).toHaveLength(0)
+    expect(
+      src,
+      '子表批量刷新要按 key 登记「在刷」（shareRefresh）：只拿这一批的 id 列表当去重键不行 ——\n' +
+        '  写回途中页面重读时陈旧集合会少几个 id，键一变去重就失效，又会发一次批量请求',
+    ).toMatch(/shareRefresh\(/)
   })
 })
 

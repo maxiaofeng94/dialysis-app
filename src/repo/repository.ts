@@ -14,10 +14,19 @@ export interface Repository {
   deleteSession(id: string): Promise<void>
 
   listBloodPressures(sessionId: string): Promise<BloodPressure[]>
+  /**
+   * 批量拉取多条记录的血压（趋势页用）。
+   *
+   * 逐条 `listBloodPressures` 的话，「最近 30 条记录」就是 30 次往返 ——
+   * 血压 + 血糖 = 60 个请求，弱网下首屏要等几十秒，还会把请求风暴放大。
+   */
+  listBloodPressuresMany(sessionIds: string[]): Promise<BloodPressure[]>
   saveBloodPressure(bp: BloodPressure): Promise<void>
   deleteBloodPressure(id: string): Promise<void>
 
   listBloodGlucoses(sessionId: string): Promise<BloodGlucose[]>
+  /** 批量拉取多条记录的血糖（趋势页用），理由同 listBloodPressuresMany */
+  listBloodGlucosesMany(sessionIds: string[]): Promise<BloodGlucose[]>
   saveBloodGlucose(glucose: BloodGlucose): Promise<void>
   deleteBloodGlucose(id: string): Promise<void>
 

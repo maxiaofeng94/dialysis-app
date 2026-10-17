@@ -62,14 +62,17 @@ async function retry() {
 async function loadBpTrend() {
   const recent = sessions.value.slice(0, 30)
   try {
-    // 原来是每条记录串行拉一次血压（30 条 = 30 次往返），改成全部并行
-    const lists = await Promise.all(recent.map((s) => repository.listBloodPressures(s.id)))
-    const all: { time: number; date: string; systolic: number; diastolic: number }[] = []
-    recent.forEach((s, i) => {
-      for (const bp of lists[i]) {
-        all.push({ time: bp.measuredAt, date: s.date, systolic: bp.systolic, diastolic: bp.diastolic })
-      }
-    })
+    // 一次批量请求取回这 30 条的血压。
+    // 以前是 `Promise.all(recent.map(listBloodPressures))` —— 30 次往返，而且这 30 个缓存 key
+    // 各自的后台刷新会把 cacheVersion 推着反复自增，弱网下直接变成请求风暴（见 cloudCache.dedupe）。
+    const bps = await repository.listBloodPressuresMany(recent.map((s) => s.id))
+    const dateOf = new Map(recent.map((s) => [s.id, s.date]))
+    const all = bps.map((bp) => ({
+      time: bp.measuredAt,
+      date: dateOf.get(bp.sessionId) ?? '',
+      systolic: bp.systolic,
+      diastolic: bp.diastolic,
+    }))
     all.sort((a, b) => a.time - b.time)
     bpTrend.value = all
     bpError.value = false
@@ -82,13 +85,13 @@ async function loadBpTrend() {
 async function loadGlucoseTrend() {
   const recent = sessions.value.slice(0, 30)
   try {
-    const lists = await Promise.all(recent.map((s) => repository.listBloodGlucoses(s.id)))
-    const all: { time: number; date: string; value: number }[] = []
-    recent.forEach((s, i) => {
-      for (const g of lists[i]) {
-        all.push({ time: g.measuredAt, date: s.date, value: g.value })
-      }
-    })
+    const list = await repository.listBloodGlucosesMany(recent.map((s) => s.id))
+    const dateOf = new Map(recent.map((s) => [s.id, s.date]))
+    const all = list.map((g) => ({
+      time: g.measuredAt,
+      date: dateOf.get(g.sessionId) ?? '',
+      value: g.value,
+    }))
     all.sort((a, b) => a.time - b.time)
     gluTrend.value = all
     gluError.value = false

@@ -608,6 +608,83 @@ describe('cloudRepository · 子表映射与排序', () => {
     expect(log.orders).toEqual([{ table: 'dry_weights', col: 'effective_date', ascending: false }])
     expect(log.selects).toEqual([{ table: 'dry_weights', cols: '*' }])
   })
+
+  it('血压批量：一次 in(session_id) 取回多条记录的数据，按 measured_at 升序', async () => {
+    const { log } = setupFake({
+      tables: {
+        blood_pressures: [
+          { id: 'bp3', session_id: 's2', measured_at: '2024-05-02T09:00:00.000Z', systolic: 140, diastolic: 88, note: null },
+          { id: 'bp1', session_id: 's1', measured_at: '2024-05-01T08:00:00.000Z', systolic: 120, diastolic: 70, note: null },
+          { id: 'bp2', session_id: 's1', measured_at: '2024-05-01T10:00:00.000Z', systolic: 150, diastolic: 92, note: null },
+          // 不在请求范围内的记录不能被带出来
+          { id: 'bp-other', session_id: 's9', measured_at: '2024-05-03T09:00:00.000Z', systolic: 110, diastolic: 60, note: null },
+        ],
+      },
+    })
+
+    const list = await cloudRepository.listBloodPressuresMany(['s1', 's2'])
+
+    expect(list.map((b) => b.id)).toEqual(['bp1', 'bp2', 'bp3'])
+    expect(list.every((b) => b.sessionId === 's1' || b.sessionId === 's2')).toBe(true)
+    expect(log.orders).toEqual([{ table: 'blood_pressures', col: 'measured_at', ascending: true }])
+  })
+
+  it('血糖批量：同上，且空数组直接返回不发请求', async () => {
+    const { log } = setupFake({
+      tables: {
+        blood_glucoses: [
+          { id: 'bg2', session_id: 's2', measured_at: '2024-05-02T09:00:00.000Z', value: '7.2', note: null },
+          { id: 'bg1', session_id: 's1', measured_at: '2024-05-01T09:00:00.000Z', value: '5.6', note: null },
+        ],
+      },
+    })
+
+    const list = await cloudRepository.listBloodGlucosesMany(['s1', 's2'])
+    expect(list.map((g) => g.id)).toEqual(['bg1', 'bg2'])
+
+    expect(await cloudRepository.listBloodGlucosesMany([])).toEqual([])
+    expect(log.selects).toHaveLength(1)
+  })
+
+  it('批量查询会剔掉本地默认 id（不是 uuid，拿去查 PostgREST 直接 400）并去重', async () => {
+    setupFake({
+      tables: {
+        blood_pressures: [
+          { id: 'bp1', session_id: 's1', measured_at: '2024-05-01T08:00:00.000Z', systolic: 120, diastolic: 70, note: null },
+        ],
+      },
+    })
+
+    const list = await cloudRepository.listBloodPressuresMany(['patient-default', 's1', 's1', ''])
+
+    expect(list.map((b) => b.id)).toEqual(['bp1'])
+  })
+
+  it('批量查询按 80 个一批拆分（URL 长度可控）', async () => {
+    const ids = Array.from({ length: 105 }, (_, i) => `s${i}`)
+    const { log } = setupFake({
+      tables: {
+        blood_pressures: [
+          { id: 'bp1', session_id: 's0', measured_at: '2024-05-01T08:00:00.000Z', systolic: 120, diastolic: 70, note: null },
+          { id: 'bp2', session_id: 's100', measured_at: '2024-05-02T08:00:00.000Z', systolic: 130, diastolic: 80, note: null },
+        ],
+      },
+    })
+
+    const list = await cloudRepository.listBloodPressuresMany(ids)
+
+    expect(list.map((b) => b.id)).toEqual(['bp1', 'bp2'])
+    expect(log.selects).toHaveLength(2) // 80 + 25
+  })
+
+  it('批量查询出错时抛错（不能被当成「没有数据」）', async () => {
+    setupFake({
+      tables: { blood_pressures: [] },
+      failOn: () => ({ message: '连接超时' }),
+    })
+
+    await expect(cloudRepository.listBloodPressuresMany(['s1'])).rejects.toThrow('连接超时')
+  })
 })
 
 describe('cloudRepository · 写方法与错误传播', () => {

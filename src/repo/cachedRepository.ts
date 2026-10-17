@@ -1,6 +1,18 @@
 import { cloudRepository } from '../lib/cloudRepository'
 import type { Repository } from './repository'
-import { cacheGet, cacheSet, cacheDelete, cacheVersion, cacheKeysByPrefix, FRESH_MS } from '../lib/cloudCache'
+import { withTimeout } from '../utils/timeout'
+import {
+  cacheGet,
+  cacheSet,
+  cacheDelete,
+  cacheKeysByPrefix,
+  cacheFirstWithRevalidate,
+  cacheVersion,
+  isRefreshing,
+  refreshInFlight,
+  shareRefresh,
+  FRESH_MS,
+} from '../lib/cloudCache'
 import type {
   Patient,
   DryWeight,
@@ -17,6 +29,8 @@ import type {
  *   页面 watch 到这个信号再读一次即可显示最新数据（此时命中刚写入的缓存，不再等网络）。
  * - 本地没缓存（首次使用/刚清理）：只能正常等一次网络。
  * - 写操作：先落云端，成功后再同步本地缓存，保持"刚改完立刻看到"。
+ *
+ * 「新鲜度闸门 + 在途去重」都在 `cacheFirstWithRevalidate` 里，后台管理端共用同一份实现。
  */
 
 const K = {
@@ -30,26 +44,13 @@ const K = {
   ars: (sid: string) => `ars:${sid}`,
 }
 
-async function cacheFirst<T>(key: string, fetcher: () => Promise<T>): Promise<T> {
-  const cached = await cacheGet<T>(key)
-  if (cached) {
-    if (Date.now() - cached.updatedAt >= FRESH_MS) {
-      void (async () => {
-        try {
-          const value = await fetcher()
-          await cacheSet(key, value)
-          cacheVersion.value++
-        } catch {
-          // 后台刷新失败就继续用旧缓存，不打扰用户
-        }
-      })()
-    }
-    return cached.value
-  }
-  const value = await fetcher()
-  await cacheSet(key, value)
-  return value
-}
+const cacheFirst = cacheFirstWithRevalidate
+
+/**
+ * 批量读取时「等一趟已经在跑的刷新」的上限。
+ * 正常弱网下一趟批量请求 1~3 秒就回来了；封顶只是防止请求彻底挂住时把页面一起拖住。
+ */
+const WAIT_INFLIGHT_MS = 5000
 
 /** 写入/更新列表缓存中的一条（不存在则插入），并按给定规则排序 */
 async function upsertInto<T extends { id: string }>(
@@ -74,6 +75,105 @@ async function removeFromListsById(id: string, prefixes: string[]): Promise<void
       if (filtered.length !== cached.value.length) await cacheSet(key, filtered)
     }
   }
+}
+
+/**
+ * 子表（血压 / 血糖 / 血流量）的**批量**读法 —— 趋势页一次要最近 30 条记录的数据。
+ *
+ * 以前是 `Promise.all(recent.map(listBloodPressures))`：30 条记录 × 2 类 = 60 次往返，
+ * 手机弱网下首屏要等几十秒；更糟的是这 60 个 key 各自「缓存优先 + 后台刷新」，
+ * 把 cacheVersion 推着反复自增（见 cloudCache.dedupe 的注释），请求数会失控。
+ *
+ * 现在的口径：
+ * - 命中缓存的直接用（页面立刻有内容）；
+ * - 缺失的合并成**一次** `in.(…)` 请求拉回，再按缓存 key 分组回填（详情页随后命中缓存）；
+ * - 整体陈旧（超过 FRESH_MS）的补一次后台批量刷新，同样走 dedupe，绝不重复发。
+ */
+async function listManyBySession<T extends { sessionId: string }>(
+  sessionIds: string[],
+  keyOf: (sessionId: string) => string,
+  fetchMany: (ids: string[]) => Promise<T[]>,
+): Promise<T[]> {
+  const ids = [...new Set(sessionIds.filter((id) => Boolean(id)))]
+  if (!ids.length) return []
+
+  const entries = await Promise.all(ids.map((id) => cacheGet<T[]>(keyOf(id))))
+  const values = new Map<string, T[]>()
+  const missing: string[] = []
+  const stale: string[] = []
+  /** 没有缓存、但已经有刷新在跑的 key：等它落库，别重复发请求 */
+  const waiting: { id: string; task: Promise<unknown> }[] = []
+
+  ids.forEach((id, i) => {
+    const key = keyOf(id)
+    const cached = entries[i]
+    if (isRefreshing(key)) {
+      // 已经在刷：有旧值就先渲染（绝不为它再排一次队，否则会拿着不同的 id 集合重复请求）；
+      // 一点缓存都没有的，才需要等这一趟
+      if (cached) values.set(id, cached.value)
+      else waiting.push({ id, task: refreshInFlight(key)! })
+      return
+    }
+    if (!cached) {
+      missing.push(id)
+      return
+    }
+    values.set(id, cached.value)
+    if (Date.now() - cached.updatedAt >= FRESH_MS) stale.push(id)
+  })
+
+  // 等的是「别人已经在跑的请求」，不会新增网络往返；封顶是防止弱网下把页面拖死
+  if (waiting.length) {
+    await withTimeout(
+      Promise.all(waiting.map((w) => w.task.catch(() => undefined))),
+      WAIT_INFLIGHT_MS,
+      undefined,
+    )
+    for (const { id } of waiting) {
+      const cached = await cacheGet<T[]>(keyOf(id))
+      if (cached) values.set(id, cached.value)
+    }
+  }
+
+  /** 按 session 分组写回各自的缓存 key（空数组也要写：代表「这条记录确实没有数据」，否则每次都会重拉） */
+  const writeBack = async (targets: string[], rows: T[]): Promise<void> => {
+    const grouped = new Map<string, T[]>()
+    for (const row of rows) {
+      const arr = grouped.get(row.sessionId)
+      if (arr) arr.push(row)
+      else grouped.set(row.sessionId, [row])
+    }
+    await Promise.all(
+      targets.map((id) => {
+        const list = grouped.get(id) ?? []
+        values.set(id, list)
+        return cacheSet(keyOf(id), list)
+      }),
+    )
+  }
+
+  if (missing.length) {
+    // shareRefresh：这一批 id 一起登记在途，写回途中页面重读也不会再发一次
+    const rows = await shareRefresh(missing.map(keyOf), () => fetchMany(missing))
+    await writeBack(missing, rows)
+  }
+
+  if (stale.length) {
+    void shareRefresh(stale.map(keyOf), async () => {
+      const rows = await fetchMany(stale)
+      await writeBack(stale, rows)
+      return rows
+    })
+      .then(() => {
+        cacheVersion.value++
+      })
+      .catch(() => {
+        // 后台刷新失败继续用旧缓存，不打扰用户
+      })
+  }
+
+  // 按调用方给的顺序拼回去（每次 load 的 session 顺序一致，图表点位才稳定）
+  return ids.flatMap((id) => values.get(id) ?? [])
 }
 
 // 与 localRepository.listSessions 保持同一口径：date 倒序，同一天按 createdAt 倒序
@@ -132,6 +232,9 @@ export const cachedCloudRepository: Repository = {
   async listBloodPressures(sessionId) {
     return cacheFirst(K.bps(sessionId), () => cloudRepository.listBloodPressures(sessionId))
   },
+  async listBloodPressuresMany(sessionIds) {
+    return listManyBySession(sessionIds, K.bps, (ids) => cloudRepository.listBloodPressuresMany(ids))
+  },
   async saveBloodPressure(bp) {
     await cloudRepository.saveBloodPressure(bp)
     await upsertInto<BloodPressure>(K.bps(bp.sessionId), bp, byMeasuredAsc)
@@ -144,6 +247,9 @@ export const cachedCloudRepository: Repository = {
   // ---------- 血糖 ----------
   async listBloodGlucoses(sessionId) {
     return cacheFirst(K.bgs(sessionId), () => cloudRepository.listBloodGlucoses(sessionId))
+  },
+  async listBloodGlucosesMany(sessionIds) {
+    return listManyBySession(sessionIds, K.bgs, (ids) => cloudRepository.listBloodGlucosesMany(ids))
   },
   async saveBloodGlucose(glucose) {
     await cloudRepository.saveBloodGlucose(glucose)

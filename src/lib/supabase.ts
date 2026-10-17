@@ -84,3 +84,39 @@ export const supabase: SupabaseClient | null = isCloudConfigured
       },
     })
   : null
+
+/** 登录页预热探测的上限：到点就放弃并如实告诉用户「现在连不上」 */
+export const PREFLIGHT_TIMEOUT_MS = 8000
+
+/**
+ * 预热到云端的连接，并顺带回答「当前这条网络到底通不通」。
+ *
+ * 手机上的首次请求要现做 DNS + TLS 握手（实测生产库首次 1489ms、后续约 310ms），
+ * 移动数据下这一步更容易失败 —— 用户看到的就是「一登录就报网络异常」，
+ * 而代码里那 3 次重试要跑完 15 秒超时 × 3 才给出提示，等待过程毫无反馈。
+ *
+ * 所以登录页一打开就先跑一趟轻量探测（GoTrue 的 health 端点，不需要登录态）：
+ * - 通：连接已建好，用户点登录时直接复用，省掉那一次握手；
+ * - 不通：在用户输完手机号之前就把话说清楚（并给「重新检测」），
+ *   而不是让他填完再等 45 秒。
+ *
+ * 注意这里**不抛错、不弹窗**：探测失败不代表登录一定失败（可能只是抖动），
+ * 只作为提示；真正点登录时仍会走完整的重试逻辑。
+ */
+export async function preflightCloud(timeoutMs = PREFLIGHT_TIMEOUT_MS): Promise<boolean> {
+  if (!isCloudConfigured) return false
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    // 用 resilientFetch：GET 的连接类失败会自动重试，这正是「多点一次就好了」的那一步
+    const res = await resilientFetch(`${SUPABASE_URL}/auth/v1/health`, {
+      headers: { apikey: SUPABASE_ANON_KEY },
+      signal: controller.signal,
+    })
+    return res.ok
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+}

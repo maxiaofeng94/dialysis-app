@@ -23,6 +23,8 @@ const mocks = vi.hoisted(() => ({
   isLoggedIn: { value: false },
   // 是否配置了云端（isCloudConfigured）：用它切换「多人版 / 本地单机版」两条分支
   supabase: { isCloudConfigured: false },
+  /** 登录页打开时的网络预检（预热 + 连通性探测），默认当作「通」 */
+  preflightCloud: vi.fn(async () => true),
 }))
 
 vi.mock('../../src/stores/auth', () => ({
@@ -38,6 +40,7 @@ vi.mock('../../src/lib/supabase', () => ({
   get isCloudConfigured() {
     return mocks.supabase.isCloudConfigured
   },
+  preflightCloud: mocks.preflightCloud,
 }))
 
 vi.mock('vant', async (importOriginal) => {
@@ -106,6 +109,7 @@ beforeEach(() => {
   mocks.initialized.value = true
   mocks.isLoggedIn.value = false
   mocks.supabase.isCloudConfigured = false
+  mocks.preflightCloud.mockReset().mockResolvedValue(true)
 })
 
 afterEach(() => {
@@ -149,7 +153,8 @@ describe('LoginView · 登录', () => {
 
     await submit(w)
 
-    expect(mocks.login).toHaveBeenCalledWith('13800000000', '123456')
+    // 第三个参数是重试进度回调（弱网下用它显示「正在重试第几次」）
+    expect(mocks.login).toHaveBeenCalledWith('13800000000', '123456', expect.any(Function))
     expect(mocks.showToast).toHaveBeenCalledWith('登录成功')
     expect(router.currentRoute.value.path).toBe('/')
   })
@@ -221,7 +226,8 @@ describe('LoginView · 注册', () => {
     await flushPromises()
 
     expect(mocks.register).toHaveBeenCalledWith('13800000000', '123456', undefined)
-    expect(mocks.login).toHaveBeenCalledWith('13800000000', '123456')
+    // 第三个参数是重试进度回调（弱网下用它显示「正在重试第几次」）
+    expect(mocks.login).toHaveBeenCalledWith('13800000000', '123456', expect.any(Function))
     // 注册成功后界面提示的是「登录」这一步的结果文案（register 的成功文案不会展示）
     expect(mocks.showToast).toHaveBeenCalledWith('登录成功')
     expect(router.currentRoute.value.path).toBe('/')
@@ -386,5 +392,86 @@ describe('LoginView · 错误文案中文化（L1）', () => {
     await submit(w)
 
     expect(mocks.showToast).toHaveBeenCalledWith('密码错误')
+  })
+})
+
+/**
+ * 移动数据下「一登录就报网络异常」的两条防线：
+ * 1. 进登录页先预检网络（顺带预热 DNS + TLS），连不上就提前说清楚 + 给「重新检测」；
+ * 2. 登录重试要有进度反馈 —— 最多 15 秒 × 3 次，没反馈用户只会以为卡死。
+ */
+describe('LoginView · 网络预检与重试反馈', () => {
+  it('进页面就预检一次网络（云端模式）', async () => {
+    mocks.supabase.isCloudConfigured = true
+    await mountLogin()
+
+    expect(mocks.preflightCloud).toHaveBeenCalledTimes(1)
+    // 探测通过时不打扰用户
+    expect(wrapper!.text()).not.toContain('连不上服务器')
+  })
+
+  it('预检失败：显示提示与「重新检测」，点一下会重新探测并消失', async () => {
+    mocks.supabase.isCloudConfigured = true
+    mocks.preflightCloud.mockResolvedValue(false)
+    const w = await mountLogin()
+
+    expect(w.text()).toContain('当前网络连不上服务器')
+    const retry = w.findAll('button').find((b) => b.text() === '重新检测')
+    expect(retry, '必须给出「重新检测」入口，否则用户只能干等').toBeTruthy()
+
+    mocks.preflightCloud.mockResolvedValue(true)
+    await retry!.trigger('click')
+    await flushPromises()
+
+    expect(mocks.preflightCloud).toHaveBeenCalledTimes(2)
+    expect(w.text()).not.toContain('当前网络连不上服务器')
+  })
+
+  it('本地单机模式不预检、也不显示网络提示', async () => {
+    mocks.supabase.isCloudConfigured = false
+    const w = await mountLogin()
+
+    expect(mocks.preflightCloud).not.toHaveBeenCalled()
+    expect(w.text()).toContain('本地单机模式')
+    expect(w.text()).not.toContain('连不上服务器')
+  })
+
+  it('登录重试时显示「正在重试第几次」', async () => {
+    mocks.supabase.isCloudConfigured = true
+    let release: (v: { ok: boolean; message: string }) => void = () => {}
+    mocks.login.mockImplementation(
+      // 模拟「首次失败 → 界面收到第 2 次重试通知 → 请求还在进行中」
+      (_phone: string, _password: string, onRetry?: (a: number, t: number) => void) =>
+        new Promise((resolve) => {
+          onRetry?.(2, 3)
+          release = resolve as (v: { ok: boolean; message: string }) => void
+        }),
+    )
+    const w = await mountLogin()
+
+    await fieldInput(w, '手机号').setValue('13800000000')
+    await fieldInput(w, '密码').setValue('123456')
+    await buttonByText(w, '登录').trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('正在重试（第 2/3 次）')
+
+    release({ ok: false, message: '网络连接失败' })
+    await flushPromises()
+    // 结束后提示必须收掉，不能留在屏幕上
+    expect(w.text()).not.toContain('正在重试')
+  })
+
+  it('登录失败后会重新探一次网络，好让用户分清是网络问题还是密码问题', async () => {
+    mocks.supabase.isCloudConfigured = true
+    mocks.login.mockResolvedValue({ ok: false, message: 'Invalid login credentials' })
+    const w = await mountLogin()
+    await flushPromises()
+    expect(mocks.preflightCloud).toHaveBeenCalledTimes(1)
+
+    await submit(w)
+    await flushPromises()
+
+    expect(mocks.preflightCloud).toHaveBeenCalledTimes(2)
   })
 })

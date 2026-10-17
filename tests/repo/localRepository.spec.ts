@@ -298,6 +298,25 @@ describe('localRepository · 子表读取与排序', () => {
     expect((await localRepository.listAdverseReactions('session-1')).map((a) => a.id)).toEqual(['a1', 'a2'])
   })
 
+  it('批量读取：一次取回多个 session 的血压，按 measuredAt 升序', async () => {
+    await localRepository.saveBloodPressure(makeBp({ id: 'b2', sessionId: 's1', measuredAt: 200 }))
+    await localRepository.saveBloodPressure(makeBp({ id: 'b1', sessionId: 's1', measuredAt: 100 }))
+    await localRepository.saveBloodPressure(makeBp({ id: 'b3', sessionId: 's2', measuredAt: 300 }))
+    await localRepository.saveBloodPressure(makeBp({ id: 'other', sessionId: 's9', measuredAt: 150 }))
+
+    const list = await localRepository.listBloodPressuresMany(['s1', 's2'])
+
+    expect(list.map((b) => b.id)).toEqual(['b1', 'b2', 'b3'])
+    expect(await localRepository.listBloodPressuresMany([])).toEqual([])
+  })
+
+  it('批量读取：血糖同理，按 measuredAt 升序', async () => {
+    await localRepository.saveBloodGlucose(makeBg({ id: 'g2', sessionId: 's1', measuredAt: 500 }))
+    await localRepository.saveBloodGlucose(makeBg({ id: 'g1', sessionId: 's2', measuredAt: 100 }))
+
+    expect((await localRepository.listBloodGlucosesMany(['s1', 's2'])).map((g) => g.id)).toEqual(['g1', 'g2'])
+  })
+
   it('子表单条删除只删自己', async () => {
     await localRepository.saveBloodPressure(makeBp({ id: 'b1', sessionId: 's1' }))
     await localRepository.saveBloodPressure(makeBp({ id: 'b2', sessionId: 's1' }))

@@ -101,3 +101,92 @@ export async function cacheClear(): Promise<void> {
     // ignore
   }
 }
+
+/**
+ * 同一个 key 的刷新只允许有一个在途任务，后来的调用直接复用。
+ *
+ * 没有这道去重会发生什么（实测复现）：趋势页一次加载要读「最近 30 条记录」的血压 / 血糖，
+ * 命中陈旧缓存时每个 key 都会发起后台刷新；每个刷新成功又让 cacheVersion 自增，
+ * 页面 watch 到就重新 load —— 而重新 load 时那些**还在途**的 key 依旧是陈旧的
+ * （FRESH_MS 闸门只看「上次写入时间」，管不住在途），于是再次发起刷新、再自增、再 load……
+ * 网络越慢越失控：把库请求延迟设为 800ms 后，趋势页 30 秒内打出了 **13 万个请求**
+ * （血压 63028 次 + 血糖 62603 次），手机持续发烫、耗电激增就是这么来的。
+ */
+const inflight = new Map<string, Promise<unknown>>()
+
+export function dedupe<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const running = inflight.get(key) as Promise<T> | undefined
+  if (running) return running
+  // 声明成可空再赋值：finally 里要拿它跟表里的条目比对（`tsc -b` 会拦「变量在赋值前被使用」）
+  let p: Promise<T> | undefined
+  p = (async () => {
+    try {
+      return await task()
+    } finally {
+      // 成败都要摘掉，失败后下一次调用才有机会重试
+      if (inflight.get(key) === p) inflight.delete(key)
+    }
+  })()
+  inflight.set(key, p)
+  return p
+}
+
+/** 某个 key 是否正在后台刷新（批量请求会把「在刷」登记到它覆盖的每一个 key 上） */
+export function isRefreshing(key: string): boolean {
+  return inflight.has(key)
+}
+
+/** 取某个 key 正在进行的刷新（没有在途刷新时是 undefined），用于「等它写完再读」 */
+export function refreshInFlight(key: string): Promise<unknown> | undefined {
+  return inflight.get(key)
+}
+
+/**
+ * 一次请求覆盖多个 key（如按 30 条记录批量拉血压）时，把「正在刷新」登记到**每个** key 上。
+ *
+ * 为什么不能只拿「这一批的 id 列表」当去重键：写回是逐个 key 落库的，
+ * 写到一半时页面若因别的刷新重读，看到的陈旧集合就**少几个 id** —— 键一变，去重失效，
+ * 于是又发一次批量请求；而它完成时又可能撞上下一次重读……实测把延迟设成 3 秒（= FRESH_MS）时，
+ * 趋势页会稳定地每 3.2 秒刷一轮、几十秒都停不下来。按 key 登记后，任何一条读路径
+ * （单条读、批量读、页面重读）看到的都是「这个 key 正在刷新」，不会重复发。
+ */
+export function shareRefresh<T>(keys: string[], task: () => Promise<T>): Promise<T> {
+  let running: Promise<T> | null = null
+  const shared = (): Promise<T> => (running ??= task())
+  const tasks = keys.map((key) => dedupe(key, shared))
+  // keys 非空时，第一个 dedupe 未命中就会真的执行 task；其余命中在途时复用它
+  return Promise.all(tasks).then((results) => results[0] as T)
+}
+
+/**
+ * 缓存优先 + 后台刷新（stale-while-revalidate）的**统一读法**。
+ *
+ * `cachedRepository` 与 `cloudAdmin` 共用这一份实现：以前两边各写一遍，
+ * 结果只有一边补上了 FRESH_MS 闸门、另一边补上了 error 检查，改完还会走散。
+ */
+export async function cacheFirstWithRevalidate<T>(key: string, loader: () => Promise<T>): Promise<T> {
+  const cached = await cacheGet<T>(key)
+  if (cached) {
+    // 新鲜度闸门 + 在途去重缺一不可：前者防「刚写完又刷」，后者防「并发/在途时重复刷」
+    if (Date.now() - cached.updatedAt >= FRESH_MS && !isRefreshing(key)) {
+      void dedupe(key, async () => {
+        const value = await loader()
+        await cacheSet(key, value)
+        return value
+      })
+        .then(() => {
+          cacheVersion.value++
+        })
+        .catch(() => {
+          // 后台刷新失败就继续用旧缓存，不打扰用户
+        })
+    }
+    return cached.value
+  }
+  // 首次没有缓存：必须等一次网络；同样走去重，两个组件同时读同一个 key 只会发一次请求
+  return dedupe(key, async () => {
+    const value = await loader()
+    await cacheSet(key, value)
+    return value
+  })
+}

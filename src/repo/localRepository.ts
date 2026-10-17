@@ -120,6 +120,11 @@ class LocalRepository implements Repository {
     const list = await db.bloodPressures.where('sessionId').equals(sessionId).toArray()
     return list.sort((a, b) => a.measuredAt - b.measuredAt)
   }
+  async listBloodPressuresMany(sessionIds: string[]) {
+    if (!sessionIds.length) return []
+    const list = await db.bloodPressures.where('sessionId').anyOf(sessionIds).toArray()
+    return list.sort((a, b) => a.measuredAt - b.measuredAt)
+  }
   async saveBloodPressure(bp: BloodPressure) {
     await db.bloodPressures.put({ ...bp })
   }
@@ -129,6 +134,11 @@ class LocalRepository implements Repository {
 
   async listBloodGlucoses(sessionId: string) {
     const list = await db.bloodGlucoses.where('sessionId').equals(sessionId).toArray()
+    return list.sort((a, b) => a.measuredAt - b.measuredAt)
+  }
+  async listBloodGlucosesMany(sessionIds: string[]) {
+    if (!sessionIds.length) return []
+    const list = await db.bloodGlucoses.where('sessionId').anyOf(sessionIds).toArray()
     return list.sort((a, b) => a.measuredAt - b.measuredAt)
   }
   async saveBloodGlucose(glucose: BloodGlucose) {

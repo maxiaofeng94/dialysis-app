@@ -27,6 +27,9 @@ vi.mock('../../src/repo', () => ({
   repository: {
     listDryWeights: vi.fn(),
     listSessions: vi.fn(),
+    // 趋势页只用批量接口：一次请求取回最近 30 条记录的血压 / 血糖
+    listBloodPressuresMany: vi.fn(),
+    listBloodGlucosesMany: vi.fn(),
     listBloodPressures: vi.fn(),
     listBloodGlucoses: vi.fn(),
     // 趋势页是纯展示页：下面这些写方法存在只是为了断言「一次都没被调用」
@@ -61,11 +64,13 @@ interface TrendData {
 function stubTrendData(data: TrendData = {}) {
   vi.mocked(repository.listDryWeights).mockResolvedValue(data.dryWeights ?? [])
   vi.mocked(repository.listSessions).mockResolvedValue(data.sessions ?? [])
-  vi.mocked(repository.listBloodPressures).mockImplementation(async (sessionId: string) =>
-    data.bpsBySession?.[sessionId] ?? [],
+  // 批量接口按传入的 session 顺序把各条记录的数据拍平，并补上 sessionId 归属
+  //（真实数据层返回的每条都带 sessionId；用例里只写 bpsBySession 分组即可）
+  vi.mocked(repository.listBloodPressuresMany).mockImplementation(async (sessionIds: string[]) =>
+    sessionIds.flatMap((id) => (data.bpsBySession?.[id] ?? []).map((bp) => ({ ...bp, sessionId: id }))),
   )
-  vi.mocked(repository.listBloodGlucoses).mockImplementation(async (sessionId: string) =>
-    data.bgsBySession?.[sessionId] ?? [],
+  vi.mocked(repository.listBloodGlucosesMany).mockImplementation(async (sessionIds: string[]) =>
+    sessionIds.flatMap((id) => (data.bgsBySession?.[id] ?? []).map((bg) => ({ ...bg, sessionId: id }))),
   )
 }
 
@@ -235,8 +240,10 @@ describe('TrendView · 血压/血糖趋势数据', () => {
     expect(opt.xAxis.data).toEqual(['01-05 08:00', '01-05 10:00', '02-06 09:00'])
     expect(opt.series[0].data).toEqual([130, 150, 140])
     expect(opt.series[1].data).toEqual([80, 95, 90])
-    // 每条记录各拉一次血压，并且是并行发出的
-    expect(repository.listBloodPressures).toHaveBeenCalledTimes(2)
+    // 一次批量请求拿回两条记录的血压，而不是每条记录各发一次
+    expect(repository.listBloodPressuresMany).toHaveBeenCalledTimes(1)
+    expect(repository.listBloodPressuresMany).toHaveBeenCalledWith(['s1', 's2'])
+    expect(repository.listBloodPressures).not.toHaveBeenCalled()
   })
 
   it('血糖趋势同样按时间升序汇总', async () => {
@@ -347,7 +354,7 @@ describe('TrendView · 加载失败与「无数据」要分开（M9）', () => {
   })
 
   it('血压趋势加载失败：对应页签显示失败态与重试，而不是「暂无血压数据」', async () => {
-    vi.mocked(repository.listBloodPressures).mockRejectedValueOnce(new Error('查询失败（血压）：Failed to fetch'))
+    vi.mocked(repository.listBloodPressuresMany).mockRejectedValueOnce(new Error('查询失败（血压）：Failed to fetch'))
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     const w = await mountTrend({ sessions: [makeSession({ id: 's1', date: '2024-01-05' })] })
 
@@ -360,7 +367,7 @@ describe('TrendView · 加载失败与「无数据」要分开（M9）', () => {
   })
 
   it('血糖趋势加载失败：对应页签显示失败态；体重页签不受影响', async () => {
-    vi.mocked(repository.listBloodGlucoses).mockRejectedValueOnce(new Error('查询失败（血糖）：Failed to fetch'))
+    vi.mocked(repository.listBloodGlucosesMany).mockRejectedValueOnce(new Error('查询失败（血糖）：Failed to fetch'))
     vi.spyOn(console, 'error').mockImplementation(() => {})
     const w = await mountTrend({
       sessions: [makeSession({ id: 's1', date: '2024-01-05', preWeightMeasured: 80, wheelchairWeightUsed: 20 })],
@@ -381,14 +388,21 @@ describe('TrendView · 加载失败与「无数据」要分开（M9）', () => {
     expect(w.text()).not.toContain('加载失败')
   })
 
-  it('一次打开仍是「每条记录各一次」并行请求（批量接口待做：需数据层支持按病人一次拉回子表）', async () => {
+  it('一次打开只有两次网络请求：血压 / 血糖各一次批量拉取（30 条记录不再逐条打 60 次）', async () => {
     const sessions = Array.from({ length: 30 }, (_, i) =>
       makeSession({ id: `s${i}`, date: `2024-01-${String(i + 1).padStart(2, '0')}` }),
     )
     await mountTrend({ sessions })
 
-    // 血压 + 血糖各 30 次：目前没有批量查询接口，只能逐条并行
-    expect(repository.listBloodPressures).toHaveBeenCalledTimes(30)
-    expect(repository.listBloodGlucoses).toHaveBeenCalledTimes(30)
+    const ids = sessions.map((s) => s.id)
+    // 用户反馈的「手机发烫、耗电激增」正是这里：以前是 30 + 30 = 60 次请求，
+    // 且每个缓存 key 各自后台刷新，弱网下会自激成停不下来的请求风暴。
+    expect(repository.listBloodPressuresMany).toHaveBeenCalledTimes(1)
+    expect(repository.listBloodGlucosesMany).toHaveBeenCalledTimes(1)
+    expect(repository.listBloodPressuresMany).toHaveBeenCalledWith(ids)
+    expect(repository.listBloodGlucosesMany).toHaveBeenCalledWith(ids)
+    // 单条接口一次都不该被调用
+    expect(repository.listBloodPressures).not.toHaveBeenCalled()
+    expect(repository.listBloodGlucoses).not.toHaveBeenCalled()
   })
 })

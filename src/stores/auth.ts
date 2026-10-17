@@ -173,8 +173,15 @@ async function register(
  * 网络类失败会自动重试（见 NETWORK_RETRY_DELAYS_MS）：手机上首次请求要现做
  * DNS + TLS 握手，偶发直接失败，用户反馈的「总提示网络失败，多点几次才行」
  * 就是缺了这一步。密码错、账号被禁这类业务错误不重试，立刻返回提示。
+ *
+ * `onRetry` 让界面能把「正在重试第几次」显示出来：重试最多要跑 15 秒 × 3，
+ * 没有反馈的话用户只会以为卡死了，然后反复点击。
  */
-async function login(phone: string, password: string): Promise<{ ok: boolean; message: string }> {
+async function login(
+  phone: string,
+  password: string,
+  onRetry?: (attempt: number, total: number) => void,
+): Promise<{ ok: boolean; message: string }> {
   // 本地模式（未配置云端）时 supabase 为 null，直接给出说明 —— 别让登录页卡在「提交中」。
   if (!supabase) return { ok: false, message: '当前是单机版，无需登录' }
 
@@ -183,6 +190,7 @@ async function login(phone: string, password: string): Promise<{ ok: boolean; me
   let lastMessage = ''
 
   for (let i = 0; i < attempts; i++) {
+    if (i > 0) onRetry?.(i + 1, attempts)
     try {
       const { error } = await supabase.auth.signInWithPassword(credentials)
       if (!error) return { ok: true, message: '登录成功' }

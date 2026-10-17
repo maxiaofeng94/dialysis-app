@@ -3,7 +3,7 @@ import { ref, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast } from 'vant'
 import { useAuth } from '../stores/auth'
-import { isCloudConfigured } from '../lib/supabase'
+import { isCloudConfigured, preflightCloud } from '../lib/supabase'
 
 const router = useRouter()
 const { initialized, isLoggedIn, register, login } = useAuth()
@@ -16,6 +16,26 @@ const phone = ref('')
 const password = ref('')
 const confirmPassword = ref('')
 const submitting = ref(false)
+
+/**
+ * 网络预检状态。
+ *
+ * 移动数据（尤其信号只有一两格时）到云端服务器的第一次连接要现做 DNS + TLS 握手，
+ * 失败率明显高于 Wi-Fi —— 用户看到的就是「用流量登录总报网络异常」。
+ * 所以一进登录页就先探一次（顺带把连接预热好）：
+ * - 通：用户点登录时直接复用这条连接；
+ * - 不通：在他输完手机号之前就把原因说清楚，并给「重新检测」，
+ *   而不是等他填完、点下去、再等满 15 秒 × 3 次重试。
+ */
+const netState = ref<'checking' | 'ok' | 'fail'>('checking')
+/** 重试进行中的提示（登录最多要跑 3 次、每次 15 秒超时，没反馈用户会以为卡死） */
+const retryTip = ref('')
+
+async function checkNetwork(): Promise<void> {
+  if (!cloudConfigured) return
+  netState.value = 'checking'
+  netState.value = (await preflightCloud()) ? 'ok' : 'fail'
+}
 
 /**
  * Supabase 返回的是英文原文（Invalid login credentials / Failed to fetch …），
@@ -129,6 +149,8 @@ function resetTurnstile() {
 onMounted(() => {
   if (initialized.value && isLoggedIn.value) router.replace('/')
   void renderTurnstile()
+  // 先探一次网络：连不上就早点提示，能连上就当预热了这条连接
+  void checkNetwork()
 })
 
 function toggleMode() {
@@ -163,6 +185,7 @@ async function onSubmit() {
   }
 
   submitting.value = true
+  retryTip.value = ''
   // 无论正常返回、失败还是抛异常（断网 / 未配置云端），finally 一定复位按钮，
   // 否则页面会永久转圈，用户只能杀进程。
   try {
@@ -174,15 +197,23 @@ async function onSubmit() {
         return
       }
     }
-    const res = await login(phone.value, password.value)
+    const res = await login(phone.value, password.value, (attempt, total) => {
+      retryTip.value = `网络较慢，正在重试（第 ${attempt}/${total} 次）…`
+    })
     showToast(res.ok ? res.message : friendlyAuthError(res.message))
-    if (res.ok) await router.replace('/')
+    if (res.ok) {
+      await router.replace('/')
+    } else {
+      // 登录失败后重新探一次：让用户马上看到「是网络的事」还是「账号密码的事」
+      void checkNetwork()
+    }
   } catch (e) {
     console.error(e)
     showToast(errorToMessage(e))
     resetTurnstile()
   } finally {
     submitting.value = false
+    retryTip.value = ''
   }
 }
 </script>
@@ -197,6 +228,12 @@ async function onSubmit() {
       <!-- 本地单机版没有云端账号体系：先把话说清楚，别让用户在这里反复试密码 -->
       <div v-if="!cloudConfigured" class="login-hint">
         当前是本地单机模式（未配置云端），无需登录，返回即可直接使用
+      </div>
+
+      <!-- 网络预检（移动数据下最容易遇到）：连不上就先说清楚，别让用户填完再等 45 秒 -->
+      <div v-else-if="netState === 'fail'" class="login-warn">
+        <div class="login-warn-text">当前网络连不上服务器，请检查手机移动数据 / Wi-Fi 后重试</div>
+        <button class="login-warn-retry" type="button" @click="checkNetwork">重新检测</button>
       </div>
 
       <van-field v-model="phone" type="tel" maxlength="11" label="手机号" placeholder="请输入手机号" />
@@ -214,6 +251,8 @@ async function onSubmit() {
       <van-button type="primary" block :loading="submitting" style="margin-top: 20px" @click="onSubmit">
         {{ mode === 'login' ? '登录' : '注册并登录' }}
       </van-button>
+
+      <div v-if="retryTip" class="login-retry-tip">{{ retryTip }}</div>
 
       <div class="toggle" @click="toggleMode">
         {{ mode === 'login' ? '没有账号？去注册' : '已有账号？去登录' }}
@@ -273,6 +312,35 @@ async function onSubmit() {
   font-size: 12px;
   line-height: 1.6;
   text-align: center;
+}
+/* 网络预检失败的提示条：移动数据下连不上服务器时，先于「登录失败」出现 */
+.login-warn {
+  margin: -8px 0 16px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #fff1f0;
+  color: #ee0a24;
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+}
+.login-warn-text {
+  margin-bottom: 8px;
+}
+.login-warn-retry {
+  border: 1px solid #ee0a24;
+  background: transparent;
+  color: #ee0a24;
+  font-size: 12px;
+  padding: 4px 14px;
+  border-radius: 999px;
+}
+/* 重试进行中的提示：登录最多要跑 3 次、每次 15 秒超时，必须让用户看到「还在努力」 */
+.login-retry-tip {
+  margin-top: 10px;
+  text-align: center;
+  color: #ed6a0c;
+  font-size: 12px;
 }
 .toggle {
   text-align: center;

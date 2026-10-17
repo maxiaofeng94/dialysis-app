@@ -197,6 +197,15 @@ Remove-Item Env:\DISABLE_SW
   断言请求数 = 2 且间隔 ≈500ms；再断言「密码错误」时请求数 = 1
 - **首屏耗时要有量化概念**：生产库（东京）实测**首次**请求 1489ms、后续 ~310ms ——
   那 1.2 秒就是 DNS + TLS 握手的成本，也正是「再点一次就好了」的原因
+- **登录页要先「预检 + 预热」**：用户反馈「App 只开移动数据时一登录就报网络异常」。
+  `preflightCloud()`（GoTrue 的 `/auth/v1/health`，8 秒封顶）在进页面时跑一次 ——
+  能连上就把 DNS + TLS 握手提前做掉；连不上就显示「当前网络连不上服务器」+「重新检测」，
+  **别让用户填完手机号再干等 15 秒 × 3 次重试**。探测不抛错、不阻塞提交（可能只是抖动）
+- **`index.html` 的 preconnect 由 vite 插件注入**（`supabasePreconnect`，域名取自 `.env*`）：
+  用户还在输手机号时连接就建好了。换库不用改插件，但**要确认 `_headers` 的 CSP `connect-src`
+  仍允许该域名**，否则 preconnect 会被静默忽略（不报错、只是没生效）
+- **重试必须可见**：`login(phone, password, onRetry?)` 的第三个参数用于显示
+  「网络较慢，正在重试（第 N/3 次）…」—— 15 秒 × 3 的等待毫无反馈，用户只会以为卡死、反复点
 
 ### 启动与白屏 · APK 还有一条独立成因
 
@@ -235,7 +244,26 @@ Remove-Item Env:\DISABLE_SW
 - 本地数据与云端缓存是**两个独立 IndexedDB**：`dialysis-db`（业务）与 `dialysis-cloud-cache`（缓存），不要混用
 - 缓存 key：`patient:` / `dryWeights:` / `session:` / `sessions:` / `bps:` / `bgs:` / `bfs:` / `ars:` / `myPatients:` / `members:`；写操作后要同步更新或删除对应 key
 - Dexie 升级用 `version(n).stores(...)`；新增非索引字段无需升版本，但读取要兼容旧数据（见 `localRepository.normalizeSession`）
-- **「缓存优先 + 后台刷新」必须有 `FRESH_MS` 闸门**：命中缓存就无条件刷新 + `cacheVersion++`，会和页面的 `watch(cacheVersion)` 组成自激循环（成员页曾每轮打一次 join 查询）。`cloudAdmin` 的两个读函数现已对齐 `cachedRepository.cacheFirst`
+- **「缓存优先 + 后台刷新」必须有 `FRESH_MS` 闸门 + 在途去重**：命中缓存就无条件刷新 + `cacheVersion++`，
+  会和页面的 `watch(cacheVersion)` 组成自激循环（成员页曾每轮打一次 join 查询）。
+  - 闸门只看「上次写入时间」，**管不住「在途」**：刷新还没回来时该 key 依旧是陈旧的，
+    于是页面每被唤醒一次就再刷一次。把库请求人为延迟 800ms 后打开趋势页，
+    30 秒内打出 **131614 个请求**（血压 63028 + 血糖 62603）且停不下来 ——
+    用户反馈的「web 端长期打开后手机发烫、耗电激增」就是它（实测该页静置 20 秒 CPU 占用为 0，
+    发烫完全来自请求风暴，不是图表或动画）
+  - 修法：`cloudCache.cacheFirstWithRevalidate` / `dedupe` 是**唯一实现**，`cachedRepository` 与
+    `cloudAdmin` 共用，别再各写一份（历史上就是一边漏了闸门、另一边漏了 error 检查）
+- **一次请求覆盖多个 key 时，要按 key 登记「在刷」**（`cloudCache.shareRefresh` +
+  `isRefreshing` / `refreshInFlight`）：写回是逐个 key 落库的，写到一半时页面重读会看到
+  「少几个 id」的陈旧集合 —— 只拿这一批 id 列表当去重键的话，键一变就失效、又发一次批量请求。
+  把延迟提到 3 秒（= `FRESH_MS`）时表现为「每 3.2 秒刷一轮、几十秒不停」
+- **趋势页的子表必须批量拉**：`Promise.all(recent.map(listBloodPressures))` 是 30 次往返，
+  血压 + 血糖 = 60 个请求，还各自带一套后台刷新。用 `listBloodPressuresMany` /
+  `listBloodGlucosesMany`（PostgREST `in.(…)`，80 个一批分批）：一次请求 + 按 key 回填缓存，
+  详情页随后照样命中缓存。实测趋势页 153 个请求 → 5 个
+- **页面静置的验收口径**：把库请求延迟 3 秒 + 把 `dialysis-cloud-cache` 所有行的 `updatedAt` 置 0，
+  再进页面 —— 请求数应是个位数并且 1~2 秒内收敛（首页 4、趋势页 2、详情页 8、报告页 7、设置页 4、成员页 2）。
+  造场景用 `page.route('**/rest/v1/**', …)` 延迟，别只看「首页能打开」
 - **导入备份要「先整份校验 → 再在事务里清库写入」**：先 `clear()` 再 `bulkPut()` 时，JSON 能解析但字段不合法，数据已全清空、界面只说「格式不正确」
 
 ### 移动端输入与不可逆操作

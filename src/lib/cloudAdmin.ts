@@ -1,6 +1,6 @@
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY, readPersistedUser } from './supabase'
 import { resilientFetch } from './resilientFetch'
-import { cacheGet, cacheSet, cacheVersion, FRESH_MS } from './cloudCache'
+import { cacheFirstWithRevalidate } from './cloudCache'
 import { withTimeout } from '../utils/timeout'
 import type { Patient } from '../types'
 
@@ -66,42 +66,23 @@ async function edgeHeaders(): Promise<Record<string, string>> {
 export async function listMyPatients(): Promise<{ patient: Patient; role: string }[]> {
   const uid = await currentUid()
   if (!uid) return []
-  const key = `myPatients:${uid}`
-  const load = async () => {
+  return cacheFirstWithRevalidate(`myPatients:${uid}`, async () => {
     const { data, error } = await supabase!.from('patient_members').select('role, patients(*)').eq('user_id', uid)
     // 读接口必须检查 error：PostgREST 出错时 data 为 null，`(data ?? []).map(...)`
     // 会把「查询失败」静默变成「一个病人都没有」——首页据此显示
     // 「还没有病人档案，去『设置』新建」，用户会真的去建一个重复档案（数据污染）。
     // 之前只有 cloudRepository 做了检查，这里的三个读函数漏了。
     if (error) throw error
-    const list = (data ?? []).map((r: any) => ({
+    return (data ?? []).map((r: any) => ({
       patient: patientFromRow(r.patients),
       role: r.role,
     }))
-    await cacheSet(key, list)
-    return list
-  }
-  const cached = await cacheGet<{ patient: Patient; role: string }[]>(key)
-  if (cached) {
-    // 必须和 cachedRepository.cacheFirst 用同一道「新鲜度」闸门：
-    // 否则「命中缓存 → 后台刷新 → cacheVersion++ → 页面 watch 重读 → 又命中缓存 …」
-    // 会自激成一个停不下来的请求循环（成员页/首页实测每轮都打一次 join 查询）。
-    if (Date.now() - cached.updatedAt >= FRESH_MS) {
-      void load()
-        .then(() => {
-          cacheVersion.value++
-        })
-        .catch(() => {})
-    }
-    return cached.value
-  }
-  return load()
+  })
 }
 
 /** 某病人的成员列表 —— 带本地缓存，先显示再后台刷新 */
 export async function listMembers(patientId: string): Promise<MemberInfo[]> {
-  const key = `members:${patientId}`
-  const load = async () => {
+  return cacheFirstWithRevalidate(`members:${patientId}`, async () => {
     const { data, error } = await supabase!
       .from('patient_members')
       .select('user_id, role, users(name, phone)')
@@ -109,28 +90,13 @@ export async function listMembers(patientId: string): Promise<MemberInfo[]> {
     // 同上：不检查 error 的话，成员页会把「查询失败」显示成「暂无成员」，
     // 用户会以为自己被移出了、家里人的账号都没了。
     if (error) throw error
-    const list = (data ?? []).map((r: any) => ({
+    return (data ?? []).map((r: any) => ({
       userId: r.user_id,
       name: r.users?.name ?? null,
       phone: r.users?.phone ?? null,
       role: r.role,
     }))
-    await cacheSet(key, list)
-    return list
-  }
-  const cached = await cacheGet<MemberInfo[]>(key)
-  if (cached) {
-    // 同上：没有这道闸门时，成员页会在 watch(cacheVersion) 与后台刷新之间反复自激
-    if (Date.now() - cached.updatedAt >= FRESH_MS) {
-      void load()
-        .then(() => {
-          cacheVersion.value++
-        })
-        .catch(() => {})
-    }
-    return cached.value
-  }
-  return load()
+  })
 }
 
 /** 我的资料（public.users）—— 记录人显示用 */

@@ -31,6 +31,19 @@ function isQueryableId(value: string): boolean {
   return value !== DEFAULT_PATIENT_ID && value.trim() !== ''
 }
 
+/**
+ * 批量查询（`.in('session_id', ids)`）的分批大小。
+ * 30 个 uuid 拼进 URL 就有 1KB 出头，留足余量：既别撞 PostgREST 的 URL 长度限制，
+ * 也别把一次请求拖成一个巨大的响应。
+ */
+const MANY_CHUNK = 80
+
+function chunk<T>(list: T[], size: number): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size))
+  return out
+}
+
 // 透析记录查询：带出记录人姓名（sessions.operator_id → users，RLS 允许同病人成员互看）
 const SESSION_SELECT = '*, operator:users(name, phone)'
 
@@ -323,6 +336,22 @@ class CloudRepository implements Repository {
     return (data ?? []).map(bpFromRow)
   }
 
+  /** 一次请求取回多条记录的血压（趋势页：30 条记录 = 1 次往返，而不是 30 次） */
+  async listBloodPressuresMany(sessionIds: string[]) {
+    const ids = [...new Set(sessionIds.filter(isQueryableId))]
+    const out: BloodPressure[] = []
+    for (const part of chunk(ids, MANY_CHUNK)) {
+      const { data, error } = await this.client()
+        .from('blood_pressures')
+        .select('*')
+        .in('session_id', part)
+        .order('measured_at', { ascending: true })
+      if (error) throw error
+      out.push(...(data ?? []).map(bpFromRow))
+    }
+    return out
+  }
+
   async saveBloodPressure(bp: BloodPressure) {
     const { error } = await this.client().from('blood_pressures').upsert(bpToRow(bp))
     if (error) throw error
@@ -343,6 +372,22 @@ class CloudRepository implements Repository {
       .order('measured_at', { ascending: true })
     if (error) throw error
     return (data ?? []).map(bgFromRow)
+  }
+
+  /** 一次请求取回多条记录的血糖，理由同 listBloodPressuresMany */
+  async listBloodGlucosesMany(sessionIds: string[]) {
+    const ids = [...new Set(sessionIds.filter(isQueryableId))]
+    const out: BloodGlucose[] = []
+    for (const part of chunk(ids, MANY_CHUNK)) {
+      const { data, error } = await this.client()
+        .from('blood_glucoses')
+        .select('*')
+        .in('session_id', part)
+        .order('measured_at', { ascending: true })
+      if (error) throw error
+      out.push(...(data ?? []).map(bgFromRow))
+    }
+    return out
   }
 
   async saveBloodGlucose(glucose: BloodGlucose) {
