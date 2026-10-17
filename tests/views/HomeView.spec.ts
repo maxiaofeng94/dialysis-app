@@ -24,6 +24,8 @@ import { makePatient, makeDryWeight, makeSession, resetIdSeq } from '../helpers/
 const mocks = vi.hoisted(() => ({
   currentPatientId: { value: 'patient-default' },
   hasNoCloudPatient: vi.fn(async () => false),
+  /** 首页在「已登录但当前病人还没校准」时会补一次校准（手机上退出再登录踩过的坑） */
+  ensureCloudPatient: vi.fn(async () => undefined),
   isLoggedIn: { value: false },
   uuid: vi.fn(() => 'uuid-fixed-1'),
   showToast: vi.fn(),
@@ -52,6 +54,7 @@ vi.mock('../../src/stores/patient', async () => {
   return {
     currentPatientId: mocks.currentPatientId,
     hasNoCloudPatient: mocks.hasNoCloudPatient,
+    ensureCloudPatient: mocks.ensureCloudPatient,
     currentRole: ref<string | null>(null),
     isReadOnly,
     refreshCurrentRole: mocks.refreshCurrentRole,
@@ -131,6 +134,8 @@ beforeEach(() => {
   vi.mocked(repository.saveSession).mockReset().mockResolvedValue(undefined)
   mocks.isLoggedIn.value = false
   mocks.hasNoCloudPatient.mockReset().mockResolvedValue(false)
+  mocks.currentPatientId.value = 'patient-default'
+  mocks.ensureCloudPatient.mockReset().mockResolvedValue(undefined)
   mocks.uuid.mockReset().mockReturnValue('uuid-fixed-1')
   mocks.showToast.mockReset()
   mocks.showConfirmDialog.mockReset().mockResolvedValue(undefined)
@@ -412,6 +417,44 @@ describe('HomeView · 无病人档案的空状态', () => {
     expect(w.find('.patient-card').exists()).toBe(true)
     expect(w.findAll('.van-empty')).toHaveLength(1) // 只剩「暂无透析记录」那个
     expect(w.text()).toContain('暂无透析记录')
+  })
+
+  /**
+   * 回归：手机上「退出登录 → 重新登录」后首页一个病人都没有、也看不到任何记录。
+   *
+   * 登出时 `clearCurrentPatient()` 把当前病人抹成 `patient-default`（本地默认 id，不是 uuid），
+   * 而守卫当时因故没重新校准 —— 首页如果直接拿它去查云端，cloudRepository 会短路返回空，
+   * 页面于是显示「请先建立病人档案」，用户以为数据全丢了。
+   * 现在首页在「已登录 + 当前病人还是默认 id」时会自己补一次校准。
+   */
+  it('已登录但当前病人还停在默认 id 时，首页先补一次校准再加载（否则会显示成「没有病人」）', async () => {
+    mocks.isLoggedIn.value = true
+    mocks.currentPatientId.value = 'patient-default'
+    mocks.ensureCloudPatient.mockImplementation(async () => {
+      mocks.currentPatientId.value = 'p-real'
+    })
+    vi.mocked(repository.getPatient).mockResolvedValue(makePatient({ id: 'p-real' }))
+    vi.mocked(repository.listDryWeights).mockResolvedValue([])
+    vi.mocked(repository.listSessions).mockResolvedValue([])
+
+    const w = await mountHome()
+    await flushPromises()
+
+    expect(mocks.ensureCloudPatient).toHaveBeenCalled()
+    // 校准之后必须用真实 id 去读，而不是 patient-default
+    expect(vi.mocked(repository.getPatient)).toHaveBeenCalledWith('p-real')
+    expect(vi.mocked(repository.listSessions)).toHaveBeenCalledWith('p-real')
+    expect(w.find('.patient-card').exists()).toBe(true)
+  })
+
+  it('本地单机模式（未登录）不做校准：currentPatientId 保持默认值', async () => {
+    mocks.isLoggedIn.value = false
+    stubData({ patient: makePatient({ id: 'patient-default' }) })
+    await mountHome()
+    await flushPromises()
+
+    expect(mocks.ensureCloudPatient).not.toHaveBeenCalled()
+    expect(vi.mocked(repository.getPatient)).toHaveBeenCalledWith('patient-default')
   })
 })
 

@@ -206,6 +206,18 @@ Remove-Item Env:\DISABLE_SW
   仍允许该域名**，否则 preconnect 会被静默忽略（不报错、只是没生效）
 - **重试必须可见**：`login(phone, password, onRetry?)` 的第三个参数用于显示
   「网络较慢，正在重试（第 N/3 次）…」—— 15 秒 × 3 的等待毫无反馈，用户只会以为卡死、反复点
+- **退出登录后「直接回 /login」也必须作废病人上下文**：设置页的退出登录是 `await logout()` 之后
+  **直接** `router.replace('/login')`，守卫走的是 `to.path === '/login'` 那条分支并直接 `return` ——
+  从前那里不重置 `patientContextUid`，于是**重新登录同一个账号**时被判定成「上下文已建好」、
+  跳过 `ensureCloudPatient()`；而登出时 `clearCurrentPatient()` 已经把当前病人抹成
+  `patient-default`（本地默认 id，**不是 uuid**），首页拿它去查云端会被 `cloudRepository`
+  短路成空 → **一个病人、一条记录都没有**（用户报的「APK 重新登录后没有任何记录、Web 端却有」
+  就是这个：Web 端一直登录着走冷启动路径，`patientContextUid` 是 undefined，所以看不出来）
+  - 三道防线 + `tests/router/router.spec.ts` 的回归用例：①回到登录页就作废 `patientContextUid`；
+    ②`currentPatientId` 仍是默认值时一律重新校准；③首页在「已登录 + 当前病人是默认 id」时
+    自己补一次校准（防守卫超时/被绕过）
+  - 通用教训：**凡是「跨登录态的模块级缓存」（uid、当前病人、上下文标记），登出路径上必须显式作废** ——
+    别指望「跳登录页」顺带清理，守卫的分支顺序常常不给你这个机会
 
 ### 启动与白屏 · APK 还有一条独立成因
 

@@ -3,8 +3,14 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { repository } from '../repo'
-import { SESSION_STATUS_LABEL, SESSION_STATUS_TAG, abortText } from '../constants'
-import { currentPatientId, hasNoCloudPatient, isReadOnly, refreshCurrentRole } from '../stores/patient'
+import { SESSION_STATUS_LABEL, SESSION_STATUS_TAG, abortText, DEFAULT_PATIENT_ID } from '../constants'
+import {
+  currentPatientId,
+  hasNoCloudPatient,
+  isReadOnly,
+  refreshCurrentRole,
+  ensureCloudPatient,
+} from '../stores/patient'
 import { isLoggedIn } from '../stores/auth'
 import { cacheVersion } from '../lib/cloudCache'
 import { todayStr, formatDateCN, fmt, calcAge } from '../utils/format'
@@ -56,7 +62,14 @@ watch(cacheVersion, () => {
  * - `loading` 放 finally，任何分支都会收起骨架。
  */
 async function refresh() {
-  const pid = currentPatientId.value
+  let pid = currentPatientId.value
+  // 云端模式下当前病人还没校准（守卫超时、或登录后直接落在首页）时补一次。
+  // 不补的话会拿「本地默认 id」去查云端，而 cloudRepository 对这种非 uuid 的 id 直接短路成空
+  // → 首页显示「请先建立病人档案」，用户以为数据全丢了（手机上退出再登录就踩过）。
+  if (isLoggedIn.value && pid === DEFAULT_PATIENT_ID) {
+    await ensureCloudPatient().catch(() => {})
+    pid = currentPatientId.value
+  }
   try {
     // 三个请求并行发出：总耗时约等于最慢的那个，而不是三次网络往返相加
     const [p, dw, ss] = await Promise.all([

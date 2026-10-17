@@ -30,7 +30,12 @@ interface Scenario {
   user?: { id: string } | null
   /** initialized 初值；true 表示「已经初始化过」，守卫不会再调 init() */
   initialized?: boolean
+  /** 初始的当前病人 id（默认是本地默认 id，代表「还没校准」） */
+  patientId?: string
 }
+
+/** 校准成功后当前病人会变成的真实 uuid（真实实现里 ensureCloudPatient 负责设置） */
+const REAL_PATIENT_ID = 'p-real'
 
 /** 装载一份全新的 router（含守卫依赖的间谍） */
 async function loadRouter(scenario: Scenario = {}) {
@@ -44,7 +49,11 @@ async function loadRouter(scenario: Scenario = {}) {
   })
 
   const restorePatientId = vi.fn(async () => {})
-  const ensureCloudPatient = vi.fn(async () => {})
+  const currentPatientId = ref(scenario.patientId ?? 'patient-default')
+  const ensureCloudPatient = vi.fn(async () => {
+    // 真实实现：校准成功后 currentPatientId 会被设成真实 uuid（不是本地默认 id）
+    currentPatientId.value = REAL_PATIENT_ID
+  })
 
   vi.doMock('../../src/stores/auth', () => ({
     useAuth: () => ({ user, initialized, isLoggedIn, init, register: vi.fn(), login: vi.fn(), logout: vi.fn() }),
@@ -55,7 +64,7 @@ async function loadRouter(scenario: Scenario = {}) {
   vi.doMock('../../src/stores/patient', () => ({
     restorePatientId,
     ensureCloudPatient,
-    currentPatientId: ref('patient-default'),
+    currentPatientId,
     setCurrentPatientId: vi.fn(),
     clearCurrentPatient: vi.fn(),
     hasNoCloudPatient: vi.fn(),
@@ -69,7 +78,16 @@ async function loadRouter(scenario: Scenario = {}) {
   vi.resetModules()
   const mod = await import('../../src/router/index')
 
-  return { router: mod.default, init, restorePatientId, ensureCloudPatient, user, initialized, isLoggedIn }
+  return {
+    router: mod.default,
+    init,
+    restorePatientId,
+    ensureCloudPatient,
+    user,
+    initialized,
+    isLoggedIn,
+    currentPatientId,
+  }
 }
 
 /** 导航到某路径并返回最终落在的路由 */
@@ -261,5 +279,77 @@ describe('云端模式 · 已登录', () => {
     expect(await go(router, '/')).toBe('/')
     expect(restorePatientId).toHaveBeenCalledTimes(2)
     expect(ensureCloudPatient).toHaveBeenCalledTimes(2)
+  })
+
+  /**
+   * 回归：手机上「退出登录 → 重新登录」后首页一个病人都没有、也看不到任何记录。
+   *
+   * 真实路径和上面那条**不一样**：设置页的退出登录是 `await logout()` 之后**直接**
+   * `router.replace('/login')`，守卫走的是 `to.path === '/login'` 那条分支并直接 return ——
+   * 从前那里不重置 `patientContextUid`，于是重新登录同一账号时被判定为「上下文已建好」，
+   * 跳过了 `ensureCloudPatient()`；而登出时 `clearCurrentPatient()` 已把当前病人抹成
+   * `patient-default`（不是 uuid），首页拿它查云端只会短路成空。
+   * Web 端一直登录着（冷启动路径 patientContextUid 为 undefined）所以看不出来。
+   */
+  it('登出后「直接」回 /login（设置页的真实路径）：重新登录同一账号必须重新校准病人', async () => {
+    const { router, ensureCloudPatient, user, currentPatientId } = await loadRouter({
+      configured: true,
+      initialized: true,
+      user: { id: 'u1' },
+    })
+
+    await go(router, '/')
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(1)
+    expect(currentPatientId.value).toBe(REAL_PATIENT_ID)
+
+    // 主动登出：清掉登录态 + 当前病人（clearCurrentPatient 的效果），随后直接 replace('/login')
+    user.value = null
+    currentPatientId.value = 'patient-default'
+    expect(await go(router, '/login')).toBe('/login')
+
+    // 同一账号重新登录 → 必须重新校准，否则首页会拿 patient-default 查云端、什么都查不到
+    user.value = { id: 'u1' }
+    expect(await go(router, '/')).toBe('/')
+
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(2)
+    expect(currentPatientId.value).toBe(REAL_PATIENT_ID)
+  })
+
+  it('即使当前病人没被重置，只要回过登录页就作废上下文（第二道防线）', async () => {
+    const { router, ensureCloudPatient, user } = await loadRouter({
+      configured: true,
+      initialized: true,
+      user: { id: 'u1' },
+    })
+
+    await go(router, '/')
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(1)
+
+    // 登出，但当前病人 id 没有回到默认值（例如某条路径漏了 clearCurrentPatient）
+    user.value = null
+    expect(await go(router, '/login')).toBe('/login')
+
+    user.value = { id: 'u1' }
+    await go(router, '/')
+
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(2)
+  })
+
+  it('当前病人还停在本地默认 id 时，即使 uid 没变也要重新校准（第三道防线）', async () => {
+    const { router, ensureCloudPatient, user, currentPatientId } = await loadRouter({
+      configured: true,
+      initialized: true,
+      user: { id: 'u1' },
+    })
+
+    await go(router, '/')
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(1)
+
+    // 模拟「未经过登录页、当前病人却回到默认值」（守卫超时/被绕过等）
+    currentPatientId.value = 'patient-default'
+    await go(router, '/trend')
+
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(2)
+    expect(currentPatientId.value).toBe(REAL_PATIENT_ID)
   })
 })
