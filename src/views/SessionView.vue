@@ -7,6 +7,7 @@ import { REACTION_TYPES, ABORT_REASONS, SESSION_STATUS_LABEL, abortText } from '
 import { currentPatientId, isReadOnly, refreshCurrentRole } from '../stores/patient'
 import { isLoggedIn } from '../stores/auth'
 import { cacheVersion } from '../lib/cloudCache'
+import { useSessionExpiryRedirect } from '../lib/sessionExpiry'
 import { todayStr, parseNum, fmt, formatTime, combineDateTime, dateStr, formatDateTimeCN, formatDateCN } from '../utils/format'
 import { getEffectiveDryWeight, calcWeights } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
@@ -21,6 +22,12 @@ import type { DialysisSession, Patient, DryWeight, BloodPressure, BloodGlucose, 
  */
 const WEIGHT_MIN = 20 // kg，上机前 / 下机后体重（含轮椅）
 const WEIGHT_MAX = 200
+/**
+ * 医生设定脱水量（ml）。没有量程时填 999999 也能入库，
+ * 报告页会显示「医生设定脱水量 1000.0 L」这种荒谬数值 —— 家属会当真。
+ */
+const DOCTOR_UF_MIN = 0
+const DOCTOR_UF_MAX = 10000
 const BP_SYSTOLIC_MIN = 40 // mmHg
 const BP_SYSTOLIC_MAX = 300
 const BP_DIASTOLIC_MIN = 20 // mmHg
@@ -72,6 +79,8 @@ const otherDetail = ref('')
 const saving = ref(false)
 /** 状态切换进行中（M2）：连点会把状态又翻回去，也用来防「确认中止」被点两次 */
 const statusBusy = ref(false)
+/** 删除整条记录在途（连点会弹两个确认框，第二次命中 0 行 → 误报「删除失败」，其实已经删掉了） */
+const deleting = ref(false)
 
 // 中止透析
 const showAbort = ref(false)
@@ -81,11 +90,17 @@ let loaded = false
 let timer: ReturnType<typeof setTimeout> | null = null
 /** 上一次已提示过的量程越界文案：同一个提示不重复弹，避免每次防抖保存都骚扰用户 */
 let lastRangeTip: string | null = null
+/** 不良反应整表替换在途（见 persistReactions：并发会互相覆盖，界面还会显示成已保存） */
+let savingReactions = false
 
 /** 首次加载（本机还没有缓存）时的骨架占位 */
 const loading = ref(true)
 /** 加载失败（不处理的话会永远停在骨架上，用户干等） */
 const loadFailed = ref(false)
+
+// 被踢下线 / 令牌失效：仓储会切回本地仓储 —— 此时写操作会静默落到本机 IndexedDB
+// （重新登录后看不到），读也变成空。必须提示并回登录页
+useSessionExpiryRedirect()
 
 onMounted(async () => {
   // 只读角色（医生 / 只读成员）的写操作会被 RLS 静默拒绝，界面必须提前隐藏写入口（H4）。
@@ -241,6 +256,11 @@ function formRangeTip(): string | null {
   if (pre != null && !checkRange(pre, WEIGHT_MIN, WEIGHT_MAX)) return `上机前体重需在 ${WEIGHT_MIN}~${WEIGHT_MAX}kg 之间`
   const post = parseNum(form.postWeight)
   if (post != null && !checkRange(post, WEIGHT_MIN, WEIGHT_MAX)) return `下机后体重需在 ${WEIGHT_MIN}~${WEIGHT_MAX}kg 之间`
+  // 医生设定脱水量同样要拦：它不参与自动计算，所以错了也不会被别的校验发现，
+  // 却会原样出现在报告页给医生看
+  const uf = parseNum(form.doctorUf)
+  if (uf != null && !checkRange(uf, DOCTOR_UF_MIN, DOCTOR_UF_MAX))
+    return `医生设定脱水量需在 ${DOCTOR_UF_MIN}~${DOCTOR_UF_MAX}ml 之间`
   return null
 }
 
@@ -269,6 +289,10 @@ async function mergeRemoteIfUntouched() {
     const s = await repository.getSession(sessionId) // 命中后台刚写回的新缓存，不用再等一次网络
     if (!s) return // 另一端删掉了这条：这里不复活它，也不打断用户
     if (s.updatedAt <= knownUpdatedAt) return // 旧的后台刷新结果，不允许把刚保存的值顶回去
+    // ⚠️ 上面那次「用户动过没有」的检查是在 await **之前**做的 —— 等网络这段时间用户完全可能
+    // 已经开始输入，回来后无条件回填就会把他刚敲的数字顶掉（AGENTS 明确禁止）。
+    // 所以合并前再确认一次。
+    if (stateSnapshot() !== knownSnapshot) return
     session.value = s
     applySessionToForm(s)
     markStateKnown()
@@ -393,7 +417,26 @@ async function toggleStatus() {
   await persistStatus('completed', '已标记完成')
 }
 
+/**
+ * 改为进行中。
+ *
+ * ⚠️ 已中止的记录这样做会**永久清空**中止时间与原因（`persistStatus` 里
+ * `status === 'ongoing'` 就清空那几个字段并写库）。家属特意补录的中止原因
+ * 一旦被误触清掉就找不回来了，所以这种情况下必须先确认。
+ */
 async function resumeSession() {
+  const s = session.value
+  if (s && s.status === 'aborted' && (s.abortedAt || s.abortReason || (s.abortTags?.length ?? 0) > 0)) {
+    try {
+      await showConfirmDialog({
+        title: '改为进行中',
+        message: '这条记录已标记中止。改为「进行中」会清空已记录的中止时间与原因，且无法恢复。确认继续？',
+        confirmButtonText: '清空并继续',
+      })
+    } catch {
+      return // 用户取消：保持中止状态不动
+    }
+  }
   await persistStatus('ongoing', '已改为进行中')
 }
 
@@ -625,15 +668,27 @@ async function removeFlow(f: BloodFlow) {
 }
 async function toggleReaction(key: string) {
   if (isReadOnly.value) return // H4：只读成员看得到已有不良反应，但不能改
+  if (savingReactions) return // 上一次整表替换还没落库：再点会并发两次「列表外全删」
+  const before = [...selectedReactions.value]
   const i = selectedReactions.value.indexOf(key)
   if (i >= 0) selectedReactions.value.splice(i, 1)
   else selectedReactions.value.push(key)
-  await persistReactions()
+  const ok = await persistReactions()
+  // 写失败要把勾选还原：界面显示已勾选、云端却没有，家属会以为记上了
+  if (!ok) selectedReactions.value = before
 }
 
-/** 不良反应整表替换（H1）：必须 await + catch，原来连 await 都没有，失败完全无处可见 */
-async function persistReactions() {
-  if (!session.value) return
+/**
+ * 不良反应整表替换（H1）：必须 await + catch，原来连 await 都没有，失败完全无处可见。
+ *
+ * 用 `savingReactions` 串行化：`replaceAdverseReactions` 的语义是「列表之外的全删」，
+ * 两次并发时后到的那次会按自己那份（可能少一个标签的）列表去删 ——
+ * 结果是库里少一项、界面上却显示勾着。
+ * 返回是否写入成功，供调用方回滚界面状态。
+ */
+async function persistReactions(): Promise<boolean> {
+  if (!session.value) return true
+  if (savingReactions) return false
   const list: AdverseReaction[] = selectedReactions.value
     .filter((k) => k !== 'other' || otherDetail.value.trim() !== '')
     .map((k) => ({
@@ -644,7 +699,15 @@ async function persistReactions() {
       severity: null,
       recordedAt: Date.now(),
     }))
-  await tryWrite(() => repository.replaceAdverseReactions(sessionId, list), '不良反应保存失败，请检查网络后重试')
+  savingReactions = true
+  try {
+    return await tryWrite(
+      () => repository.replaceAdverseReactions(sessionId, list),
+      '不良反应保存失败，请检查网络后重试',
+    )
+  } finally {
+    savingReactions = false
+  }
 }
 
 async function onOtherBlur() {
@@ -653,6 +716,7 @@ async function onOtherBlur() {
 }
 
 async function removeSession() {
+  if (deleting.value) return // 连点会弹两个确认框；第二次必然命中 0 行 → 误报「删除失败」
   try {
     await showConfirmDialog({
       title: '删除',
@@ -662,9 +726,14 @@ async function removeSession() {
   } catch {
     return
   }
-  if (!(await tryWrite(() => repository.deleteSession(sessionId), '删除失败，请检查网络后重试'))) return
-  session.value = null
-  router.replace('/')
+  deleting.value = true
+  try {
+    if (!(await tryWrite(() => repository.deleteSession(sessionId), '删除失败，请检查网络后重试'))) return
+    session.value = null
+    router.replace('/')
+  } finally {
+    deleting.value = false
+  }
 }
 </script>
 
@@ -918,7 +987,7 @@ async function removeSession() {
 
       <!-- 删除入口（L3）：放在页面底部危险区，与右上角「报告」图标拉开距离，避免单手误触 -->
       <div v-if="!isReadOnly" class="danger-zone">
-        <van-button block plain type="danger" icon="delete-o" @click="removeSession">删除本条记录</van-button>
+        <van-button block plain type="danger" icon="delete-o" :loading="deleting" :disabled="deleting" @click="removeSession">删除本条记录</van-button>
       </div>
 
     </template>

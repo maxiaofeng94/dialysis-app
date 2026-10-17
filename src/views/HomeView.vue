@@ -13,6 +13,7 @@ import {
 } from '../stores/patient'
 import { isLoggedIn } from '../stores/auth'
 import { cacheVersion } from '../lib/cloudCache'
+import { useSessionExpiryRedirect } from '../lib/sessionExpiry'
 import { todayStr, formatDateCN, fmt, calcAge } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import { uuid } from '../utils/id'
@@ -43,6 +44,10 @@ const WEIGHT_MAX = 200
 function checkRange(value: number, min: number, max: number): boolean {
   return value >= min && value <= max
 }
+
+// 被踢下线 / 令牌失效：仓储会切回本地仓储、页面变成「请先建立病人档案」，
+// 用户会以为档案和记录全丢了 —— 必须明确提示并回登录页（解析见 lib/sessionExpiry.ts）
+useSessionExpiryRedirect()
 
 onMounted(async () => {
   // 只读角色（医生 / 只读成员）的写操作会被 RLS 静默拒绝，界面必须提前隐藏写入口（H4）。

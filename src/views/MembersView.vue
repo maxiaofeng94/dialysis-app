@@ -31,6 +31,12 @@ const canManage = computed(() => currentRole.value === null || currentRole.value
 
 /** 首次加载（本机还没有缓存）时的骨架占位 */
 const loading = ref(true)
+/**
+ * 加载失败提示（H5 同款）：
+ * 只 toast 一下的话，页面留下的会是「暂无成员」—— 用户以为家里人的账号都被移除了，
+ * 可能重复邀请；必须用错误态盖住空态并给「重试」。
+ */
+const loadError = ref('')
 
 onMounted(async () => {
   await load()
@@ -53,12 +59,21 @@ watch(isLoggedIn, (val, old) => {
 async function load() {
   try {
     members.value = await listMembers(currentPatientId.value)
+    loadError.value = ''
   } catch (err) {
     console.error(err)
-    showToast('成员列表加载失败，请检查网络后重试')
+    // 关键：失败必须留下可见的错误态，不能只弹个 toast 就把「暂无成员」留在页面上
+    loadError.value = '成员列表加载失败，请检查网络后重试'
   } finally {
     loading.value = false // 任何情况下都要收掉骨架，否则页面永久白等
   }
+}
+
+/** 失败后手动重试：回到骨架态再拉一次 */
+async function retryLoad() {
+  loading.value = true
+  loadError.value = ''
+  await load()
 }
 
 /** 关闭邀请弹窗（取消/成功后都走这里，避免手机号残留到下一次邀请） */
@@ -169,7 +184,13 @@ async function onRemove(m: MemberInfo) {
       <van-skeleton title :row="4" />
     </div>
 
-    <template v-if="!loading">
+    <!-- 加载失败：必须盖住「暂无成员」，否则用户会以为家里人都被移除了 -->
+    <div v-else-if="loadError" class="card" style="margin-top: 12px">
+      <div class="muted" style="padding: 12px 0">{{ loadError }}</div>
+      <van-button block plain size="small" @click="retryLoad">重试</van-button>
+    </div>
+
+    <template v-else>
     <div class="card">
       <div class="row">
         <div class="card-title" style="margin: 0">成员列表</div>

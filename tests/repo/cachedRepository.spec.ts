@@ -44,7 +44,15 @@ const cloud = vi.hoisted(() => ({
 vi.mock('../../src/lib/cloudRepository', () => ({ cloudRepository: cloud }))
 
 import { cachedCloudRepository } from '../../src/repo/cachedRepository'
-import { cacheGet, cacheSet, cacheKeysByPrefix, cacheClear, cacheVersion, FRESH_MS } from '../../src/lib/cloudCache'
+import {
+  cacheGet,
+  cacheSet,
+  cacheKeysByPrefix,
+  cacheClear,
+  cacheVersion,
+  isBatchRefreshing,
+  FRESH_MS,
+} from '../../src/lib/cloudCache'
 
 /** 直接往缓存 kv 表写原始行：用于精确构造 updatedAt（新鲜 / 过期边界）或制造损坏数据 */
 function putRawRow(key: string, value: string, updatedAt: number): Promise<void> {
@@ -444,6 +452,48 @@ describe('cachedRepository · 批量读取子表（趋势页一次拉回 30 条�
     cloud.listBloodPressuresMany.mockRejectedValue(new Error('查询失败（血压）：Failed to fetch'))
 
     await expect(cachedCloudRepository.listBloodPressuresMany(['s1'])).rejects.toThrow('查询失败')
+  })
+
+  /**
+   * 回归：批量刷新在途时，单条读**不能复用它的返回值** —— 那是整批数据。
+   *
+   * `shareRefresh` 把「在刷」登记到它覆盖的每个 key 上（这是防请求风暴的关键），
+   * 但批量任务的返回值是**整批**：如果单条读直接拿它当自己的值，
+   * 详情页「血压 (N)」就会混进其他透析日的血压 —— 类型相同、语义不同，TS 拦不住。
+   * 触发窗口是弱网下的 1~3 秒，场景就是「趋势页正在加载时点进某条记录」。
+   */
+  it('批量刷新在途时，单条读只能拿到自己那条记录的数据（不能复用整批的返回值）', async () => {
+    let release: (v: unknown[]) => void = () => {}
+    cloud.listBloodPressuresMany.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve as (v: unknown[]) => void
+        }),
+    )
+    cloud.listBloodPressures.mockResolvedValue([makeBp({ id: 'single-s1', sessionId: 's1' })])
+
+    // 趋势页发起批量刷新（在途），此刻详情页读 s1
+    void cachedCloudRepository.listBloodPressuresMany(['s1', 's2'])
+    // 等批量真的把这批 key 登记成「在刷」再继续（注册要经过几轮 IndexedDB 异步）
+    await vi.waitFor(() => {
+      expect(isBatchRefreshing('bps:s1')).toBe(true)
+    })
+
+    const pending = cachedCloudRepository.listBloodPressures('s1')
+    await flushAsync()
+
+    release([
+      makeBp({ id: 'batch-s1', sessionId: 's1' }),
+      makeBp({ id: 'batch-s2', sessionId: 's2' }),
+    ])
+    const got = await pending
+
+    // 核心：s1 的详情页绝不能出现 s2 的血压。
+    // 修复前这里会直接复用批量任务的返回值（整批），于是 s1 页面上混进 s2 的数据 ——
+    // 类型相同、语义不同，TypeScript 拦不住；触发窗口就是弱网下那 1~3 秒。
+    expect(got.map((x) => x.id)).not.toContain('batch-s2')
+    expect(got.every((x) => x.sessionId === 's1')).toBe(true)
+    expect(got).toHaveLength(1)
   })
 
   /**

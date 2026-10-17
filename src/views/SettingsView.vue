@@ -113,6 +113,12 @@ const loading = ref(true)
 const loadError = ref('')
 /** 当前版本：装机后想确认「装的是哪一版」时，不用再翻系统设置 */
 const appVersion = ref('')
+/**
+ * 「我的病人」列表加载失败。
+ * 失败时**绝不能**落到「暂无病人，点『＋ 新建』创建」—— 用户云端明明有病人，
+ * 会照着提示建出重复档案（App 内删不掉，只能上后台/跑 SQL）。
+ */
+const patientsError = ref('')
 
 async function loadAppVersion() {
   if (!Capacitor.isNativePlatform()) {
@@ -137,6 +143,7 @@ onMounted(async () => {
   // 也不能让异常逃出去变成 unhandled rejection —— 更不能影响已经渲染出来的档案表单。
   try {
     myPatients.value = await listMyPatients()
+    patientsError.value = ''
     // 角色决定「病人配置」能不能改（非 owner 的写入会被数据库静默拒绝）
     await refreshCurrentRole()
     const profile = await getMyProfile()
@@ -144,8 +151,21 @@ onMounted(async () => {
     myPhone.value = profile?.phone ?? ''
   } catch (err) {
     console.error(err)
+    // 与「确实没有病人」分开：否则会显示「暂无病人，点新建」诱导用户建重复档案
+    patientsError.value = '病人列表加载失败，请检查网络后重试'
   }
 })
+
+/** 「我的病人」加载失败后的重试（沿用列表本身，不额外造请求） */
+async function retryPatients(): Promise<void> {
+  patientsError.value = ''
+  try {
+    myPatients.value = await listMyPatients()
+  } catch (err) {
+    console.error(err)
+    patientsError.value = '病人列表加载失败，请检查网络后重试'
+  }
+}
 
 /**
  * 重新拉取「我的病人」列表（M2）：
@@ -672,11 +692,24 @@ function showHelp() {
     <div v-if="isLoggedIn" class="card">
       <div class="row">
         <div class="card-title" style="margin: 0">我的病人</div>
-        <van-button size="small" type="primary" plain :loading="creatingPatient" :disabled="creatingPatient" @click="openNewPatient">
+        <van-button
+          size="small"
+          type="primary"
+          plain
+          :loading="creatingPatient"
+          :disabled="creatingPatient || Boolean(patientsError)"
+          @click="openNewPatient"
+        >
           ＋ 新建
         </van-button>
       </div>
-      <div v-if="!myPatients.length" class="muted" style="padding: 10px 0">暂无病人，点「＋ 新建」创建</div>
+      <!-- 失败态必须排在空态前面：否则「拉不到」会被显示成「一个病人都没有」，
+           用户照着提示建重复档案（App 内删不掉） -->
+      <div v-if="patientsError" class="muted" style="padding: 10px 0">
+        {{ patientsError }}
+        <van-button size="mini" plain style="margin-left: 8px" @click="retryPatients">重试</van-button>
+      </div>
+      <div v-else-if="!myPatients.length" class="muted" style="padding: 10px 0">暂无病人，点「＋ 新建」创建</div>
       <div
         v-for="item in myPatients"
         :key="item.patient.id"

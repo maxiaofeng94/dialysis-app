@@ -102,10 +102,16 @@ beforeEach(async () => {
 })
 
 describe('listMyPatients', () => {
-  it('未登录（auth.getSession 没有 session）→ 返回 [] 且不发查询', async () => {
+  /**
+   * 回归：读不到 uid 时**必须抛错**，不能返回 []。
+   * 返回空数组会被上层理解成「这个账号一个病人都没有」→ 首页显示
+   * 「还没有病人档案，去设置新建」→ 用户真的去建一个重复档案（App 内删不掉）。
+   */
+  it('未登录（读不到持久化登录态）→ 抛错，而不是返回「一个病人都没有」', async () => {
     const fake = installFake()
+    state.user = null
 
-    await expect(listMyPatients()).resolves.toEqual([])
+    await expect(listMyPatients()).rejects.toThrow('登录状态读取失败')
 
     expect(fake.calls).toHaveLength(0)
   })

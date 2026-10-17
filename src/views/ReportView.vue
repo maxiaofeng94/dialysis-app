@@ -10,6 +10,7 @@ import { repository } from '../repo'
 import { reactionLabel, SESSION_STATUS_LABEL, abortText } from '../constants'
 import { currentPatientId } from '../stores/patient'
 import { cacheVersion } from '../lib/cloudCache'
+import { useSessionExpiryRedirect } from '../lib/sessionExpiry'
 import { fmt, formatTime, calcAge, formatDateTimeCN } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
@@ -35,6 +36,9 @@ const loading = ref(true)
 const loadError = ref(false)
 /** 分享进行中：防连点（html2canvas 很重，连点会并发跑多次） */
 const sharing = ref(false)
+
+// 被踢下线时仓储会切回本地仓储、报告变成「记录不存在」直接跳首页，必须提示并回登录页
+useSessionExpiryRedirect()
 
 onMounted(load)
 

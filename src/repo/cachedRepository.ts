@@ -11,6 +11,7 @@ import {
   isRefreshing,
   refreshInFlight,
   shareRefresh,
+  WAIT_INFLIGHT_MS,
   FRESH_MS,
 } from '../lib/cloudCache'
 import type {
@@ -45,12 +46,6 @@ const K = {
 }
 
 const cacheFirst = cacheFirstWithRevalidate
-
-/**
- * 批量读取时「等一趟已经在跑的刷新」的上限。
- * 正常弱网下一趟批量请求 1~3 秒就回来了；封顶只是防止请求彻底挂住时把页面一起拖住。
- */
-const WAIT_INFLIGHT_MS = 5000
 
 /** 写入/更新列表缓存中的一条（不存在则插入），并按给定规则排序 */
 async function upsertInto<T extends { id: string }>(

@@ -70,9 +70,17 @@ export async function restorePatientId(): Promise<void> {
  * 清除「当前病人」的本机记忆（登出 / 凭证失效时调用）。
  * 不清的话，下一个在这台设备上登录的账号如果拉取病人列表失败（离线、网络抖动），
  * 会拿着上一个账号的 patientId 命中缓存，显示别人的档案与记录。
+ *
+ * ⚠️ **角色也必须一并作废**：`currentRole` 是「上一个账号对这个病人的权限」，
+ * 留着它会让下一个账号沿用：
+ * - 残留 `viewer`/`doctor` → 创建者登录后被界面锁成「你是只读成员，仅可查看」，
+ *   所有写入口消失，**完全没法记录数据**（弱网下 ensureCloudPatient/refreshCurrentRole
+ *   超时没跑，就会一直用这个残留值）；
+ * - 残留 `owner` → 只读成员登录后看到可写界面，点了写才被 RLS 拒绝。
  */
 export async function clearCurrentPatient(): Promise<void> {
   currentPatientId.value = DEFAULT_PATIENT_ID
+  currentRole.value = null
   try {
     if (isNative) await Preferences.remove({ key: STORAGE_KEY })
     else localStorage.removeItem(STORAGE_KEY)

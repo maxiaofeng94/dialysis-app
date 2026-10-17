@@ -65,7 +65,12 @@ async function edgeHeaders(): Promise<Record<string, string>> {
 /** 当前用户可访问的病人列表（含角色）—— 带本地缓存，先显示再后台刷新 */
 export async function listMyPatients(): Promise<{ patient: Patient; role: string }[]> {
   const uid = await currentUid()
-  if (!uid) return []
+  // ⚠️ 读不到 uid 时必须**抛错**，不能返回空数组：
+  // 调用方会把「空」理解成「这个账号一个病人都没有」——首页显示
+  // 「还没有病人档案，去『设置』新建或上传本地数据」，用户于是真的去建一个重复档案
+  // （App 内删不掉，只能上后台/跑 SQL）。抛错则各处已有的 catch 会把页面显示成
+  // 「加载失败」，那才是对的语义，用户会去重试而不是重建。
+  if (!uid) throw new Error('登录状态读取失败，请重新登录后再试')
   return cacheFirstWithRevalidate(`myPatients:${uid}`, async () => {
     const { data, error } = await supabase!.from('patient_members').select('role, patients(*)').eq('user_id', uid)
     // 读接口必须检查 error：PostgREST 出错时 data 为 null，`(data ?? []).map(...)`

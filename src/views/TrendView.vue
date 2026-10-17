@@ -3,6 +3,7 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { repository } from '../repo'
 import { currentPatientId } from '../stores/patient'
 import { cacheVersion } from '../lib/cloudCache'
+import { useSessionExpiryRedirect } from '../lib/sessionExpiry'
 import { formatTime } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import BaseChart from '../components/BaseChart.vue'
@@ -22,6 +23,9 @@ const loadError = ref(false)
 const bpError = ref(false)
 const gluError = ref(false)
 const retrying = ref(false)
+
+// 被踢下线时仓储会切回本地仓储、页面变成「暂无数据」，必须提示并回登录页
+useSessionExpiryRedirect()
 
 onMounted(load)
 

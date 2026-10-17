@@ -943,6 +943,74 @@ describe('SessionView · H1 写失败必须让用户看见', () => {
 
     expect(repository.replaceAdverseReactions).toHaveBeenCalledTimes(1)
     expect(mocks.showToast).toHaveBeenCalledWith('不良反应保存失败，请检查网络后重试')
+    // 必须把勾选回滚：界面显示已勾选、云端却没有 = 家属以为记上了
+    expect(w.findAll('.chip.active')).toHaveLength(0)
+  })
+
+  /**
+   * 回归（本轮自查）：
+   * 1. 「改为进行中」会**永久清空**中止时间与原因（persistStatus 里 status==='ongoing' 就清），
+   *    已中止的记录必须先二次确认，否则家属补录的原因被误触清掉就找不回来了；
+   * 2. 「医生设定脱水量」原来完全没有量程，填 999999 也能入库，
+   *    报告页会显示「医生设定脱水量 1000.0 L」这种会被当真的荒谬数值；
+   * 3. 删除整条记录没有 in-flight 守卫，连点会弹两个确认框、第二次命中 0 行 →
+   *    误报「删除失败」，而记录其实已经删掉了。
+   */
+  it('已中止的记录点「改为进行中」：先二次确认；取消则不动库、状态保持中止', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'aborted',
+          abortedAt: Date.now() - 3600_000,
+          abortTags: ['hypotension'],
+          abortReason: '低血压',
+        }),
+      }),
+    )
+    vi.mocked(repository.saveSession).mockClear()
+    mocks.showConfirmDialog.mockRejectedValueOnce(new Error('cancel')) // 用户点取消
+
+    await buttonByText(w, '改为进行中').trigger('click')
+    await flushPromises()
+
+    expect(mocks.showConfirmDialog).toHaveBeenCalledTimes(1)
+    expect(repository.saveSession).not.toHaveBeenCalled()
+    expect(w.text()).toContain('低血压') // 中止原因还在
+  })
+
+  it('医生设定脱水量超出量程：不写库并提示', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const w = await mountSession()
+    vi.mocked(repository.saveSession).mockClear()
+
+    const field = w.findAll('.weight-field').find((f) => f.text().includes('医生设定脱水量'))!
+    await field.find('input.weight-input').setValue('999999')
+    await vi.advanceTimersByTimeAsync(400)
+
+    expect(repository.saveSession).not.toHaveBeenCalled()
+    expect(mocks.showToast).toHaveBeenCalledWith('医生设定脱水量需在 0~10000ml 之间（未保存）')
+    vi.useRealTimers()
+  })
+
+  it('删除进行中再点一次「删除本条记录」：只发一次删除请求', async () => {
+    const w = await mountSession()
+    let release: () => void = () => {}
+    vi.mocked(repository.deleteSession).mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          release = () => resolve()
+        }),
+    )
+
+    const btn = buttonByText(w, '删除本条记录')
+    await btn.trigger('click')
+    await flushPromises()
+    await btn.trigger('click') // 第一次还在途，这一下应被守卫拦掉
+    await flushPromises()
+
+    expect(repository.deleteSession).toHaveBeenCalledTimes(1)
+    release()
   })
 
   it('删除整条记录失败：给出提示并留在详情页', async () => {

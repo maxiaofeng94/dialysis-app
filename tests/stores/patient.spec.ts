@@ -116,6 +116,26 @@ describe('clearCurrentPatient', () => {
     await expect(mod.clearCurrentPatient()).resolves.toBeUndefined()
     expect(mod.currentPatientId.value).toBe(DEFAULT_ID)
   })
+
+  /**
+   * 回归：登出只清病人 id、不清角色，下一个账号会沿用上一个账号的角色。
+   *
+   * 后果很实际：A 账号是「只读成员」→ 登出 → B 账号（同一个病人的创建者）登录，
+   * 如果这次 `ensureCloudPatient` / `refreshCurrentRole` 因为弱网超时或守卫跳过而没跑，
+   * 首页/详情页就会拿残留的 viewer 把界面锁成「你是只读成员，仅可查看」——
+   * 创建者**完全无法记录数据**，而且看不出为什么。
+   */
+  it('登出时把角色一并清掉（否则下一个账号会沿用上一个账号的角色）', async () => {
+    const { mod } = await loadPatient({ configured: true, list: async () => [item('p1', 'viewer')] })
+    await mod.ensureCloudPatient()
+    expect(mod.currentRole.value).toBe('viewer')
+    expect(mod.isReadOnly.value).toBe(true)
+
+    await mod.clearCurrentPatient()
+
+    expect(mod.currentRole.value).toBeNull()
+    expect(mod.isReadOnly.value).toBe(false)
+  })
 })
 
 describe('ensureCloudPatient', () => {

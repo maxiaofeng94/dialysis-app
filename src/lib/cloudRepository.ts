@@ -1,4 +1,4 @@
-import { supabase } from './supabase'
+import { supabase, readPersistedUser } from './supabase'
 import { DEFAULT_PATIENT_ID } from '../constants'
 import type { Repository } from '../repo/repository'
 import type {
@@ -310,10 +310,14 @@ class CloudRepository implements Repository {
     // 都会被 RLS 拒绝，而且 PostgREST 只回 204、前端看不出失败。
     // 副作用：B 编辑 A 创建的记录后，记录人显示名会变成 B（语义偏向「最后修改人」）。
     // 要真正区分「创建人 / 最后修改人」得改数据库（新增列 + 触发器），不能只改前端。
-    const {
-      data: { user },
-    } = await this.client().auth.getUser()
-    row.operator_id = user?.id ?? null
+    //
+    // ⚠️ 读本地登录态，**别用 `auth.getUser()`**：它每次都发一趟 `/auth/v1/user`，
+    // 弱网下既慢又可能失败，失败时 operator_id 写成 null 会被 RLS 拒绝 ——
+    // 用户看到的是「保存失败，请检查网络后重试」，填好的体重白填。
+    // （cloudAdmin.currentUid 早就因为同一个原因改成读本地了。）
+    const uid = (await readPersistedUser())?.id
+    if (!uid) throw new Error('登录状态已失效，请重新登录后再试')
+    row.operator_id = uid
     const { error } = await this.client().from('sessions').upsert(row)
     if (error) throw error
   }

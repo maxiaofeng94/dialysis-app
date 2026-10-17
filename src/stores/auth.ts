@@ -66,6 +66,15 @@ async function clearLocalState() {
 /** init() 的重入锁：路由守卫在并发导航时可能同时触发多次，重复注册 onAuthStateChange 会叠加回调 */
 let initPromise: Promise<void> | null = null
 
+/**
+ * 初始化登录态。
+ *
+ * ⚠️ 这个函数**绝不能 reject**，`initialized` 也必须**保证**被置 true：
+ * 守卫里是 `if (!initialized.value) await init()`，而 `initPromise` 是模块级缓存 ——
+ * 一旦它变成 rejected promise，后续每一次导航都会拿到同一个 rejected promise 再抛一次，
+ * 同时 `initialized` 永远停在 false，整个 App 就卡在「导航永远失败」且没有任何提示。
+ * 所以恢复登录态与注册回调各自兜异常，`initialized` 放 finally。
+ */
 async function init(): Promise<void> {
   if (initPromise) return initPromise
   initPromise = (async () => {
@@ -73,24 +82,37 @@ async function init(): Promise<void> {
       initialized.value = true
       return
     }
-    // 超时兜底成 null 而不是一直等：宁可让用户看到登录页，也不能白屏
-    const session = await withTimeout(supabase!.auth.getSession(), INIT_TIMEOUT_MS, null)
-    if (session) {
-      user.value = session.data.session?.user ?? null
-    } else {
-      // 超时了。注意：`getSession()` 正常只读本地存储，需要发网络请求只可能是
-      // 「access token 过期、正在刷新」—— 也就是说本地明明还存着登录态。
-      // 这时候判定「未登录」会把人赶到登录页，他会以为自己被登出，然后在弱网里
-      // 反复重试登录（实测：刷新被挂住时 10 秒后跳登录页）。先按已登录放行：
-      // 真失效了后续请求会 401，onAuthStateChange 会触发 SIGNED_OUT 再清一次。
-      user.value = await readPersistedUser()
+    try {
+      // 超时兜底成 null 而不是一直等：宁可让用户看到登录页，也不能白屏
+      const session = await withTimeout(supabase!.auth.getSession(), INIT_TIMEOUT_MS, null)
+      if (session) {
+        user.value = session.data.session?.user ?? null
+      } else {
+        // 超时了。注意：`getSession()` 正常只读本地存储，需要发网络请求只可能是
+        // 「access token 过期、正在刷新」—— 也就是说本地明明还存着登录态。
+        // 这时候判定「未登录」会把人赶到登录页，他会以为自己被登出，然后在弱网里
+        // 反复重试登录（实测：刷新被挂住时 10 秒后跳登录页）。先按已登录放行：
+        // 真失效了后续请求会 401，onAuthStateChange 会触发 SIGNED_OUT 再清一次。
+        user.value = await readPersistedUser()
+      }
+    } catch (err) {
+      // 恢复登录态这一步失败（存储损坏、getSession 同步抛…）：按未登录放行
+      console.error(err)
+      user.value = null
     }
-    supabase!.auth.onAuthStateChange((event, session) => {
-      user.value = session?.user ?? null
-      // 注意：主动登出也会触发 SIGNED_OUT，这里再清一次是幂等的
-      if (event === 'SIGNED_OUT') void clearLocalState()
-    })
-    initialized.value = true
+    try {
+      supabase!.auth.onAuthStateChange((event, session) => {
+        user.value = session?.user ?? null
+        // 注意：主动登出也会触发 SIGNED_OUT，这里再清一次是幂等的
+        if (event === 'SIGNED_OUT') void clearLocalState()
+      })
+    } catch (err) {
+      // 注册失败只影响「被动登出」的自动响应（后续请求 401 时各页面仍会提示），
+      // 不该因此阻断启动
+      console.error(err)
+    } finally {
+      initialized.value = true
+    }
   })()
   return initPromise
 }

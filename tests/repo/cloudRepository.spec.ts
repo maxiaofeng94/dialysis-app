@@ -16,7 +16,7 @@ import { makeFakeSupabase, type FakeSupabase, type FakeSupabaseOptions } from '.
 import { makePatient, makeDryWeight, makeSession, makeBp, makeBg, makeBf, makeReaction } from '../helpers/factories'
 
 const hoisted = vi.hoisted(() => {
-  const state: { client: unknown } = { client: null }
+  const state: { client: unknown; user: { id: string } | null } = { client: null, user: { id: 'u1' } }
   /** 转发到当前 fake client 的代理：cloudRepository 只在调用时才读 supabase */
   const proxy: unknown = new Proxy(
     {},
@@ -36,6 +36,13 @@ vi.mock('../../src/lib/supabase', () => {
   const mod = fakeSupabaseModule({ configure: true, client: hoisted.proxy as object })
   Object.defineProperty(mod, 'supabase', {
     get: () => (hoisted.state.client ? (hoisted.proxy as object) : null),
+    configurable: true,
+    enumerable: true,
+  })
+  // 登录用户也做成可改写的：saveSession 用 readPersistedUser()（读本地登录态）填 operator_id，
+  // 不再走 auth.getUser() —— 后者每次都要发一趟 /auth/v1/user，弱网下失败会让保存整个失败。
+  Object.defineProperty(mod, 'readPersistedUser', {
+    get: () => async () => hoisted.state.user,
     configurable: true,
     enumerable: true,
   })
@@ -86,12 +93,13 @@ function setupFake(opts: FakeSupabaseOptions = {}): {
 }
 
 /** 让当前登录用户是 u1（saveSession 会读它填 operator_id） */
-function loginAs(fake: FakeSupabase, id = 'u1') {
-  fake.client.auth.getUser.mockResolvedValue({ data: { user: id ? { id } : null }, error: null })
+function loginAs(_fake: FakeSupabase, id: string | null = 'u1') {
+  hoisted.state.user = id ? { id } : null
 }
 
 beforeEach(() => {
   hoisted.state.client = null
+  hoisted.state.user = { id: 'u1' }
 })
 
 describe('cloudRepository · 病人映射（snake_case → camelCase）', () => {
@@ -494,13 +502,13 @@ describe('cloudRepository · saveSession 写入行', () => {
     expect(fake.lastCall('sessions')!.payload.abort_tags).toEqual([])
   })
 
-  it('未登录（getUser 拿不到用户）时 operator_id 写 null，不抛错', async () => {
+  it('登录态读不到时 saveSession 抛错，而不是把 operator_id 写成 null 被 RLS 静默拒绝', async () => {
     const { fake } = setupFake({ tables: { sessions: [] } })
-    fake.client.auth.getUser.mockResolvedValue({ data: { user: null }, error: null })
+    loginAs(fake, null)
 
-    await expect(cloudRepository.saveSession(makeSession({ id: 's1' }))).resolves.toBeUndefined()
-
-    expect(fake.lastCall('sessions')!.payload.operator_id).toBeNull()
+    // 写成 null 会被 sessions_insert 的 with check 拒掉，用户看到的是「保存失败」
+    // 却不知道原因；直接抛错才能让界面给出「登录状态已失效」这种可操作的提示
+    await expect(cloudRepository.saveSession(makeSession({ id: 's1' }))).rejects.toThrow('登录状态已失效')
   })
 
   it('云端报错时 saveSession 必须抛出来（不能静默丢数据）', async () => {

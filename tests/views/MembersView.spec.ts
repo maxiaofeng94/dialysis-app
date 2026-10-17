@@ -463,15 +463,36 @@ describe('MembersView · 缓存刷新', () => {
 })
 
 describe('MembersView · 加载失败与被踢下线', () => {
-  it('成员列表加载失败时给提示并收掉骨架（不永久白等）', async () => {
+  /**
+   * 回归：加载失败**不能**只弹个 toast 就把「暂无成员」留在页面上 ——
+   * 用户会以为家里人的账号都被移除了，可能重复邀请。必须留下错误态 + 重试入口。
+   */
+  it('成员列表加载失败：显示错误态与重试，绝不显示「暂无成员」', async () => {
     vi.mocked(listMembers).mockRejectedValueOnce(new Error('Failed to fetch'))
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
     const w = await mountMembers()
 
     expect(w.findComponent({ name: 'VanSkeleton' }).exists()).toBe(false)
-    expect(mocks.showToast).toHaveBeenCalledWith('成员列表加载失败，请检查网络后重试')
+    expect(w.text()).toContain('成员列表加载失败，请检查网络后重试')
+    expect(w.text()).not.toContain('暂无成员')
+    expect(w.findAll('button').some((b) => b.text().includes('重试'))).toBe(true)
     expect(errSpy).toHaveBeenCalled()
+  })
+
+  it('加载失败后点「重试」能恢复出成员列表', async () => {
+    vi.mocked(listMembers).mockRejectedValueOnce(new Error('Failed to fetch'))
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const w = await mountMembers()
+    expect(w.text()).not.toContain('王五')
+
+    vi.mocked(listMembers).mockResolvedValueOnce([{ userId: 'u9', name: '王五', phone: '13700000000', role: 'caregiver' }])
+    const retry = w.findAll('button').find((b) => b.text().includes('重试'))!
+    await retry.trigger('click')
+    await flushPromises()
+
+    expect(w.text()).toContain('王五')
+    expect(w.text()).not.toContain('成员列表加载失败')
   })
 
   it('被踢下线（isLoggedIn 由 true 变 false）时提示并引导回登录页（M6）', async () => {
