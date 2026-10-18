@@ -96,6 +96,11 @@ export async function clearCurrentPatient(): Promise<void> {
  */
 export async function ensureCloudPatient(): Promise<void> {
   if (!isCloudConfigured) return
+  // 这里的读失败**不抛**：本 store 的约定是「所有失败路径都不能把人卡死」
+  // （见 tests/stores/patient.spec.ts 的文件头注释与对应用例）。
+  // ⚠️ 已知取舍：代价是守卫会把「读失败」当成「校准成功、这个账号没有病人」
+  // （拿到 resolve → synced = true）→ 不再重试。要修它必须连同守卫的失败语义一起改，
+  // 不能只在这里抛错（那会违背既有约定、也会让守卫多一条未处理拒绝）。详见 AGENTS.md。
   const list = await listMyPatients().catch(() => [])
   if (!list.length) {
     currentRole.value = null

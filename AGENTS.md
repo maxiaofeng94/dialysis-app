@@ -68,13 +68,18 @@
 
 - **自己**：逐条回答下面的 5 问，答案写进**评审记录** `.review/answers.md`
   （`npm run review:pass -- --answers .review/answers.md` 会逐条校验 5 问是否有实质答案；
-  门禁**只读这份文件、不读提交信息**，提交信息里写摘要即可 —— 两处都写会造成落点不一致）
+  ⚠️ 落点要说清：`pre-push` 的 `check` 读的是 **`.review/state.json`**（只认 `passedSha == HEAD`），
+  `answers.md` 只在 `review:pass` 那一步被校验一次 —— 所以**改完答案要重跑 `review:pass`**，
+  只编辑 `answers.md` 不会让门禁重新校验。提交信息里写摘要即可）
 - **独立的评审 agent（必须，不能省）**：至少一路，任务是**对抗性审查**（找问题，不是确认它对）。
   自己写的东西自己审有盲区 —— 上面「连漏三次」就是只靠自己看的结果。
   改动大或涉及并发 / 数据一致性时派两路（源码维度 + 测试有效性维度）
   - 如果当前会话是**被委派的子代理**，`subagent` / `subagent_fork` 会因 `depth` 限制不可用；
-    此时改用独立进程起一路评审：把评审要求写成文件，再 `dsh headless "$(cat 要求文件)"`
-    （实测有效：它按「每条必须带佐证」的格式产出了带代码位置与失败用例写法的报告）
+    此时改用独立进程起一路评审：把评审要求写成文件再喂给 `dsh headless`
+    （POSIX：`dsh headless "$(cat 要求文件)"`；Windows PowerShell：`dsh headless (Get-Content 文件 -Raw)`）。
+    实测有效：两轮都按「每条必须带佐证」的格式产出了带代码位置、可复现路径与会失败用例的报告。
+    ⚠️ 若 `dsh` 不在 PATH、或 headless 跑不起来，就**在本轮记录里写明「未做独立评审」并停止推送** ——
+    不允许静默跳过这道门（`SKIP_REVIEW=1` 只用于确实不适用评审的场景）
 
 #### 3.5.2 评审范围
 
@@ -379,7 +384,8 @@ Content-Type: application/json
   就是这个：Web 端一直登录着走冷启动路径，`patientContextUid` 是 undefined，所以看不出来）
   - **四道防线** + `tests/router/router.spec.ts` 的回归用例：
     ①`onLoggedOut()`（订阅写在 `stores/auth` 里）—— 登出即作废，**不依赖有没有导航到 /login**；
-    ②回到登录页就作废 `patientContextUid`；③`currentPatientId` 仍是默认值时一律重新校准；
+    ②回到登录页就作废 `patientContextUid`；③`currentPatientId` 仍是默认值**且本次还没校准成功**时重新校准
+    （注意这个「且」：账号确实一个病人都没有时 pid 会一直是默认值，写成「一律」会让每次导航都重拉病人列表）；
     ④首页在「已登录 + 当前病人是默认 id」时自己补一次校准（防守卫超时/被绕过）
   - 另有两条窄窗口纪律（都是独立评审揪出来的）：
     - ⚠️ **校准途中登出**时守卫不得把旧上下文写回 —— 弱网下 `ensureCloudPatient()` 最长 10 秒，

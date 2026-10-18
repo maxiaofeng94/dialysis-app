@@ -414,27 +414,39 @@ describe('云端模式 · 已登录', () => {
    * 首页查云端短路为空 —— 「重新登录后一条记录都没有」就从这条窄窗口复发。
    */
   it('校准途中登出：守卫不得把旧账号的上下文写回', async () => {
-    const { router, ensureCloudPatient, user } = await loadRouter({
+    const { router, ensureCloudPatient, user, currentPatientId } = await loadRouter({
       configured: true,
       initialized: true,
       user: { id: 'u1' },
     })
-    let release!: () => void
-    ensureCloudPatient.mockImplementation(() => new Promise<void>((r) => (release = r)))
+    let releaseOld!: () => void
+    ensureCloudPatient
+      // 旧账号那次：挂住（模拟弱网下最长 10 秒的窗口）
+      .mockImplementationOnce(() => new Promise<void>((r) => (releaseOld = r)))
+      // 重新登录后的那次：正常完成（别让它落到 10 秒超时，否则用例慢且只证明「又调了一次」）
+      .mockImplementationOnce(async () => {
+        currentPatientId.value = REAL_PATIENT_ID
+      })
 
     const nav = router.push('/') // 故意不 await：让守卫停在校准里
     await vi.waitFor(() => expect(ensureCloudPatient).toHaveBeenCalledTimes(1))
 
     user.value = null // 弱网期间被登出（或被踢下线）
     await flushWatch()
-    release() // 守卫这才拿到校准结果
-    await nav
+
+    // ⚠️ 顺序至关重要：**先**让旧守卫跑完，**再**发起新导航。
+    // 反过来写（先 `go('/trend')` 再 releaseOld）会踩 vue-router 的导航串行：
+    // 新 push 必须等旧守卫返回，而旧守卫正卡在 `withTimeout` 的 10 秒兜底上 ——
+    // 实测该写法耗时 10122ms，全量并发跑时会被拖过用例超时，变成「偶尔红」。
+    releaseOld()
+    await nav // 旧守卫在这里走完写回判断：代次已变 → 不写回
 
     user.value = { id: 'u1' } // 同一账号重新登录
     await go(router, '/trend')
 
-    // 必须重新校准（写回旧上下文的话这里只会是 1 次）
+    // 必须重新校准（若旧守卫写回了旧上下文，这里只会是 1 次）
     expect(ensureCloudPatient).toHaveBeenCalledTimes(2)
+    expect(currentPatientId.value).toBe(REAL_PATIENT_ID)
   })
 
   /**

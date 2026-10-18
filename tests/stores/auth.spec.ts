@@ -71,14 +71,6 @@ function authCallback(client: ReturnType<typeof makeAuthClient>) {
 }
 
 /**
- * init() 的失败路径。
- *
- * `initPromise` 是模块级缓存（防止并发导航重复注册 onAuthStateChange），
- * 守卫里是 `if (!initialized.value) await init()` —— 一旦这个 Promise 变成 rejected，
- * 后续每一次导航都会拿到同一个 rejected promise 再抛一次，而且 `initialized` 永远停在 false：
- * 整个 App 会卡在「导航永远失败」的状态，且没有任何提示。
- */
-/**
  * `onLoggedOut` 的**真实实现**必须被单独覆盖。
  *
  * router 的回归用例把 `onLoggedOut` 整个 mock 掉了（那份 mock 自己重写了一遍
@@ -109,6 +101,14 @@ describe('useAuth · onLoggedOut（登出订阅）', () => {
   })
 })
 
+/**
+ * init() 的失败路径。
+ *
+ * `initPromise` 是模块级缓存（防止并发导航重复注册 onAuthStateChange），
+ * 守卫里是 `if (!initialized.value) await init()` —— 一旦这个 Promise 变成 rejected，
+ * 后续每一次导航都会拿到同一个 rejected promise 再抛一次，而且 `initialized` 永远停在 false：
+ * 整个 App 会卡在「导航永远失败」的状态，且没有任何提示。
+ */
 describe('useAuth · init() 的失败路径', () => {
   it('注册 onAuthStateChange 抛错时：init 不能 reject，也不许把 initialized 卡在 false', async () => {
     const { store, client } = await loadAuth({ session: { user: makeUser('u1') } })

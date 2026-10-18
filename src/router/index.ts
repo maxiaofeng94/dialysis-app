@@ -103,16 +103,20 @@ router.beforeEach(async (to) => {
   if (!initialized.value) await init()
   if (!isCloudConfigured) return true
   if (to.path === '/login') {
-    // 回到登录页（主动登出 / 被踢下线）＝ 病人上下文作废，下次登录必须重新校准
+    // 回到登录页（主动登出 / 被踢下线）＝ 病人上下文作废，下次登录必须重新校准。
+    // ⚠️ 这里与下面那处都要 `patientContextGeneration++`：它们同样是「作废上下文」的语义，
+    // 不参与代次的话，正在 await 的那次校准恢复后仍会把旧上下文写回（评审 A2 指出的语义不一致）。
     if (!isLoggedIn.value) {
       patientContextUid = undefined
       patientContextSynced = false
+      patientContextGeneration++
     }
     return isLoggedIn.value ? '/' : true
   }
   if (!isLoggedIn.value) {
     patientContextUid = undefined
     patientContextSynced = false
+    patientContextGeneration++
     return '/login'
   }
   // 恢复上次选中的病人，并校准到当前账号可访问的病人（首次登录/换账号/重新登录/被移出成员）。
