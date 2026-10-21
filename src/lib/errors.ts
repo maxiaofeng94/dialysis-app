@@ -24,10 +24,34 @@ export class NotFoundError extends Error {
   }
 }
 
+/**
+ * 没有写权限 / 写入被 RLS 拦下。
+ *
+ * 为什么必须与 `ConflictError` 分开：RLS 的 UPDATE 是**静默过滤**（返回 0 行、error 为 null），
+ * 而乐观锁的「版本不匹配」也是 0 行 —— 两者在返回值上完全一样。
+ * 曾经一律判成「已被其他人修改」，于是：
+ * - owner 把成员从 caregiver 降为 viewer（或弱网下拉角色失败、`currentRole` 被置空 = 不限制）；
+ * - 该成员界面上仍可写，点保存 → 看到「重新加载 / 覆盖保存」；
+ * - 点「覆盖保存」还是被 RLS 拒 → **白填一遍数据，而且归因完全错误**（真相是没有权限）。
+ *
+ * 区分方式：0 行时**再读一次那行的 `updated_at`** ——
+ * 若与请求里带的版本**一致**（说明版本没变），却写不进去，那就只能是权限问题。
+ */
+export class PermissionError extends Error {
+  constructor(message = '你没有修改这条内容的权限') {
+    super(message)
+    this.name = 'PermissionError'
+  }
+}
+
 export function isConflictError(err: unknown): boolean {
   return err instanceof Error && err.name === 'ConflictError'
 }
 
 export function isNotFoundError(err: unknown): boolean {
   return err instanceof Error && err.name === 'NotFoundError'
+}
+
+export function isPermissionError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'PermissionError'
 }

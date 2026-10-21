@@ -93,25 +93,39 @@ export async function clearCurrentPatient(): Promise<void> {
  * 校准当前病人（仅云端模式，登录后调用）：
  * - 上次选中的病人不在「我的病人」里（首次登录 / 换账号 / 被移出成员）→ 自动选第一个；
  * - 一个病人都没有 → 保持现状，由页面引导「新建病人」或「上传本地数据」。
+ *
+ * @returns 是否**真的校准成功**。`false` = 列表读失败（离线 / 弱网），此时什么都没改，
+ *   调用方（路由守卫）应把它当成「本次没校准」，下次导航再试。
+ *
+ * ⚠️ 仍然**不抛错** —— 本 store 的约定是「所有失败路径都不能把人卡死」
+ * （见 tests/stores/patient.spec.ts 的文件头注释）。这里只是把结果**告诉**调用方。
+ *
+ * 踩过的坑：这里曾经写成 `listMyPatients().catch(() => [])`，把读失败吞成空列表 →
+ * 守卫拿到 resolve，判成「校准成功、这个账号没有病人」→ **同一会话内不再重试**，
+ * 弱网首屏一直显示「没有病人」，要等下次登出/换账号才恢复 ——
+ * 与「重新登录后一条记录都没有」的症状**难以区分**，这正是它的危险之处。
  */
-export async function ensureCloudPatient(): Promise<void> {
-  if (!isCloudConfigured) return
-  // 这里的读失败**不抛**：本 store 的约定是「所有失败路径都不能把人卡死」
-  // （见 tests/stores/patient.spec.ts 的文件头注释与对应用例）。
-  // ⚠️ 已知取舍：代价是守卫会把「读失败」当成「校准成功、这个账号没有病人」
-  // （拿到 resolve → synced = true）→ 不再重试。要修它必须连同守卫的失败语义一起改，
-  // 不能只在这里抛错（那会违背既有约定、也会让守卫多一条未处理拒绝）。详见 AGENTS.md。
-  const list = await listMyPatients().catch(() => [])
-  if (!list.length) {
-    currentRole.value = null
-    return
-  }
-  const current = list.find((item) => item.patient.id === currentPatientId.value)
-  if (!current) {
-    setCurrentPatientId(list[0].patient.id)
-    currentRole.value = list[0].role
-  } else {
-    currentRole.value = current.role
+export async function ensureCloudPatient(): Promise<boolean> {
+  if (!isCloudConfigured) return true
+  try {
+    const list = await listMyPatients()
+    if (!list.length) {
+      // 真的一个病人都没有 = 校准成功（调用方据此引导「新建病人」）
+      currentRole.value = null
+      return true
+    }
+    const current = list.find((item) => item.patient.id === currentPatientId.value)
+    if (!current) {
+      setCurrentPatientId(list[0].patient.id)
+      currentRole.value = list[0].role
+    } else {
+      currentRole.value = current.role
+    }
+    return true
+  } catch (err) {
+    // 读失败 ≠ 这个账号没有病人。返回 false 让守卫把「已校准」置否，下次导航重试。
+    console.error(err)
+    return false
   }
 }
 

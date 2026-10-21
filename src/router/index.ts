@@ -7,9 +7,8 @@ import SettingsView from '../views/SettingsView.vue'
 import LoginView from '../views/LoginView.vue'
 import MembersView from '../views/MembersView.vue'
 import { useAuth, onLoggedOut } from '../stores/auth'
-import { currentPatientId, restorePatientId, ensureCloudPatient } from '../stores/patient'
+import { restorePatientId, ensureCloudPatient } from '../stores/patient'
 import { isCloudConfigured } from '../lib/supabase'
-import { DEFAULT_PATIENT_ID } from '../constants'
 import { withTimeout } from '../utils/timeout'
 
 const router = createRouter({
@@ -73,11 +72,18 @@ let patientContextGeneration = 0
  * 表现就是「重新登录后一个病人都没有、也看不到任何记录」
  * （Web 端一直登录着走的是冷启动路径，所以看不出来；手机上退出再登录必现）。
  *
- * 所以第二个条件同样重要：当前病人 id 还停在默认值**且这次还没校准成功**时，必须重建。
+ * 所以第二个条件同样重要：**这次没校准成功**（没跑过 / 读失败 / 超时）时必须重建。
+ *
+ * ⚠️ 这里**不能**再叠加「当前病人 id 是默认值」作为条件。曾经的写法是
+ * `!synced && currentPatientId === DEFAULT_PATIENT_ID`，冷启动路径会先 `restorePatientId()`
+ * 恢复出**上次的真实 uuid**，随后 `ensureCloudPatient()` 读失败（不再抛错，返回 false）——
+ * 此时 pid 是真实值、`synced` 是 false，可那个 pid 条件不成立 → **永远不重试**，
+ * 弱网下首屏会一直用旧 pid（档案已被移出成员时就是「一条记录都没有」）。
+ * 「真的一个病人都没有」的情况由 `synced === true` 表达，不需要靠 pid 区分。
  */
 function needsPatientContext(uid: string | null): boolean {
   if (patientContextUid !== uid) return true
-  return !patientContextSynced && currentPatientId.value === DEFAULT_PATIENT_ID
+  return !patientContextSynced
 }
 
 /**
@@ -125,13 +131,10 @@ router.beforeEach(async (to) => {
   if (needsPatientContext(uid)) {
     const generation = patientContextGeneration
     await withTimeout(restorePatientId(), RESTORE_PATIENT_TIMEOUT_MS, undefined)
-    // 用 then(() => true) 把「成功」与「超时」区分开：两者都返回 undefined 的话，
-    // 超时会被误当成校准完成，于是再也不会重试
-    const synced = await withTimeout(
-      ensureCloudPatient().then(() => true),
-      SYNC_PATIENT_TIMEOUT_MS,
-      false,
-    )
+    // `ensureCloudPatient()` 现在自己返回「是否真的校准成功」（读失败 → false），
+    // 所以这里不再需要 `.then(() => true)`：false 与「超时兜底」都会让 synced 为假，
+    // 下次导航会重试。两者必须能区分于「真的没有病人」（那时它返回 true）。
+    const synced = await withTimeout(ensureCloudPatient(), SYNC_PATIENT_TIMEOUT_MS, false)
     // ⚠️ 只有「还是同一代」才写回：这中间可能已经登出（或被踢下线），
     // 那时 onLoggedOut 刚清空上下文，无条件写回等于又填回去 —— 见 patientContextGeneration
     if (generation === patientContextGeneration) {

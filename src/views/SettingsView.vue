@@ -9,7 +9,7 @@ import { Filesystem, Directory, Encoding } from '@capacitor/filesystem'
 import { Share } from '@capacitor/share'
 import { repository } from '../repo'
 import { cacheDelete } from '../lib/cloudCache'
-import { isConflictError, isNotFoundError } from '../lib/errors'
+import { isConflictError, isNotFoundError, isPermissionError } from '../lib/errors'
 import { DEFAULT_RINSE_BACK_ML } from '../constants'
 import {
   currentPatientId,
@@ -421,6 +421,11 @@ async function savePatient(opts: { override?: boolean } = {}) {
     }
     if (isNotFoundError(err)) {
       showToast('这个病人档案已被删除')
+      return
+    }
+    // 没有写权限（被 RLS 拦）：与「冲突」区分开 —— 弹「覆盖保存」也没用，点了照样被拒
+    if (isPermissionError(err)) {
+      showToast('你没有修改这个病人档案的权限，请联系创建者')
       return
     }
     showToast(`保存失败：${errorText(err)}`)

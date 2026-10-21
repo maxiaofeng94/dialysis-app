@@ -8,7 +8,7 @@ import { currentPatientId, isReadOnly, refreshCurrentRole } from '../stores/pati
 import { isLoggedIn } from '../stores/auth'
 import { cacheVersion } from '../lib/cloudCache'
 import { useSessionExpiryRedirect } from '../lib/sessionExpiry'
-import { isConflictError, isNotFoundError } from '../lib/errors'
+import { isConflictError, isNotFoundError, isPermissionError } from '../lib/errors'
 import { todayStr, parseNum, fmt, formatTime, combineDateTime, dateStr, formatDateTimeCN, formatDateCN } from '../utils/format'
 import { getEffectiveDryWeight, calcWeights } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
@@ -327,18 +327,25 @@ async function mergeRemoteIfUntouched() {
  *
  * `force` = true 时忽略「没改动过」的短路（用户已经选了「覆盖保存」，要用最新版本重试一次）。
  * `override` = true 时不带版本条件写入 —— 用户已明确选择「用我的内容盖掉对方的」。
+ * `forLeave` = true 表示正在离开页面：**冲突时不弹选择框**（那时组件即将卸载，
+ *   弹出来用户选什么都无效），改为返回 false 让路由钩子拦住这次离开。
+ *
+ * @returns 是否已经处理妥当（保存成功 / 无需保存 / 冲突已由用户处理完）。
+ *   `false` 只会在 `forLeave` 且发生冲突时出现，或保存失败时出现。
  */
-async function persistSession(opts: { force?: boolean; override?: boolean } = {}): Promise<void> {
-  if (!session.value || !loaded) return
-  if (!opts.force && stateSnapshot() === knownSnapshot) return
+async function persistSession(opts: { force?: boolean; override?: boolean; forLeave?: boolean } = {}): Promise<boolean> {
+  if (!session.value || !loaded) return true
+  if (!opts.force && stateSnapshot() === knownSnapshot) return true
   const rangeTip = formRangeTip()
   if (rangeTip) {
-    // 越界不写库；同一句提示只弹一次，别让每次防抖保存都骚扰用户
-    if (rangeTip !== lastRangeTip) {
+    // 越界不写库；同一句提示只弹一次，别让每次防抖保存都骚扰用户。
+    // ⚠️ 但「离开页面」时**必须每次都提示**：否则第二次点返回会被直接拦下、一个提示都没有，
+    // 用户只会觉得 App 卡死了（数据确实没保存，但"点了没反应"本身是缺陷）。
+    if (opts.forLeave || rangeTip !== lastRangeTip) {
       lastRangeTip = rangeTip
       showToast(`${rangeTip}（未保存）`)
     }
-    return
+    return false
   }
   lastRangeTip = null
   const s = session.value
@@ -359,18 +366,30 @@ async function persistSession(opts: { force?: boolean; override?: boolean } = {}
     // 变成「自己跟自己冲突」，用户会莫名其妙被问「记录已被他人修改」
     if (iso) s.updatedAtIso = iso
     markStateKnown()
+    return true
   } catch (err) {
     console.error(err)
     if (isConflictError(err)) {
+      // 正在离开页面：不能弹选择框（组件马上卸载，用户选什么都无效），让路由钩子拦住离开
+      if (opts.forLeave) return false
       await resolveSaveConflict()
-      return
+      return true
     }
     if (isNotFoundError(err)) {
       showToast('这条记录已被删除')
       router.replace('/')
-      return
+      return true
+    }
+    // 没有写权限（被 RLS 拦）：与「冲突」必须区分开 —— 弹「覆盖保存」也没用，
+    // 点了照样被拒，只会让用户以为自己填的东西「快存上了」而白填一遍。
+    // ⚠️ 这里返回 **true（允许离开）**：权限问题是**永久性**的，重试多少次都不会成功，
+    // 拦住离开只会把用户**卡死在详情页**（每次点返回都被弹回来）。提示一句就放行。
+    if (isPermissionError(err)) {
+      showToast('你没有修改这条记录的权限，请联系创建者')
+      return true
     }
     showToast('保存失败，请检查网络后重试')
+    return false
   }
 }
 
@@ -403,15 +422,40 @@ onBeforeUnmount(() => {
   if (timer) clearTimeout(timer)
 })
 
-// 离开详情页前先等待保存完成，避免列表读到旧状态
+// 离开详情页前先等待保存完成，避免列表读到旧状态。
+// ⚠️ 必须能**拦住**这次离开：改动保存失败或版本冲突时，如果放任导航继续，
+//   详情页组件会被卸载，而此时弹出来的「重新加载 / 覆盖保存」就没有任何意义了 ——
+//   用户选什么都作用不到已卸载的组件上，这次填写直接丢失。
+//   `forLeave: true` 让 persistSession 在冲突时不弹框、只返回 false，由这里拦住并提示。
 onBeforeRouteLeave(async () => {
+  let ok = false
   try {
-    await persistSession()
+    ok = await persistSession({ forLeave: true })
   } catch (err) {
     // persistSession 自己已经兜了一层，这里是保险：漏出来的异常也必须让用户看见，
     // 否则「填了下机后体重 → 点返回」会静默丢数据
     console.error(err)
     showToast('保存失败，请检查网络后重试')
+    return false
+  }
+  if (ok) return true
+
+  // 没能保存：**不能一律拦住**。网络一直不通、或冲突后用户就是想放弃修改离开时，
+  // 一味 `return false` 会把人**永久卡在详情页**（每次点返回都被弹回来，除了杀 App 没别的出路）。
+  // 也不能静默放行 —— 那会丢掉用户刚填的数据。
+  // 所以交给用户决定，并把「会丢什么」写清楚。
+  try {
+    await showConfirmDialog({
+      title: '还有修改没保存',
+      message:
+        '这次修改没能保存（可能网络不通，或这条记录已被其他人改过）。\n\n现在离开会**丢失本次修改**。',
+      confirmButtonText: '仍要离开',
+      cancelButtonText: '留下重试',
+      messageAlign: 'left',
+    })
+    return true // 用户明确选择放弃本次修改
+  } catch {
+    return false // 留着，可以重试
   }
 })
 

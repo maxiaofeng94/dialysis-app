@@ -127,6 +127,29 @@ describe('api · call 的前置校验', () => {
     expect(f).not.toHaveBeenCalled()
   })
 
+  /**
+   * 回归（本轮修）：**HTTP 200 但响应不是 JSON**（网关错误页 / Pages 的 404 兜底页）。
+   *
+   * 原来 `.catch(() => ({}))` 把 body 变成空对象 → `!res.ok` 为假、`body.error` 为空 →
+   * **不抛错**，函数返回 `undefined`；调用方读 `data.items` 直接 TypeError、页面白崩，
+   * 而用户看不到任何有效提示。现在这种响应必须抛 AdminApiError。
+   */
+  it('HTTP 200 但响应不是 JSON → 抛 AdminApiError，不返回 undefined', async () => {
+    withSession({ access_token: 'tok' })
+    stubFetch({
+      ok: true,
+      status: 200,
+      json: async () => {
+        throw new SyntaxError('Unexpected token < in JSON at position 0')
+      },
+    } as unknown as Response)
+
+    const err = await catchError(() => call('stats.overview'))
+
+    expect(err.status).toBe(200)
+    expect(err.message).toContain('不是 JSON')
+  })
+
   it('没有 session 时也触发统一登出回调（否则页面只会停在原地反复报过期）', async () => {
     withSession(undefined)
     const onUnauthorized = vi.fn()

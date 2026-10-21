@@ -886,15 +886,93 @@ describe('SessionView · H1 写失败必须让用户看见', () => {
     vi.useRealTimers()
   })
 
-  it('离开页面时保存失败：toast 提示（原来只 console.error）', async () => {
+  it('离开页面时保存失败：弹确认框（选「留下」→ 留在页面，选「仍要离开」→ 放行）', async () => {
     const w = await mountSession()
+    // 用户点「留下重试」→ showConfirmDialog 以 reject 结束
     vi.mocked(repository.saveSession).mockRejectedValueOnce(new Error('offline'))
+    mocks.showConfirmDialog.mockRejectedValueOnce(new Error('cancel'))
 
     await fieldInput(w, '记录人').setValue('李护士')
     await router.push('/')
     await flushPromises()
 
     expect(mocks.showToast).toHaveBeenCalledWith('保存失败，请检查网络后重试')
+    expect(mocks.showConfirmDialog).toHaveBeenCalledWith(
+      expect.objectContaining({ title: '还有修改没保存', cancelButtonText: '留下重试' }),
+    )
+    // 用户选了「留下重试」→ 必须留在详情页，不能丢数据
+    expect(router.currentRoute.value.path).toBe('/session/session-1')
+  })
+
+  it('离开页面时保存失败：用户选「仍要离开」→ 放行（否则断网时会被永久卡住）', async () => {
+    const w = await mountSession()
+    vi.mocked(repository.saveSession).mockRejectedValueOnce(new Error('offline'))
+    // 用户点「仍要离开」（确认按钮）
+    mocks.showConfirmDialog.mockResolvedValueOnce(undefined as never)
+
+    await fieldInput(w, '记录人').setValue('李护士')
+    await router.push('/')
+    await flushPromises()
+
+    expect(router.currentRoute.value.path).toBe('/')
+  })
+
+  /**
+   * 回归（本轮修）：离开页面时恰好碰上版本冲突。
+   *
+   * 原来 `onBeforeRouteLeave` 里 `await persistSession()` 遇到冲突会走 `resolveSaveConflict()`
+   * 弹「重新加载 / 覆盖保存」——**但钩子没有 return false**，导航继续、详情页组件卸载，
+   * 用户选什么都作用不到已卸载的组件上，这次填写直接丢失。
+   * 现在 `forLeave: true` 让 persistSession 不弹那个（此时无意义的）选择框，
+   * 改由钩子弹「还有修改没保存」的确认框。
+   */
+  it('离开页面时版本冲突：不弹「重新加载/覆盖保存」，改弹「还有修改没保存」并拦住', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({ id: 'session-1', postWeightMeasured: 77, updatedAtIso: '2024-01-10T09:00:00Z' }),
+      }),
+    )
+    vi.mocked(repository.saveSession).mockRejectedValueOnce(
+      Object.assign(new Error('冲突'), { name: 'ConflictError' }),
+    )
+    mocks.showConfirmDialog.mockClear()
+    // 用户点「留下重试」
+    mocks.showConfirmDialog.mockRejectedValueOnce(new Error('cancel'))
+
+    await fieldInput(w, '记录人').setValue('李护士')
+    await router.push('/')
+    await flushPromises()
+
+    // 不能弹「重新加载 / 覆盖保存」——组件即将卸载，弹出来用户选什么都无效
+    expect(mocks.showConfirmDialog).toHaveBeenCalledWith(
+      expect.objectContaining({ title: '还有修改没保存' }),
+    )
+    expect(mocks.showConfirmDialog).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: '这条记录已被其他人修改' }),
+    )
+    expect(router.currentRoute.value.path).toBe('/session/session-1')
+  })
+
+  /**
+   * 回归（本轮修）：没有写权限被 RLS 拦时，不能误报成「已被其他人修改」。
+   * 弹「覆盖保存」是骗人的 —— 点了还是被拒，用户白填一遍。
+   * 而且**必须允许离开**：权限问题是永久性的，拦住离开会把用户卡死在详情页出不去。
+   */
+  it('没有写权限时提示「联系创建者」，不弹「覆盖保存」，且允许离开', async () => {
+    const w = await mountSession()
+    vi.mocked(repository.saveSession).mockRejectedValue(
+      Object.assign(new Error('无权限'), { name: 'PermissionError' }),
+    )
+    mocks.showConfirmDialog.mockClear()
+    mocks.showToast.mockClear()
+
+    await fieldInput(w, '记录人').setValue('李护士')
+    await vi.waitFor(() => expect(mocks.showToast).toHaveBeenCalledWith(expect.stringContaining('没有修改')))
+    expect(mocks.showConfirmDialog).not.toHaveBeenCalled()
+
+    // 离开不能被拦住 —— 否则只读成员每次点返回都会被弹回来
+    await router.push('/')
+    await flushPromises()
     expect(router.currentRoute.value.path).toBe('/')
   })
 
@@ -1508,6 +1586,34 @@ describe('SessionView · M6 数值量程校验', () => {
     expect(mocks.showToast).toHaveBeenCalledTimes(1)
     expect(mocks.showToast).toHaveBeenCalledWith('下机后体重需在 20~200kg 之间（未保存）')
     vi.useRealTimers()
+  })
+
+  /**
+   * 回归（本轮修）：越界时**离开页面要每次都提示**。
+   *
+   * 提示去重（`rangeTip !== lastRangeTip`）本来是为了别让每次防抖保存都骚扰用户，
+   * 但它把「离开时被拦下」也一起静默了：第二次点返回会被 `return false` 拦下、一个提示都没有，
+   * 用户只会觉得 App 卡死了。所以离开时（`forLeave`）必须绕过这个去重。
+   */
+  it('越界后离开页面：每次点返回都有提示（第二次起不能静默拦下）', async () => {
+    // 先让一次防抖保存跑起来，把「同一条提示只弹一次」的去重状态置上 ——
+    // 否则这条用例守不住：lastRangeTip 还是空的，无论有没有 forLeave 都会弹
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const w = await mountSession()
+    await weightInputs(w)[1].setValue('5') // 越界（下机后体重需 20~200kg）
+    await vi.advanceTimersByTimeAsync(400)
+    expect(mocks.showToast).toHaveBeenCalledWith(expect.stringContaining('未保存'))
+    vi.useRealTimers()
+    expect(router.currentRoute.value.path).toBe('/session/session-1')
+
+    // 第二次尝试离开：仍然必须有提示，且用户选「留下重试」→ 留在页面
+    mocks.showToast.mockClear()
+    mocks.showConfirmDialog.mockRejectedValueOnce(new Error('cancel'))
+    await router.push('/')
+    await flushPromises()
+
+    expect(mocks.showToast).toHaveBeenCalledWith(expect.stringContaining('未保存'))
+    expect(router.currentRoute.value.path).toBe('/session/session-1')
   })
 
   it('量程内的体重照常保存（不能把正常输入也拦掉）', async () => {

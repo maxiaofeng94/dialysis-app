@@ -86,7 +86,19 @@ export async function call<T>(action: string, payload: Record<string, unknown> =
     // 断网 / DNS 失败 / 被拦截 / 超时：浏览器只给 TypeError，转成中文提示
     throw new AdminApiError('网络连接失败，请检查网络后重试', 0)
   }
-  const body = (await res.json().catch(() => ({}))) as { error?: string; data?: T; warning?: string }
+  // ⚠️ 解析失败必须区分「HTTP 失败」与「HTTP 成功但返回的不是 JSON」。
+  // 后者常见于网关/代理直接回 200 + HTML（Cloudflare 错误页、404 兜底页）：
+  // 原来 `.catch(() => ({}))` 把 body 变成空对象 → `!res.ok` 为假、`body.error` 为空 →
+  // **不抛错**，函数返回 `undefined`，调用方读 `data.items` 直接 TypeError、页面白崩，
+  // 而用户什么有效提示都看不到。
+  let body: { error?: string; data?: T; warning?: string }
+  try {
+    body = (await res.json()) as typeof body
+  } catch {
+    if (res.ok) throw new AdminApiError('服务返回异常（响应不是 JSON），请稍后重试或联系管理员', res.status)
+    // HTTP 本来就失败 → 拿不到 JSON 很正常，交给下面的统一错误分支
+    body = {}
+  }
 
   // 登录凭证失效：交给 auth.ts 统一登出并回到登录页，避免页面反复报错却停在原地
   if (res.status === 401) unauthorizedHandler?.()

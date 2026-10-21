@@ -575,6 +575,56 @@ describe('cloudRepository · 乐观锁（多人同时编辑同一条记录）', 
     })
   })
 
+  /**
+   * 回归（本轮修）：RLS 静默过滤 vs 版本冲突 —— 返回值一模一样（0 行 + error 为 null）。
+   *
+   * 曾经一律判成「已被其他人修改」，于是被降权 / 拉不到角色的成员会看到
+   * 「重新加载 / 覆盖保存」，点「覆盖保存」还是被 RLS 拒 —— 白填一遍数据，归因完全错误。
+   * 现在 0 行时连 `updated_at` 一起读回来比对：**版本没变却写不进去 = 没有写权限**。
+   */
+  it('0 行且版本没变（updated_at 与我带的相同）→ 抛 PermissionError，不是 ConflictError', async () => {
+    // 手工造一个「update 命中 0 行、但行仍可读且版本未变」的 client（模拟 RLS 静默过滤）
+    hoisted.state.client = {
+      ...makeAuthClient(),
+      from: () => ({
+        update: () => ({
+          eq: () => ({
+            eq: () => ({ select: async () => ({ data: [], error: null }) }),
+          }),
+        }),
+        select: () => ({
+          eq: () => ({ maybeSingle: async () => ({ data: { id: 's1', updated_at: IRS }, error: null }) }),
+        }),
+      }),
+    }
+
+    await expect(cloudRepository.saveSession(makeSession({ id: 's1' }), IRS)).rejects.toMatchObject({
+      name: 'PermissionError',
+    })
+  })
+
+  it('0 行但版本确实变了 → 仍然抛 ConflictError（别把真冲突误判成权限问题）', async () => {
+    hoisted.state.client = {
+      ...makeAuthClient(),
+      from: () => ({
+        update: () => ({
+          eq: () => ({
+            eq: () => ({ select: async () => ({ data: [], error: null }) }),
+          }),
+        }),
+        select: () => ({
+          eq: () => ({
+            maybeSingle: async () => ({ data: { id: 's1', updated_at: '2024-05-01T11:00:00.000000+00:00' }, error: null }),
+          }),
+        }),
+      }),
+    }
+
+    await expect(cloudRepository.saveSession(makeSession({ id: 's1' }), IRS)).rejects.toMatchObject({
+      name: 'ConflictError',
+    })
+  })
+
   it('不带版本号（新建记录）：沿用 upsert，不做冲突判定', async () => {
     const { fake } = setupFake({ tables: { sessions: [] } })
     loginAs(fake)

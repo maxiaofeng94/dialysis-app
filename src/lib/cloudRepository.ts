@@ -1,5 +1,5 @@
 import { supabase, readPersistedUser } from './supabase'
-import { ConflictError, NotFoundError } from './errors'
+import { ConflictError, NotFoundError, PermissionError } from './errors'
 import { DEFAULT_PATIENT_ID } from '../constants'
 import type { Repository } from '../repo/repository'
 import type {
@@ -282,14 +282,22 @@ class CloudRepository implements Repository {
     if (error) throw error
 
     if (!data?.length) {
+      // 0 行有两种原因，返回值一模一样（RLS 静默过滤：0 行 + error 为 null）：
+      //   ① 版本已变（别人先保存了）→ 真冲突，让用户选「重新加载 / 覆盖保存」
+      //   ② 版本没变却写不进去 → 只能是**没有写权限**（被 RLS 拦）
+      // 所以这里必须把 updated_at 一起读回来比对，不能一律报「已被其他人修改」——
+      // 否则被降权的成员会看到「覆盖保存」，点了还是被拒，白填一遍数据。
       const { data: exists, error: checkError } = await this.client()
         .from('patients')
-        .select('id')
+        .select('id, updated_at')
         .eq('id', patient.id)
         .maybeSingle()
       if (checkError) throw checkError
       // 同 saveSession：查不到也可能是被 RLS 过滤，别写死「已被删除」
       if (!exists) throw new NotFoundError('这个病人档案不存在，或你已无权访问')
+      if ((exists as { updated_at: string }).updated_at === expectedUpdatedAt) {
+        throw new PermissionError('你没有修改这个病人档案的权限，请联系创建者')
+      }
       throw new ConflictError('病人档案已被其他人修改')
     }
 
@@ -381,17 +389,24 @@ class CloudRepository implements Repository {
     if (error) throw error
 
     if (!data?.length) {
-      // 命中 0 行：要么别人改过（版本变了），要么这条已经被删了。
-      // 两者给用户的引导完全不同，所以再查一次把「不存在」分辨出来。
+      // 命中 0 行有三种可能，返回值一模一样（RLS 静默过滤：0 行 + error 为 null）：
+      //   ① 别人改过（版本变了）→ 真冲突
+      //   ② 这条真的被删了
+      //   ③ 版本没变却写不进去 → **没有写权限**（被 RLS 拦）
+      // ③ 曾经被误判成 ①：用户看到「覆盖保存」，点了还是被拒，白填一遍数据。
+      // 所以这里要把 updated_at 一起读回来比版本，才能区分 ① 和 ③。
       const { data: exists, error: checkError } = await this.client()
         .from('sessions')
-        .select('id')
+        .select('id, updated_at')
         .eq('id', session.id)
         .maybeSingle()
       if (checkError) throw checkError
       // 查不到有两种可能：真被删了，或**被 RLS 过滤**（不再是成员 / 权限被收回）。
       // 文案不要写死「已被删除」—— 用户会去问「谁删的」，而实际只是没有权限了。
       if (!exists) throw new NotFoundError('这条记录不存在，或你已无权访问')
+      if ((exists as { updated_at: string }).updated_at === expectedUpdatedAt) {
+        throw new PermissionError('你没有修改这条记录的权限，请联系创建者')
+      }
       throw new ConflictError()
     }
 

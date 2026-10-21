@@ -58,8 +58,10 @@ async function loadRouter(scenario: Scenario = {}) {
   const restorePatientId = vi.fn(async () => {})
   const currentPatientId = ref(scenario.patientId ?? 'patient-default')
   const ensureCloudPatient = vi.fn(async () => {
-    // 真实实现：校准成功后 currentPatientId 会被设成真实 uuid（不是本地默认 id）
+    // 真实实现：校准成功后 currentPatientId 会被设成真实 uuid（不是本地默认 id），
+    // 并返回 true —— 只有「列表读失败」才返回 false，守卫据此决定下次导航是否重试
     currentPatientId.value = REAL_PATIENT_ID
+    return true
   })
 
   vi.doMock('../../src/stores/auth', async () => {
@@ -363,9 +365,12 @@ describe('云端模式 · 已登录', () => {
       initialized: true,
       user: { id: 'u1' },
     })
-    // 模拟「这个账号没有病人」：校准跑完但当前病人仍是默认值
-    ensureCloudPatient.mockImplementation(async () => {})
-    currentPatientId.value = 'patient-default'
+    // 模拟「这个账号确实没有病人」：**校准成功**（返回 true）但当前病人仍是默认值。
+    // 注意必须返回 true —— 返回 false/undefined 会被当成「读失败」，那是要重试的另一种情况。
+    ensureCloudPatient.mockImplementation(async () => {
+      currentPatientId.value = 'patient-default'
+      return true
+    })
 
     await go(router, '/')
     await go(router, '/trend')
@@ -373,6 +378,62 @@ describe('云端模式 · 已登录', () => {
 
     expect(ensureCloudPatient).toHaveBeenCalledTimes(1)
     expect(user.value).toEqual({ id: 'u1' })
+  })
+
+  /**
+   * 回归（本轮新修）：**读取病人列表失败**时不能算「已校准」。
+   *
+   * 曾经 `ensureCloudPatient` 用 `listMyPatients().catch(() => [])` 把读失败吞成空列表，
+   * 守卫拿到 resolve 就判成「校准成功、这个账号没有病人」→ 同一会话内不再重试，
+   * 弱网下首屏一直显示「没有病人」，要等下次登出/换账号才恢复 ——
+   * 与「重新登录后一条记录都没有」的症状难以区分。
+   * 现在它返回 false，守卫把 `synced` 置否 → 下次导航重试。
+   */
+  it('读取病人列表失败时不算校准成功：下次导航会重试', async () => {
+    const { router, ensureCloudPatient, currentPatientId } = await loadRouter({
+      configured: true,
+      initialized: true,
+      user: { id: 'u1' },
+    })
+    // 第一次：读失败（弱网）。注意**不改 pid**，模拟真实实现「什么都没做」的行为。
+    ensureCloudPatient.mockImplementationOnce(async () => false)
+    currentPatientId.value = 'patient-default'
+
+    await go(router, '/')
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(1)
+
+    // 第二次导航：上次没校准成功 → 必须重试（否则弱网下会一直认为「没有病人」）
+    ensureCloudPatient.mockImplementationOnce(async () => {
+      currentPatientId.value = REAL_PATIENT_ID
+      return true
+    })
+    await go(router, '/trend')
+
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(2)
+    expect(currentPatientId.value).toBe(REAL_PATIENT_ID)
+  })
+
+  /**
+   * 冷启动路径的窄窗口：`restorePatientId()` 会先恢复出**上次的真实 uuid**，
+   * 随后读列表失败。此时 pid 不是默认值 —— 若「是否要重试」还依赖 pid === 默认值，
+   * 就永远不会重试（这正是本轮把那个条件删掉的原因）。
+   */
+  it('冷启动时 pid 已被恢复成真实 uuid、但读列表失败 → 仍然重试', async () => {
+    const { router, ensureCloudPatient, currentPatientId } = await loadRouter({
+      configured: true,
+      initialized: true,
+      user: { id: 'u1' },
+      patientId: REAL_PATIENT_ID, // 冷启动：restorePatientId 恢复出上次的真实病人
+    })
+    ensureCloudPatient.mockImplementationOnce(async () => false)
+
+    await go(router, '/')
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(1)
+    // pid 仍是恢复出来的真实 uuid（读失败时什么都没改）
+    expect(currentPatientId.value).toBe(REAL_PATIENT_ID)
+
+    await go(router, '/trend')
+    expect(ensureCloudPatient).toHaveBeenCalledTimes(2)
   })
 
   /**
@@ -455,7 +516,22 @@ describe('云端模式 · 已登录', () => {
    * 这里做静态断言而不是真等 10 秒超时（那会让整个套件慢十几秒）。
    */
   it('守卫把「成功」与「超时」区分开（超时不算校准成功）', () => {
-    expect(read('src/router/index.ts')).toMatch(/ensureCloudPatient\(\)\.then\(\(\) => true\)/)
-    expect(read('src/router/index.ts')).toMatch(/patientContextSynced = synced/)
+    const src = read('src/router/index.ts')
+    // `ensureCloudPatient()` 自身返回「是否真的校准成功」；`withTimeout` 的兜底值是 false，
+    // 所以「读失败」与「超时」都会让 synced 为假 → 下次导航重试。
+    expect(src).toMatch(/withTimeout\(ensureCloudPatient\(\),\s*SYNC_PATIENT_TIMEOUT_MS,\s*false\)/)
+    expect(src).toMatch(/patientContextSynced = synced/)
+  })
+
+  /**
+   * 「是否要重试」不能依赖 `currentPatientId === 默认值`：
+   * 冷启动会先恢复出真实 uuid，读失败后 pid 仍是真实值，那个条件会让重试永远不发生。
+   * 这里做静态断言，防止将来有人"顺手加回去"。
+   */
+  it('needsPatientContext 只看「上次是否真的校准成功」，不看 pid 是不是默认值', () => {
+    const src = read('src/router/index.ts')
+    const fn = src.slice(src.indexOf('function needsPatientContext'), src.indexOf('function needsPatientContext') + 260)
+    expect(fn).toMatch(/return !patientContextSynced/)
+    expect(fn).not.toMatch(/DEFAULT_PATIENT_ID/)
   })
 })

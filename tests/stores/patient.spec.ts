@@ -188,7 +188,7 @@ describe('ensureCloudPatient', () => {
     expect(setItem).not.toHaveBeenCalled()
   })
 
-  it('listMyPatients 抛错（离线/网络抖动）→ 不崩、保持现状', async () => {
+  it('listMyPatients 抛错（离线/网络抖动）→ 不崩、保持现状，并返回 false 告诉调用方「没校准」', async () => {
     const { mod } = await loadPatient({
       configured: true,
       list: async () => {
@@ -197,7 +197,9 @@ describe('ensureCloudPatient', () => {
     })
     mod.currentPatientId.value = 'kept'
 
-    await expect(mod.ensureCloudPatient()).resolves.toBeUndefined()
+    // 返回 false（而不是抛错）：守卫据此把「已校准」置否，下次导航重试。
+    // 曾经这里返回 resolve，守卫会误判成「校准成功、没有病人」→ 同一会话内不再重试。
+    await expect(mod.ensureCloudPatient()).resolves.toBe(false)
     expect(mod.currentPatientId.value).toBe('kept')
   })
 
