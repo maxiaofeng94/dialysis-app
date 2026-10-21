@@ -120,4 +120,27 @@ describe('CI 门禁 · 调用方都真的被挡住', () => {
       expect(doc.jobs.test.secrets, `${file} 的 test job 没有 secrets: inherit`).toBe('inherit')
     }
   })
+
+  /**
+   * 回归（本轮修）：**上传 APK 后必须校验资产**。
+   *
+   * 原来的写法把上传结果直接管给 jq：`curl … | jq -r '"已上传：" + (.name // "失败")'`。
+   * 上传失败时 curl 返回错误 JSON、jq 仍**退出 0**，pipeline 的退出码取最后一个命令，
+   * 于是 `set -euo pipefail` 也拦不住 —— release 建好了、APK 资产没上去、**step 却是 success**，
+   * 而手机直链 404。真踩过：Build APK #24 显示成功，releases 列表却是空的。
+   */
+  it('build-apk 上传 APK 后必须校验资产（否则上传失败也显示 success，直链 404）', () => {
+    const src = readFileSync(join(WF_DIR, 'build-apk.yml'), 'utf8')
+
+    // 必须把上传响应落到变量并显式判空
+    expect(src, '上传响应没有落到变量，无法校验').toMatch(/UP_NAME=/)
+    expect(src, '上传失败没有报错退出').toMatch(/上传 APK 失败/)
+    // 还要回查一次资产大小，防止「release 在、资产空」
+    expect(src, '没有回查 release 资产大小').toMatch(/ASSET_SIZE=/)
+
+    // 禁止退回「直接 pipe 给 jq」的写法
+    expect(src, '上传结果又被直接管给 jq 了（pipeline 退出码会掩盖失败）').not.toMatch(
+      /assets\?name=\$NAME"\s*\\\s*\| jq -r/,
+    )
+  })
 })

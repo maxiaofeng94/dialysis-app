@@ -231,10 +231,28 @@ jobs:
             exit 1
           fi
 
-          curl -sS -X POST -H "$AUTH" -H "Content-Type: application/vnd.android.package-archive" \
+          # ⚠️ 上传**必须**校验结果。原来的写法是 `curl … | jq -r '"已上传：" + (.name // "失败")…'` ——
+          # 上传失败时 curl 返回错误 JSON、jq 仍**退出 0**；pipeline 退出码取最后一个命令，
+          # 所以 `set -euo pipefail` 也拦不住。结果：release 建好了、APK 资产没上去、
+          # **step 却显示 success**，而手机直链 404（真踩过：#24 之后 releases 列表是空的）。
+          UP=$(curl -sS -X POST -H "$AUTH" -H "Content-Type: application/vnd.android.package-archive" \
             --data-binary @"$APK" \
-            "https://uploads.github.com/repos/$REPO/releases/$REL_ID/assets?name=$NAME" \
-            | jq -r '"已上传：" + (.name // "失败") + "  " + ((.size // 0) | tostring) + " bytes"'
+            "https://uploads.github.com/repos/$REPO/releases/$REL_ID/assets?name=$NAME")
+          UP_NAME=$(echo "$UP" | jq -r '.name // empty')
+          if [ -z "${UP_NAME:-}" ]; then
+            echo "::error title=上传 APK 失败::$(echo "$UP" | jq -r '.message // .error // "unknown"')"
+            exit 1
+          fi
+          echo "已上传：$UP_NAME"
+
+          # 再回查一次资产大小：确认直链真的能下载，而不是「release 在、资产空」
+          ASSET_SIZE=$(curl -sS -H "$AUTH" -H "$ACCEPT" "$API/releases/$REL_ID/assets" \
+            | jq -r '[.[] | select(.name == "'"$NAME"'")][0].size // 0')
+          if [ "${ASSET_SIZE:-0}" -le 0 ]; then
+            echo "::error title=Release 资产为空::release 建好了但 $NAME 没上传成功（直链会 404）"
+            exit 1
+          fi
+          echo "资产大小：$ASSET_SIZE bytes"
 
           {
             echo "### 📱 APK 已发布"
