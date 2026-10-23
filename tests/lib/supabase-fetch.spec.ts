@@ -10,7 +10,7 @@
  *   2. 写入请求（POST）与超时中止（请求可能已经被服务端处理）一律不重试。
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { resilientFetch, REQUEST_TIMEOUT_MS } from '../../src/lib/supabase'
+import { resilientFetch, classifyReachability, REQUEST_TIMEOUT_MS } from '../../src/lib/supabase'
 
 /** 一个「连接失败」：fetch 在网络层失败时抛的就是 TypeError */
 function connectionError() {
@@ -135,5 +135,37 @@ describe('resilientFetch · 超时', () => {
     await resilientFetch('https://example.test/rest/v1/fast')
 
     expect(clearSpy).toHaveBeenCalled()
+  })
+})
+
+/**
+ * 可达性归类（纯函数）。
+ *
+ * 为什么单独测这个：这段判断原来写在 `preflightCloud` 里，而它在测试环境会被
+ * `isCloudConfigured === false` 早退、视图层又把 `preflightCloud` 整个 mock 掉了 ——
+ * 等于**没有任何测试**（把判据写反，全量一条都不会红）。
+ *
+ * 最重要的那条是第 4 条：**探测成功必须覆盖 `navigator.onLine` 的误报**。
+ * `navigator.onLine` 只是网络变更事件的快照，切 Wi-Fi↔移动数据瞬间 / 后台回前台 / VPN
+ * 时都可能陈旧。曾经（错误地）在 onLine === false 时直接早退、连探测都不发，
+ * 结果「手机当前没有联网」会永久显示，点「重新检测」也出不来 —— 比泛化提示更糟。
+ */
+describe('classifyReachability · 可达性归类', () => {
+  it('探测失败 + 本机明确没网 → offline（提示去开网络）', () => {
+    expect(classifyReachability(false, 'fail')).toBe('offline')
+  })
+
+  it('探测失败 + 本机有网 → unreachable（提示线路/换网络，别叫人检查移动数据）', () => {
+    expect(classifyReachability(true, 'fail')).toBe('unreachable')
+  })
+
+  it('探测失败 + 拿不到 onLine（iOS/桌面）→ unreachable（保守，不谎称没网）', () => {
+    expect(classifyReachability(undefined, 'fail')).toBe('unreachable')
+  })
+
+  it('探测成功 → ok（哪怕 onLine 报 false：陈旧的 onLine 必须被真实探测纠正）', () => {
+    expect(classifyReachability(false, 'ok')).toBe('ok')
+    expect(classifyReachability(true, 'ok')).toBe('ok')
+    expect(classifyReachability(undefined, 'ok')).toBe('ok')
   })
 })

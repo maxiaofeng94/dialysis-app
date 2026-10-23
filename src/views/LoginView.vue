@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast } from 'vant'
 import { useAuth } from '../stores/auth'
@@ -27,14 +27,42 @@ const submitting = ref(false)
  * - 不通：在他输完手机号之前就把原因说清楚，并给「重新检测」，
  *   而不是等他填完、点下去、再等满 15 秒 × 3 次重试。
  */
-const netState = ref<'checking' | 'ok' | 'fail'>('checking')
+const netState = ref<'checking' | 'ok' | 'offline' | 'unreachable'>('checking')
+/**
+ * 上一轮的失败态。**重新检测期间要保留提示** —— 否则点一下按钮，警告块会整个消失、
+ * 最多 8 秒后才回来，这段时间用户完全不知道发生了什么。
+ */
+const lastFail = ref<'offline' | 'unreachable' | null>(null)
+/** 探测进行中：用于禁用「重新检测」，避免连点并发探测（最后 resolve 的赢，结果不可预期） */
+const checking = ref(false)
 /** 重试进行中的提示（登录最多要跑 3 次、每次 15 秒超时，没反馈用户会以为卡死） */
 const retryTip = ref('')
 
+/**
+ * 当前网络类型。只有 Android WebView 的 `navigator.connection` 提供，
+ * iOS / 桌面为 undefined → 用中性措辞。
+ * 为什么需要它：「先连 Wi-Fi 试试」对**本来就在 Wi-Fi 上**的用户是自相矛盾的，
+ * 说明文案必须按当前网络类型分支，不能假定一定是移动数据。
+ */
+const netKind = computed<'cellular' | 'wifi' | 'unknown'>(() => {
+  const conn = (navigator as unknown as { connection?: { type?: string } }).connection
+  const t = conn?.type
+  return t === 'cellular' || t === 'wifi' ? t : 'unknown'
+})
+
 async function checkNetwork(): Promise<void> {
-  if (!cloudConfigured) return
+  if (!cloudConfigured || checking.value) return
+  checking.value = true
+  const prev = lastFail.value
   netState.value = 'checking'
-  netState.value = (await preflightCloud()) ? 'ok' : 'fail'
+  lastFail.value = prev // 保留上一轮结论，让模板在检测期间仍能显示提示
+  try {
+    const result = await preflightCloud()
+    netState.value = result
+    lastFail.value = result === 'ok' ? null : result
+  } finally {
+    checking.value = false
+  }
 }
 
 /**
@@ -230,10 +258,38 @@ async function onSubmit() {
         当前是本地单机模式（未配置云端），无需登录，返回即可直接使用
       </div>
 
-      <!-- 网络预检（移动数据下最容易遇到）：连不上就先说清楚，别让用户填完再等 45 秒 -->
-      <div v-else-if="netState === 'fail'" class="login-warn">
-        <div class="login-warn-text">当前网络连不上服务器，请检查手机移动数据 / Wi-Fi 后重试</div>
-        <button class="login-warn-retry" type="button" @click="checkNetwork">重新检测</button>
+      <!-- 网络预检（移动数据下最容易遇到）：连不上就先说清楚，别让用户填完再等 45 秒。
+           两种原因分开说 —— 对「手机没网」说「检查移动数据」是对的；
+           但对「有网却到不了服务器」（运营商 DNS/IPv6/拦截），再说「检查移动数据」就是误导，
+           用户会反复开关数据也解决不了。
+           检测中（netState === 'checking'）保留上一轮的提示，避免警告块闪没、期间零反馈。 -->
+      <div
+        v-else-if="netState === 'offline' || (netState === 'checking' && lastFail === 'offline')"
+        class="login-warn"
+      >
+        <div class="login-warn-text">手机当前没有联网，请打开移动数据或连接 Wi-Fi 后重试</div>
+        <button class="login-warn-retry" type="button" :disabled="checking" @click="checkNetwork">
+          {{ checking ? '检测中…' : '重新检测' }}
+        </button>
+      </div>
+      <div
+        v-else-if="netState === 'unreachable' || (netState === 'checking' && lastFail === 'unreachable')"
+        class="login-warn"
+      >
+        <div class="login-warn-text">
+          <template v-if="netKind === 'cellular'">
+            手机有网络，但连不上服务器（可能是当前运营商的线路限制）。可以先连 Wi-Fi 试试，或稍后重试。
+          </template>
+          <template v-else-if="netKind === 'wifi'">
+            手机有网络，但连不上服务器。可以换回移动数据试试，或稍后重试。
+          </template>
+          <template v-else>
+            手机有网络，但连不上服务器。换一种网络（Wi-Fi ↔ 移动数据）再试，或稍后重试。
+          </template>
+        </div>
+        <button class="login-warn-retry" type="button" :disabled="checking" @click="checkNetwork">
+          {{ checking ? '检测中…' : '重新检测' }}
+        </button>
       </div>
 
       <van-field v-model="phone" type="tel" maxlength="11" label="手机号" placeholder="请输入手机号" />

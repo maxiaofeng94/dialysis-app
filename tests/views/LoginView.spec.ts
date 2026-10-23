@@ -24,7 +24,7 @@ const mocks = vi.hoisted(() => ({
   // 是否配置了云端（isCloudConfigured）：用它切换「多人版 / 本地单机版」两条分支
   supabase: { isCloudConfigured: false },
   /** 登录页打开时的网络预检（预热 + 连通性探测），默认当作「通」 */
-  preflightCloud: vi.fn(async () => true),
+  preflightCloud: vi.fn(async () => 'ok' as const),
 }))
 
 vi.mock('../../src/stores/auth', () => ({
@@ -109,7 +109,7 @@ beforeEach(() => {
   mocks.initialized.value = true
   mocks.isLoggedIn.value = false
   mocks.supabase.isCloudConfigured = false
-  mocks.preflightCloud.mockReset().mockResolvedValue(true)
+  mocks.preflightCloud.mockReset().mockResolvedValue('ok')
 })
 
 afterEach(() => {
@@ -410,21 +410,62 @@ describe('LoginView · 网络预检与重试反馈', () => {
     expect(wrapper!.text()).not.toContain('连不上服务器')
   })
 
-  it('预检失败：显示提示与「重新检测」，点一下会重新探测并消失', async () => {
+  /** 设置/清除 navigator.connection（jsdom 默认没有），模拟不同网络类型 */
+  function stubNetType(type: 'cellular' | 'wifi' | undefined): void {
+    if (type === undefined) {
+      delete (window.navigator as unknown as { connection?: unknown }).connection
+      return
+    }
+    Object.defineProperty(window.navigator, 'connection', { value: { type }, configurable: true })
+  }
+
+  it('预检「有网但连不上服务器」：无网络类型信息时用中性措辞（不能假定是移动数据）', async () => {
     mocks.supabase.isCloudConfigured = true
-    mocks.preflightCloud.mockResolvedValue(false)
+    mocks.preflightCloud.mockResolvedValue('unreachable')
+    stubNetType(undefined)
     const w = await mountLogin()
 
-    expect(w.text()).toContain('当前网络连不上服务器')
+    expect(w.text()).toContain('手机有网络，但连不上服务器')
+    expect(w.text()).toContain('换一种网络')
     const retry = w.findAll('button').find((b) => b.text() === '重新检测')
     expect(retry, '必须给出「重新检测」入口，否则用户只能干等').toBeTruthy()
 
-    mocks.preflightCloud.mockResolvedValue(true)
+    mocks.preflightCloud.mockResolvedValue('ok')
     await retry!.trigger('click')
     await flushPromises()
 
     expect(mocks.preflightCloud).toHaveBeenCalledTimes(2)
-    expect(w.text()).not.toContain('当前网络连不上服务器')
+    expect(w.text()).not.toContain('连不上服务器')
+  })
+
+  it('预检「有网但连不上服务器」：蜂窝网络下建议连 Wi-Fi（正是用户这次的场景）', async () => {
+    mocks.supabase.isCloudConfigured = true
+    mocks.preflightCloud.mockResolvedValue('unreachable')
+    stubNetType('cellular')
+    const w = await mountLogin()
+
+    expect(w.text()).toContain('运营商')
+    expect(w.text()).toContain('先连 Wi-Fi')
+  })
+
+  it('预检「有网但连不上服务器」：Wi-Fi 用户不能被建议「先连 Wi-Fi」（自相矛盾）', async () => {
+    mocks.supabase.isCloudConfigured = true
+    mocks.preflightCloud.mockResolvedValue('unreachable')
+    stubNetType('wifi')
+    const w = await mountLogin()
+
+    expect(w.text()).toContain('换回移动数据')
+    expect(w.text()).not.toContain('先连 Wi-Fi')
+  })
+
+  it('预检「手机没联网」：提示去开移动数据/Wi-Fi（与「连不上服务器」区分开）', async () => {
+    mocks.supabase.isCloudConfigured = true
+    mocks.preflightCloud.mockResolvedValue('offline')
+    stubNetType(undefined)
+    const w = await mountLogin()
+
+    expect(w.text()).toContain('手机当前没有联网')
+    expect(w.text()).not.toContain('运营商')
   })
 
   it('本地单机模式不预检、也不显示网络提示', async () => {
