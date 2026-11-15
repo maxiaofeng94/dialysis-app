@@ -1289,37 +1289,6 @@ function showHelp() {
       </div>
     </div>
 
-    <div class="card">
-      <div class="card-title">数据管理</div>
-      <van-button block plain type="primary" :loading="exporting" :disabled="exporting" @click="exportData">
-        导出全部数据（JSON 备份）
-      </van-button>
-      <van-button
-        block
-        plain
-        style="margin-top: 10px"
-        :disabled="isLoggedIn"
-        @click="importData"
-      >
-        导入数据恢复
-      </van-button>
-      <div v-if="isLoggedIn" class="muted" style="margin: 6px 2px 0">
-        云端模式下数据在服务器，恢复备份请先退出登录
-      </div>
-      <van-button block plain style="margin-top: 10px" @click="showHelp">使用说明</van-button>
-      <van-button
-        v-if="isLoggedIn"
-        block
-        plain
-        style="margin-top: 10px"
-        :loading="migrating"
-        :disabled="migrating"
-        @click="onMigrate"
-      >
-        上传本地数据到云端
-      </van-button>
-      <input ref="fileInput" type="file" accept=".json,application/json" style="display: none" @change="onImportFile" />
-    </div>
 
     <div v-if="isLoggedIn" class="card">
       <div class="row">
@@ -1366,6 +1335,38 @@ function showHelp() {
         <van-icon v-if="currentPatientId === item.patient.id" name="success" color="#07c160" />
       </div>
       <van-button block plain style="margin-top: 10px" @click="goMembers">成员管理</van-button>
+    </div>
+
+    <div class="card">
+      <div class="card-title">数据管理</div>
+      <van-button block plain type="primary" :loading="exporting" :disabled="exporting" @click="exportData">
+        导出全部数据（JSON 备份）
+      </van-button>
+      <van-button
+        block
+        plain
+        style="margin-top: 10px"
+        :disabled="isLoggedIn"
+        @click="importData"
+      >
+        导入数据恢复
+      </van-button>
+      <div v-if="isLoggedIn" class="muted" style="margin: 6px 2px 0">
+        云端模式下数据在服务器，恢复备份请先退出登录
+      </div>
+      <van-button block plain style="margin-top: 10px" @click="showHelp">使用说明</van-button>
+      <van-button
+        v-if="isLoggedIn"
+        block
+        plain
+        style="margin-top: 10px"
+        :loading="migrating"
+        :disabled="migrating"
+        @click="onMigrate"
+      >
+        上传本地数据到云端
+      </van-button>
+      <input ref="fileInput" type="file" accept=".json,application/json" style="display: none" @change="onImportFile" />
     </div>
 
     <div v-if="isLoggedIn" class="card">

@@ -3853,4 +3853,38 @@ describe('SettingsView · 轮椅及衣物重量变更记录（运行时行为）
     expect(saveCalls.length).toBe(1)
     expect(saveCalls[0][0]).toMatchObject({ id: 'patient-a', name: '甲', wheelchairWeight: 13.5 })
   })
+
+  /**
+   * 第十二轮（用户反馈）：卡片顺序按「高频在前、低频在后」排列 ——
+   * 数据管理（导出/导入/迁移，低频）要在我的病人（切换病人，高频）之后，
+   * 账号（改姓名/退出登录）保持在最后。
+   *
+   * 为什么钉住：模板里 5 张卡片是硬编码顺序，没有数组驱动，
+   * 任何人「顺手」加一张卡片都可能把顺序弄乱，而这种回归不会报错、只会让用户多点两次。
+   */
+  it('设置页卡片顺序：病人档案 → 干体重历史 → 我的病人 → 数据管理 → 账号', async () => {
+    // 「我的病人」「账号」都带 v-if="isLoggedIn"，不登录根本不渲染
+    isLoggedInRef.value = true
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
+
+    const titles = w
+      .findAll('.card')
+      .map((c) => {
+        const t = c.find('.card-title')
+        return t.exists() ? t.text().trim() : ''
+      })
+      .filter((t) => t !== '')
+
+    expect(titles).toEqual([
+      '病人档案',
+      '干体重历史',
+      '我的病人',
+      '数据管理',
+      '账号',
+    ])
+
+    // 单独钉住用户明确要求的这两条（前面 toEqual 已覆盖，这里是可读的意图声明）
+    expect(titles.indexOf('我的病人')).toBeLessThan(titles.indexOf('数据管理'))
+    expect(titles[titles.length - 1]).toBe('账号')
+  })
 })

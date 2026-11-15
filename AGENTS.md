@@ -317,6 +317,15 @@ Content-Type: application/json
 - `supabase.auth.getUser()` **无参永远拿不到用户**（service 客户端自身没 session）→ 必须传入请求头里的 token
 - 前端调 Edge Function 要带 `Authorization: Bearer <access_token>` **且** `apikey` 头；只有注册接口能用 anon key
 - **改过 `schema.sql` 必须重新执行**（幂等，重复跑不清数据）：`drop policy if exists` + `add column if not exists`
+  - ⚠️ **这不是「记得就好」，是发布流程的一步**：第十一轮用户在生产环境发现「变更历史永远提示加载失败」
+    与「心率保存报错」，根因就是 `schema.sql` 改了但**从没应用到生产库** —— 而当时 1828 条测试、10 轮评审、
+    4 个 CI 工作流全绿，**没有一环能发现它**（测试跑本地 jsdom 不连库、CI 只构建产物、评审只看代码）。
+  - 现在有**机械防线**：`npm run check:schema`（`scripts/check-prod-schema.mjs`）解析 `schema.sql` 的
+    13 张表 / 89 个列，用 anon key 只读探测生产库，缺任何一个就报出来；**`pre-push` 第 ④ 步会跑它**，
+    结构未同步直接中止推送（网络不通可用 `SKIP_SCHEMA_CHECK=1 git push`）。
+  - 应用命令：`npm run apply:schema -- <prod-ref> <PROD_PAT>`（PAT 从 `.supabase-pat.local` 的 `PROD_PAT` 读）。
+  - 教训：**凡是「代码依赖了某个服务端结构」，就必须有一条检查去核对服务端真的存在它** ——
+    单测全绿只能证明代码逻辑对，证明不了「它要的东西在线上有」。
 - RLS 策略里引用外层表列**必须带表名**（`users.id`）：`patient_members` 也有 `id`，裸写会解析成 `pm.user_id = pm.id`（恒假），导致看不到记录人姓名
 - `sessions.operator_id` 外键必须指向 **`public.users`**；指向 `auth.users` 时 PostgREST 关联不出记录人姓名
 - **RLS 拦截是静默过滤**：删除 0 行也返回 204、error 为 null → 判断是否被拦要看**数据是否还在**，不能只看状态码（详见下一节）
