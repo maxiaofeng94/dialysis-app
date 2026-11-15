@@ -1537,6 +1537,30 @@ describe('admin-api · 成员与病人的写操作细节', () => {
     expect(mutations(h)).toHaveLength(0)
   })
 
+  /**
+   * ⚠️ 回水量上限必须与另外两处一致（独立评审 D3）：
+   * Edge `admin-api/index.ts:966` 的 2000、后台 `PatientDetailView.vue:74` 的 2000、
+   * App `SettingsView.vue` 的 `RINSE_BACK_MAX = 2000`。
+   * 历史上这里与后台曾经一个 2000 一个 5000，管理员填 3000 时前端放行、后端 400，
+   * 用户只看到「保存失败」而表单没标红。
+   *
+   * 边界值用 2001/2000 这一对（有区分性）：改回 5000 时 2001 会放行 → 用例红。
+   */
+  it('patient.update：回水量 2001 超出上限 → 400 且不写库', async () => {
+    const h = await load()
+    const { status, body } = await call(h, 'patient.update', { patientId: 'p-1', rinseBackVolume: 2001 })
+    expect(status).toBe(400)
+    expect(body.error).toBe('回水量不能超过 2000ml')
+    expect(mutations(h)).toHaveLength(0)
+  })
+
+  it('patient.update：回水量 2000 是合法上限 → 200', async () => {
+    const h = await load()
+    const { status, body } = await call(h, 'patient.update', { patientId: 'p-1', rinseBackVolume: 2000 })
+    expect(status).toBe(200)
+    expect(body.data.patch.rinse_back_volume).toBe(2000)
+  })
+
   it('patient.update：什么都没传 → 400「没有需要修改的内容」', async () => {
     const h = await load()
     const { status, body } = await call(h, 'patient.update', { patientId: 'p-1' })

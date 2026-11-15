@@ -428,13 +428,22 @@ async function savePatient(opts: { override?: boolean } = {}) {
       const logged = await appendWheelchairLog(prevWheelchair, wheelchairWeight, p.id)
       if (!logged) {
         // 进队列（不是单槽覆盖）：连续两次失败时两条都要留着，且带上归属
-        pushPendingWheelchairLog({
+        const queued = pushPendingWheelchairLog({
           patientId: p.id,
           oldValue: prevWheelchair,
           newValue: wheelchairWeight,
         })
+        // ⚠️ 队列也存不下时**绝不能**再说「下次保存时会自动补记」——
+        // 那是空头承诺（独立评审 D2：隐私模式下队列静默丢失，第二次保存还报「已保存」，
+        // 用户以为记录齐了，实际永久缺失）。必须如实告诉他这次变更记不上了。
+        showToast(
+          queued
+            ? '已保存，但变更记录未能写入（下次保存时会自动补记）'
+            : '已保存，但变更记录未能写入，且本机无法暂存待补项，这条变更记录将缺失',
+        )
+      } else {
+        showToast('已保存')
       }
-      showToast(logged ? '已保存' : '已保存，但变更记录未能写入（下次保存时会自动补记）')
     } else {
       // 本次没改重量，但可能有上次没记上的变更 → 顺手补写
       const flushed = await flushPendingWheelchairLog()
@@ -563,26 +572,41 @@ function readPendingWheelchairLogs(): PendingWheelchairLog[] {
   }
 }
 
-function writePendingWheelchairLogs(items: PendingWheelchairLog[]): void {
+/**
+ * 写待补队列。返回 **false 表示本机存不下**（隐私模式 / 配额满）。
+ *
+ * ⚠️ 返回值必须被调用方检查：`localStorage` 写不进去时队列会静默丢失，
+ * 而 toast 里承诺了「下次保存时会自动补记」—— 不检查就等于**文案在撒谎**
+ * （独立评审 D2 实测：隐私模式下第二次保存 toast 变成「已保存」，
+ * 而承诺的补记一条都没发生，用户以为记录齐了，实际永久丢失）。
+ */
+function writePendingWheelchairLogs(items: PendingWheelchairLog[]): boolean {
   try {
     if (items.length === 0) localStorage.removeItem(PENDING_LOG_KEY)
     else localStorage.setItem(PENDING_LOG_KEY, JSON.stringify(items))
+    return true
   } catch {
     // 隐私模式/配额满：存不下就只能当次会话内有效，不阻断保存流程
+    return false
   }
 }
 
-/** 记一条待补项（失败时调用） */
-function pushPendingWheelchairLog(item: PendingWheelchairLog): void {
+/** 记一条待补项（失败时调用）。返回 false 表示本机存不下（隐私模式/配额满） */
+function pushPendingWheelchairLog(item: PendingWheelchairLog): boolean {
   const items = readPendingWheelchairLogs()
   items.push(item)
-  writePendingWheelchairLogs(items)
+  return writePendingWheelchairLogs(items)
 }
 
 /**
  * 补写所有**属于当前病人**的待补项（按发生顺序）。返回 true 表示没有待补项或全部补写成功。
  *
  * 别的病人的待补项原样保留（等用户切回去再补），不报错、不提示 —— 用户没做错什么。
+ *
+ * ⚠️ 遇到第一条失败就 **break**，不能 `continue` 去试后面的（独立评审 D1）：
+ * 队列里第 1 条失败、第 2 条恰好成功时，第 2 条会先落库，变更历史变成
+ * 「13.5→13.6，13.4→13.5」——**倒着长**。而历史顺序正是「这份记录可信」的核心，
+ * 倒置比缺失更误导。所以：失败即停，把这一条和**它后面所有还没试的**按原顺序放回队列。
  */
 async function flushPendingWheelchairLog(): Promise<boolean> {
   const all = readPendingWheelchairLogs()
@@ -590,15 +614,21 @@ async function flushPendingWheelchairLog(): Promise<boolean> {
   const mine = all.filter((x) => x.patientId === currentPatientId.value)
   if (mine.length === 0) return true
 
+  // 别的病人的原样保留；本病人的先全部摘掉，成功的就不再放回
   const remaining: PendingWheelchairLog[] = all.filter((x) => x.patientId !== currentPatientId.value)
   let allOk = true
-  for (const item of mine) {
-    const ok = await appendWheelchairLog(item.oldValue, item.newValue, item.patientId)
-    if (ok) continue
-    // 这一条没补上：把它放回队列，后续的也别试了（网络多半还没恢复）
-    allOk = false
-    remaining.push(item)
+  let stoppedAt = -1
+  for (let i = 0; i < mine.length; i++) {
+    const ok = await appendWheelchairLog(mine[i].oldValue, mine[i].newValue, mine[i].patientId)
+    if (!ok) {
+      // 这一条没补上：网络多半还没恢复，后面的也别试了（否则历史会倒序）
+      allOk = false
+      stoppedAt = i
+      break
+    }
   }
+  // 失败的那条 + 它之后没来得及试的，按原顺序放回队列
+  if (stoppedAt >= 0) remaining.push(...mine.slice(stoppedAt))
   writePendingWheelchairLogs(remaining)
   return allOk
 }

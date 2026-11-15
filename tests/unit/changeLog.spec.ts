@@ -157,11 +157,19 @@ describe('SettingsView 的留痕纪律（源码级守卫）', () => {
     expect(prevIdx).toBeLessThan(body.indexOf('await repository.savePatient('))
   })
 
-  // 「已保存，但变更记录未能写入（请检查网络）」—— 三种后果必须能区分：
+  // 「已保存，但变更记录未能写入」—— 三种后果必须能区分：
   // 全对了 / 档案存了但日志没写 / 档案没存上。文案混同会让用户二选一都猜错。
+  //
+  // ⚠️ D2（第三轮独立评审）：日志写失败后还要区分「进队列成功（下次能补）」与
+  // 「队列也存不下（这条永久缺失）」—— 后者绝不能再承诺「下次保存时会自动补记」，
+  // 否则就是空头支票（隐私模式下队列静默丢失，用户以为记录齐了）。
   it('日志写失败时的提示与成功路径明确区分（不假报成功、也不谎报失败）', () => {
     expect(settingsSrc).toContain('已保存，但变更记录未能写入')
-    expect(settingsSrc).toMatch(/showToast\(\s*logged\s*\?\s*'已保存'\s*:/)
+    // 成功路径单独给「已保存」，不能跟失败混用同一句
+    expect(settingsSrc).toMatch(/showToast\(\s*'已保存'\s*\)/)
+    // 队列存不下时必须如实说「缺失」，且不能出现「下次保存时会自动补记」的承诺
+    expect(settingsSrc).toContain('本机无法暂存待补项')
+    expect(settingsSrc).toMatch(/queued\s*\?/)
   })
 
   it('appendWheelchairLog 自己吞掉异常并返回布尔（日志失败不能把整次保存判成失败）', () => {

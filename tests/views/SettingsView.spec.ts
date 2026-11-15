@@ -1627,6 +1627,132 @@ describe('SettingsView · 轮椅及衣物重量变更记录（运行时行为）
   })
 
   /**
+   * D1（第三轮独立评审）：补写循环「失败就 continue」会让历史**倒序**。
+   *
+   * 场景：队列里有两条待补项 [13.4→13.5, 13.5→13.6]，第 1 条偶发失败、第 2 条恰好成功。
+   * 旧实现继续试第 2 条 → 13.5→13.6 先落库，历史变成
+   * 「13.5→13.6，13.4→13.5」—— 倒着长。而变更历史的意义就是「可信」，
+   * 倒置比缺失更误导（用户会以为中间那次是错的）。
+   *
+   * 修法：失败即 break，把失败的这条和它后面**还没试的**按原顺序放回队列。
+   *
+   * ⚠️ 这条用例必须断言「第一次补写**只尝试了 1 条**」，只断言最终顺序会被
+   * 「先成功后失败」等其他路径蒙过去（评审实测：把实现改成 break 版本，
+   * 原有 1739 条用例全绿，说明旧用例对这个交叉场景零判别力）。
+   */
+  it('补写时第 1 条失败、第 2 条本可成功：必须停下，不能让历史倒序', async () => {
+    currentPatientIdRef.value = 'patient-default'
+    // 预置两条待补项（模拟之前两次保存都写日志失败）
+    localStorage.setItem(
+      'dialysis-pending-wheelchair-logs',
+      JSON.stringify([
+        { patientId: 'patient-default', oldValue: 13.4, newValue: 13.5 },
+        { patientId: 'patient-default', oldValue: 13.5, newValue: 13.6 },
+      ]),
+    )
+
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.6 }) })
+
+    // 补写：第 1 次调用失败，第 2 次本会成功 —— 但正确实现根本不该发第 2 次
+    const attempted: string[] = []
+    const written: string[] = []
+    let calls = 0
+    vi.mocked(repository.addPatientChangeLog).mockImplementation(async (log) => {
+      calls += 1
+      const key = `${log.oldValue}->${log.newValue}`
+      attempted.push(key)
+      if (calls === 1) throw new Error('offline') // 第 1 条失败
+      written.push(key)
+      return undefined as never
+    })
+
+    // 不改重量，直接保存 → 只触发补写
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 关键 1：只尝试了第 1 条，第 2 条**不该被尝试**（否则它就先落库了）
+    expect(attempted).toEqual(['13.4->13.5'])
+    expect(written).toEqual([])
+
+    // 关键 2：两条都还在队列里，且顺序不变
+    const queued = JSON.parse(localStorage.getItem('dialysis-pending-wheelchair-logs') || '[]')
+    expect(queued.map((x: { oldValue: number; newValue: number }) => `${x.oldValue}->${x.newValue}`)).toEqual([
+      '13.4->13.5',
+      '13.5->13.6',
+    ])
+  })
+
+  it('补写时第 1 条失败、第 2 条本可成功：网络恢复后历史顺序仍是老的在前', async () => {
+    currentPatientIdRef.value = 'patient-default'
+    localStorage.setItem(
+      'dialysis-pending-wheelchair-logs',
+      JSON.stringify([
+        { patientId: 'patient-default', oldValue: 13.4, newValue: 13.5 },
+        { patientId: 'patient-default', oldValue: 13.5, newValue: 13.6 },
+      ]),
+    )
+
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.6 }) })
+
+    const written: string[] = []
+    let calls = 0
+    vi.mocked(repository.addPatientChangeLog).mockImplementation(async (log) => {
+      calls += 1
+      if (calls === 1) throw new Error('offline') // 第一次保存：第 1 条失败
+      written.push(`${log.oldValue}->${log.newValue}`)
+      return undefined as never
+    })
+
+    // 第一次保存：补写失败即停
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 第二次保存：网络恢复，两条按顺序补上
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 历史顺序必须是老的在前（倒序会让用户以为中间那次改动是错的）
+    expect(written).toEqual(['13.4->13.5', '13.5->13.6'])
+    expect(localStorage.getItem('dialysis-pending-wheelchair-logs')).toBeNull()
+  })
+
+  /**
+   * D2（第三轮独立评审）：`localStorage` 存不下时队列静默丢失，
+   * 而 toast 仍承诺「下次保存时会自动补记」—— 文案在撒谎。
+   *
+   * 真实场景：iOS 无痕模式 / 存储配额满。用户看到「下次会自动补记」就不再管了，
+   * 下次保存时 toast 变成「已保存」（因为队列已空、`flushed` 返回 true），
+   * 这条变更**永久缺失**，而用户以为它是齐的。
+   *
+   * 修法：`writePendingWheelchairLogs` 返回布尔，存不下时如实说「这条变更记录将缺失」。
+   */
+  it('本机存不下待补队列（隐私模式/配额满）：必须如实告知会缺失，不能承诺「下次自动补记」', async () => {
+    currentPatientIdRef.value = 'patient-default'
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.4 }) })
+
+    // 写日志失败 + localStorage.setItem 抛错（隐私模式/配额满）
+    vi.mocked(repository.addPatientChangeLog).mockRejectedValue(new Error('offline'))
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError')
+    })
+
+    try {
+      await fieldInput(w, '轮椅及衣物重量').setValue('13.5')
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+
+      const toast = toastText()
+      // 关键：不能承诺「下次保存时会自动补记」——队列根本没存下
+      expect(toast).not.toContain('下次保存时会自动补记')
+      expect(toast).toContain('缺失')
+      // 队列确实是空的（存不下）
+      expect(localStorage.getItem('dialysis-pending-wheelchair-logs')).toBeNull()
+    } finally {
+      setItemSpy.mockRestore()
+    }
+  })
+
+  /**
    * S-1（独立评审）：`appendWheelchairLog` 在 `await savePatient(...)` **之后**才读
    * `currentPatientId.value` —— 保存期间切病人，档案写对了人、变更记录却写到别人名下。
    *

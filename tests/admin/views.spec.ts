@@ -1028,10 +1028,18 @@ describe('后台页面 · PatientDetailView', () => {
       expect(String(error.mock.calls[0][0])).toContain('kg')
     })
 
-    it('回水量超范围同样拦下（填成 300000 会让机器脱水量离谱）', async () => {
+    /**
+     * ⚠️ 这里的边界值必须**有区分性**（独立评审 D3）：
+     * 原来用 300000，它在 2000 和 5000 两种上限下都会被拦，
+     * 把上限误改成 5000 用例照样绿 —— 等于没守。
+     * 现在用 2001（2000 上限下必须拦、5000 上限下会放行），才有判别力。
+     * 上限与 Edge `admin-api/index.ts` 及 App 端 `SettingsView` 的 2000 必须一致。
+     */
+    it('回水量超范围同样拦下（2001 必须拦、2000 必须放行）', async () => {
+      // 2001：超出 2000 上限 → 拦
       vi.mocked(api.patient).mockResolvedValue({
         ...PATIENT_DETAIL,
-        patient: { ...PATIENT_DETAIL.patient, rinseBackVolume: 300000 },
+        patient: { ...PATIENT_DETAIL.patient, rinseBackVolume: 2001 },
       } as never)
       const error = vi.spyOn(ElMessage, 'error').mockImplementation(() => ({}) as never)
 
@@ -1041,6 +1049,19 @@ describe('后台页面 · PatientDetailView', () => {
 
       expect(api.updatePatient).not.toHaveBeenCalled()
       expect(error).toHaveBeenCalled()
+    })
+
+    it('回水量 2000 是合法上限，必须放行（防止把上限误收紧）', async () => {
+      vi.mocked(api.patient).mockResolvedValue({
+        ...PATIENT_DETAIL,
+        patient: { ...PATIENT_DETAIL.patient, rinseBackVolume: 2000 },
+      } as never)
+
+      const { wrapper } = await mountView(PatientDetailView, '/patients/p-1')
+      await buttonByText(wrapper, '保存配置').trigger('click')
+      await flushPromises()
+
+      expect(api.updatePatient).toHaveBeenCalled()
     })
 
     it('范围内的值照常保存（不能把正常路径一起拦掉）', async () => {
