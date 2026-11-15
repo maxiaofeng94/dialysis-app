@@ -148,6 +148,26 @@
 **修复 → 补齐用例 → 重新评审**（新一轮，重新派独立评审），
 **不允许带着未决问题进入第 4 步的推送**。
 
+#### 3.5.6.1 评审必须能收敛：范围限定 `git diff`，自查新问题**只记录不改**
+
+> 第十四轮踩的坑：一轮评审跑了 **5 小时**还没结束，原因不是需求复杂，而是
+> **「评审中发现新缺陷 → 修 → 补用例 → 变异验证 → 重新评审」这个循环没有出口**。
+> 那一轮自找出 5 个真缺陷（都是真问题），但每修一个就推翻一次「已冻结」的承诺，
+> 评审 agent 被迫从头重读 42KB 源码 + 38KB 测试，反复重来。
+
+规则：
+
+1. **评审范围严格限定在 `git diff <基线>..HEAD`**，不评整个仓库、不顺手扩展。
+2. **评审中/自查中发现的新问题，只要不在本次 diff 的影响面内，一律只记录不修**：
+   写进 `.review/answers.md` 的「下一轮待办」，标注文件与行号，本轮不动代码。
+3. **宣布「冻结」之后不许再改文件**。改了就要重新冻结并通知评审，
+   而每次重新冻结都意味着评审从头再来 —— 这是上一轮 5 小时的主因。
+4. **一条判据**：如果一个缺陷「现在就存在、但不修也不会让本次改动出错」，
+   那它就是下一轮的事，不是这一轮的事。
+5. **必须当轮修**的只有两类：
+   - 本次 diff **引入**的缺陷；
+   - 本次 diff 的**防线本身是假的**（守卫恒真 / 变异不红）—— 因为它会让人误以为安全。
+
 #### 3.5.7 能机械化的部分已经写成守卫（跟着 pre-push 跑，不要只靠自觉）
 
 - `tests/guards/optimistic-lock.spec.ts` —— 新增写方法必须**显式归类**「要不要乐观锁」；
@@ -321,11 +341,57 @@ Content-Type: application/json
     与「心率保存报错」，根因就是 `schema.sql` 改了但**从没应用到生产库** —— 而当时 1828 条测试、10 轮评审、
     4 个 CI 工作流全绿，**没有一环能发现它**（测试跑本地 jsdom 不连库、CI 只构建产物、评审只看代码）。
   - 现在有**机械防线**：`npm run check:schema`（`scripts/check-prod-schema.mjs`）解析 `schema.sql` 的
-    13 张表 / 89 个列，用 anon key 只读探测生产库，缺任何一个就报出来；**`pre-push` 第 ④ 步会跑它**，
+    13 张表 / 84 个唯一列（`schema.sql` 里共 89 处列声明，去重后 84），用 anon key 只读探测生产库（13 + 84 = **97 项探测**），缺任何一个就报出来；**`pre-push` 第 ④ 步会跑它**，
     结构未同步直接中止推送（网络不通可用 `SKIP_SCHEMA_CHECK=1 git push`）。
   - 应用命令：`npm run apply:schema -- <prod-ref> <PROD_PAT>`（PAT 从 `.supabase-pat.local` 的 `PROD_PAT` 读）。
+  - **CI 也会跑**（`.github/workflows/test.yml` 的「生产库结构与 schema.sql 一致性」步骤）：
+    只在本地钩子里问「库和代码匹配吗」是不够的 —— `git push --no-verify`、从网页/别的机器推、
+    或没装 hook 都能绕过。CI 用仓库 secret 提供凭据，没有 secret 时警告并跳过（不让 CI 假红）。
+  - 脚本会先做 **SQL 语法自检**（`findUnterminatedSql`）：`schema.sql` 有未闭合的引号 / dollar-quote /
+    块注释 / **括号不配平**时**直接失败**，不会拿残缺的解析结果报「结构一致」—— 残缺结果既可能漏报真实缺列（假绿），
+    也可能造出幻影列（假红）。⚠️ 括号配平这条是第十二轮评审补的：`parseSchema` 靠括号配平截取建表体，
+    少一个右括号就会把后面的列全吞掉（实测把 `admins` 的 `(` 改成 `((` → 该表 4 列静默消失、
+    脚本照样报「✅ 一致（93 项探测）」并 exit 0）。
+  - 脚本还有 **DDL 普查**（`ddlCensus`）：`parseSchema` 是「尽力解析」，遇到不认识的 DDL 拼写会静默跳过。
+    所以用一条**不依赖 parseSchema 的极宽正则**数「文件里有几条 `create table`」，与解析出的表数对不上就
+    exit 1。⚠️ 这条也是第十二轮评审补的：放宽前的正则只认 `create table if not exists public.x` 一种写法，
+    评审追加 5 种合法 DDL 变体（pg_dump 的双引号风格、`alter table if exists/only`、省略 `if not exists` 等）
+    后**三道守卫全绿、新结构 100% 未被解析**。现在支持 `unlogged`/`temp`/`only`/带引号标识符/可选 `public.`。
   - 教训：**凡是「代码依赖了某个服务端结构」，就必须有一条检查去核对服务端真的存在它** ——
     单测全绿只能证明代码逻辑对，证明不了「它要的东西在线上有」。
+  - 教训二：**解析器的「尽力而为」是假绿的温床**。只要解析结果会被当成「期望值」去比对，
+    就必须有**一条独立的、不依赖该解析器的**兜底核算（表数普查 / 手写基线清单），否则
+    「解析器少解析」和「库里真缺」在断言上无法区分。`tests/guards/schema-baseline.spec.ts`
+    的手写清单（13 表 84 列逐表列出）就是这个兜底。
+  - 教训三：**解析器要「认全语法」和「别认错对象」，是两个方向相反的坑**。第十三轮把正则放宽到认全
+    DDL 变体（`unlogged`/`temp`/`only`/引号标识符/可选 `public.`）之后，第十四轮自查发现放宽的方向上还有两类问题：
+    1. **漏解析（假绿）**：`alter table public.t add column a int, add column b int;`（一条语句多个 `add`，
+       PG 合法）原来只解析出 `a`，`b` **静默丢失** → 探测项变少 → 生产库真缺 `b` 也不报。
+       根因是正则把 `add ...` 也吃进匹配里，全局 `exec` 从 `a` 之后继续找、下一个 `add` 前没有 `alter table`
+       前缀就匹配不上。**修法**：拆成 `ALTER_HEAD_RE`（只定位到表名）+ `ALTER_BODY_ADD_RE`（在语句体内逐个扫 `add`）。
+    2. **认错对象（假红）**：字符串字面量里的 DDL 关键字被当成真语句。`stripSqlComments` **保留**字符串内容
+       （`parseSchema` 截建表体需要它），于是
+       `create table public.t (note text default 'create table public.fake2 (id int);');`
+       会解析出**幻影表** `fake2` + 幻影列 `fake2.id`；同理 `default 'alter table public.fake add column zz int;'`
+       造出幻影列 `fake.zz`。脚本会去探测根本不存在的表/列。
+       **修法**：`parseSchema` 内引入 `const locate = blankSqlStrings(sql)`（连字符串一起遮成空白，
+       与保留字符串内容的 `stripSqlComments` 区分），**所有 DDL 定位正则改在 `locate` 上跑**；
+       建表体截取、alter 语句体切片、语句结束分号查找也全部从 `locate` 取。
+       ⚠️ `blankSqlStrings` **必须保证字符数与换行位置和原文完全一致**（逐字符替换成空格），
+       否则 `match.index` 与 `clean`/原始 SQL 错位 —— 这是这层设计唯一的耦合点。
+    - 另：`ddlCensus` 也必须用 `blankSqlStrings` 而不是 `stripSqlComments`，否则
+      `default 'create table x'` 会被宽正则多数一次 → `found=2 parsed=1` → **假红**（合法 SQL 被拦下推送）。
+    - 教训：**「放宽正则」只能解决「认不全」，解决不了「认错对象」**。后者要靠**词法层先遮住不该看的区域**
+      （字符串 / dollar-quote / 注释），再做模式匹配。两件事要分开做，混在一起就会在修一个方向时恶化另一个方向。
+  - 教训四：**「括号组」千万别用 `\([^)]*\)` 匹配**。`alter table public.t add column (a numeric(4,1), b text);`
+    是合法 PG 语法，但 `[^)]*` 会在 `numeric(4,1)` 的第一个 `)` 处停下 → 只解析出 `a`，`b` **静默丢失**
+    （假绿：探测项变少，生产库真缺 `b` 也不报）。当前 `schema.sql` 里没有 `add column (` 这种形态，
+    但**不能靠「现在没有」保证安全**。修法：正则只负责定位 `add` 关键字与列名起点，
+    括号组用 `matchBalancedParens(text, start)` 按**配平**提取（跳过字符串与双引号标识符内部的括号）。
+    - 教训：**凡是要「截取一段带括号的内容」，先问「里面还会不会有括号」**。类型声明 `numeric(4,1)`、
+      默认值 `')'`、标识符 `"a(b"` 都会让「取到第一个 `)` 为止」的写法出错，而**出错方向往往是静默丢数据**。
+
+
 - RLS 策略里引用外层表列**必须带表名**（`users.id`）：`patient_members` 也有 `id`，裸写会解析成 `pm.user_id = pm.id`（恒假），导致看不到记录人姓名
 - `sessions.operator_id` 外键必须指向 **`public.users`**；指向 `auth.users` 时 PostgREST 关联不出记录人姓名
 - **RLS 拦截是静默过滤**：删除 0 行也返回 204、error 为 null → 判断是否被拦要看**数据是否还在**，不能只看状态码（详见下一节）

@@ -14,8 +14,10 @@ import {
   isConflictError,
   isNotFoundError,
   isPermissionError,
+  isMissingColumnError,
   isRlsDeniedError,
   isSchemaMissingError,
+  isSessionExpiredError,
 } from '../lib/errors'
 import { DEFAULT_RINSE_BACK_ML } from '../constants'
 import {
@@ -871,11 +873,18 @@ async function openChangeLog() {
     // 根因是**生产库没执行 schema.sql**（patient_change_logs 表不存在，实测 404 PGRST205），
     // 而这里把所有异常都归一成「请检查网络后重试」—— 用户换网络、点重试一万次也不会好，
     // 排查的人也只会往网络方向查。所以按错误码分开说，仍然不显示成「暂无记录」。
-    changeLogError.value = isSchemaMissingError(err)
-      ? '变更记录功能尚未在服务器启用，请联系管理员（缺少数据库表）'
-      : isRlsDeniedError(err)
-        ? '没有权限查看变更记录，请联系创建者'
-        : '变更记录加载失败，请检查网络后重试'
+    // 轻微-2（第十二轮独立评审）：缺表（PGRST205/42P01）与缺列（42703）文案要分开 ——
+    // 缺列时说「缺少数据库表」会把排查方向引偏（这次事故里两者都出现过）。
+    // 轻微-3：PGRST301 是登录态失效，不能提示「找创建者要权限」（实际重登即可）。
+    changeLogError.value = isMissingColumnError(err)
+      ? '变更记录功能尚未在服务器启用，请联系管理员（缺少数据库列）'
+      : isSchemaMissingError(err)
+        ? '变更记录功能尚未在服务器启用，请联系管理员（缺少数据库表）'
+        : isSessionExpiredError(err)
+          ? '登录状态已失效，请重新登录后再试'
+          : isRlsDeniedError(err)
+            ? '没有权限查看变更记录，请联系创建者'
+            : '变更记录加载失败，请检查网络后重试'
     if (import.meta.env.DEV) {
       // 开发/测试环境把错误码打出来，避免下次又靠猜
       console.warn('[changeLog] 加载失败，错误码 =', errorCode(err))

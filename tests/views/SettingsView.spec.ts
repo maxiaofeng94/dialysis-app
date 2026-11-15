@@ -1565,6 +1565,41 @@ describe('SettingsView · 轮椅及衣物重量变更记录（运行时行为）
     expect(text).not.toContain('暂无变更记录')
   })
 
+  /**
+   * 轻微-2（第十二轮独立评审）：缺列（42703）与缺表（PGRST205）文案必须分开。
+   * 两者都被 isSchemaMissingError 覆盖，但说「缺少数据库表」在缺列时会把排查方向引偏 ——
+   * 而这次事故里「表不存在」和「列不存在」同时出现过。
+   */
+  it('变更历史读失败是「服务端缺列」（42703）时：文案说缺列，不说缺表', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
+    const colErr = Object.assign(new Error('column does not exist'), { code: '42703' })
+    vi.mocked(repository.listPatientChangeLogs).mockRejectedValueOnce(colErr)
+
+    await buttonByText(w, '变更历史').trigger('click')
+    await flushPromises()
+
+    const text = w.text()
+    expect(text).toContain('尚未在服务器启用')
+    expect(text).toContain('缺少数据库列')
+    expect(text).not.toContain('缺少数据库表')
+  })
+
+  /**
+   * 轻微-3（第十二轮独立评审）：PGRST301 是 JWT 无效/过期（登录态失效），
+   * 不是「没有权限」—— 提示「请联系创建者」会让用户找错人（实际重登即可）。
+   */
+  it('变更历史读失败是「登录态失效」（PGRST301）时：引导重新登录，不说没权限', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
+    const jwtErr = Object.assign(new Error('JWT expired'), { code: 'PGRST301' })
+    vi.mocked(repository.listPatientChangeLogs).mockRejectedValueOnce(jwtErr)
+
+    await buttonByText(w, '变更历史').trigger('click')
+    await flushPromises()
+
+    const text = w.text()
+    expect(text).toContain('登录状态已失效')
+    expect(text).not.toContain('没有权限查看变更记录')
+  })
   it('变更历史读失败是 RLS 拒绝时：提示没有权限', async () => {
     const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
     const rlsErr = Object.assign(new Error('permission denied'), { code: '42501' })

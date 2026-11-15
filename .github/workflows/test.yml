@@ -111,3 +111,34 @@ jobs:
 
       - name: 后台页面 SSR 冒烟
         run: npm run smoke:admin
+
+      # ---------------------------------------------------------------
+      # 生产库结构同步（第十二轮独立评审·中级-3）
+      #
+      # 为什么必须放进 CI：`npm run check:schema` 原来只挂在**本地 pre-push**，
+      # 而 `git push --no-verify`、从网页/其它机器推、hook 没装（core.hooksPath
+      # 是本地配置）都能绕过。第十一轮事故的本质就是「没有任何一环问过
+      # 库和代码匹配吗」，只在开发机本地钩子里问，仍然不算有人问。
+      #
+      # 凭据用仓库 secret；没有 secret 的场景（fork PR）跳过并给出警告 ——
+      # 宁可跳过也不能让 CI 因为「拿不到库」而红，那会训练大家忽略这道门。
+      # ---------------------------------------------------------------
+      - name: 生产库结构与 schema.sql 一致性
+        env:
+          PROD_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          PROD_ANON: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PROD_URL:-}" ] || [ -z "${PROD_ANON:-}" ]; then
+            echo "::warning::未配置 VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY，跳过生产库结构检查"
+            exit 0
+          fi
+          # ⚠️ 用 trap 保证无论 node 成功/失败都会删掉凭据文件 ——
+          # 写成「node ... 然后 rm」时，node 失败会因 set -e 直接退出、rm 不执行，
+          # 凭据就残留在工作区里（runner 是一次性的，但别的步骤可能读到它）。
+          trap 'rm -f .env.production' EXIT
+          # 脚本只认 .env.production（刻意不回退到 .env 的测试库）
+          # 用 printf 而不是 echo：避免特殊字符被 shell 解释；
+          # 命令本身只显示变量名（GitHub 会自动遮蔽 secret 的值）
+          printf "VITE_SUPABASE_URL=%s\nVITE_SUPABASE_ANON_KEY=%s\n" "$PROD_URL" "$PROD_ANON" > .env.production
+          node scripts/check-prod-schema.mjs

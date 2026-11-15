@@ -76,6 +76,11 @@ const SCHEMA_MISSING_CODES = ['PGRST205', '42P01', '42703'] as const
 export function errorCode(err: unknown): string | null {
   if (typeof err !== 'object' || err === null) return null
   const code = (err as { code?: unknown }).code
+  // ⚠️ 只认**字符串**错误码，数字型一律当「没有码」返回 null（`errors.spec.ts:33` 钉住了这条）。
+  // 原因：PostgREST 的错误码都是字符串（`PGRST205` / `42703` / `42P01` / `42501` / `PGRST301`），
+  // 而数字型 `code` 是**别的**来源（例如某些 HTTP 库把 status 塞进 code、或业务自造的 1001 之类），
+  // 把它当成 PG 错误码会让 `SCHEMA_MISSING_CODES.includes()` 之类的判断误命中。
+  // 保守做法：不认识的形态就不猜，宁可归到 unknown 让它走「无法判定」分支。
   return typeof code === 'string' ? code : null
 }
 
@@ -85,9 +90,25 @@ export function isSchemaMissingError(err: unknown): boolean {
   return code !== null && (SCHEMA_MISSING_CODES as readonly string[]).includes(code)
 }
 
-/** RLS 拒绝（没有权限读/写） */
+/**
+ * RLS 拒绝（没有权限读/写）—— 只有真正的「策略不允许」。
+ *
+ * ⚠️ `PGRST301`（JWT 无效/过期）**不在这里**：那是登录态失效，
+ * 提示「没有权限，请联系创建者」会把用户引向错误方向（实际重登即可）。
+ * 它归 isSessionExpiredError()。
+ */
 export function isRlsDeniedError(err: unknown): boolean {
   const code = errorCode(err)
-  // 42501 = insufficient_privilege（PG）；PGRST301 = JWT 无效/过期
-  return code === '42501' || code === 'PGRST301'
+  // 42501 = insufficient_privilege（PG）
+  return code === '42501'
+}
+
+/** 登录态失效（JWT 无效 / 过期）—— 应该引导重新登录，不是「找创建者要权限」 */
+export function isSessionExpiredError(err: unknown): boolean {
+  return errorCode(err) === 'PGRST301'
+}
+
+/** 缺表还是缺列：两者文案不同（缺列时说「缺表」会把排查引偏） */
+export function isMissingColumnError(err: unknown): boolean {
+  return errorCode(err) === '42703'
 }

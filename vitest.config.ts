@@ -48,7 +48,11 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['text-summary', 'text', 'json-summary'],
       reportsDirectory: './coverage',
-      include: ['src/**/*.{ts,vue}', 'supabase/functions/**/*.ts'],
+      // ⚠️ `scripts/**/*.mjs` 必须纳入：`check-prod-schema.mjs` 是**生产库结构的唯一防线**，
+      // 第十一轮的事故（生产库缺表却全绿）就是因为它不存在；而它自己有 700+ 行、
+      // 一堆词法/配平逻辑，不纳入覆盖率就等于「守卫本身没人守」。
+      // （第十二轮独立评审·轻微-4）
+      include: ['src/**/*.{ts,vue}', 'supabase/functions/**/*.ts', 'scripts/**/*.mjs'],
       exclude: [
         'src/main.ts',
         'src/admin/main.ts',
@@ -59,6 +63,12 @@ export default defineConfig({
         'src/admin/lib/types.ts',
         'src/repo/repository.ts',
         'supabase/functions/**/*.d.ts',
+        // 其它一次性运维脚本（不进发布链路、不参与结构守卫），纳入只会稀释分母
+        'scripts/apply-schema.mjs',
+        'scripts/install-hooks.mjs',
+        'scripts/check-admin-dev.mjs',
+        'scripts/review-gate.mjs',
+        'scripts/smoke-admin.mjs',
       ],
       // 阈值按「当前真实水位」设置：低于此线说明有功能退化，CI 直接红
       // 实测水位（1348 个用例）：statements 89.5% / branches 87.1% / functions 86.8% / lines 91.3%

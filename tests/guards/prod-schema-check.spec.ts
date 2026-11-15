@@ -16,6 +16,7 @@ import {
   parseSchema,
   dedupeColumns,
   stripSqlComments,
+  splitTopLevel,
   loadEnv,
   refFromUrl,
   assertProdTarget,
@@ -102,10 +103,30 @@ create table if not exists public.patient_change_logs (
     const keys = columns.map((c) => `${c.table}.${c.column}`)
     expect(keys).toContain('patient_change_logs.old_value')
     expect(keys).toContain('patient_change_logs.new_value')
-    expect(keys.some((k) => k.endsWith('.primary'))).toBe(false)
-    expect(keys.some((k) => k.endsWith('.constraint'))).toBe(false)
   })
 
+  /**
+   * ⭐ 第十二轮独立评审·轻微-3：原来用 `keys.some(k => k.endsWith(".primary"))` 断言 ——
+   * 那是**恒真**的：keys 是 `table.column` 形式，永远不可能以 `.primary` 结尾，
+   * 无论解析器好坏都是 false。真正该覆盖的形状是「约束独占一行」
+   * （真实 schema.sql 的 `rate_limits` 就是 `primary key (bucket, key, window_start)` 单起一行）。
+   * 这里用精确等值，删掉 CONSTRAINT_KEYWORDS 过滤必然变红。
+   */
+  it('约束独占一行时不能被当成列（精确等值）', () => {
+    const sql = `
+create table if not exists public.rate_limits (
+  bucket text not null,
+  key text not null,
+  window_start timestamptz not null,
+  count int not null,
+  primary key (bucket, key, window_start),
+  constraint chk_count check (count >= 0),
+  unique (bucket, window_start)
+);
+`
+    const cols = parseSchema(sql).columns.map((c) => c.column)
+    expect(cols).toEqual(['bucket', 'key', 'window_start', 'count'])
+  })
   it('大小写不敏感（CREATE TABLE IF NOT EXISTS 也要认）', () => {
     const sql = `CREATE TABLE IF NOT EXISTS public.admins (id uuid primary key);`
     const { tables } = parseSchema(sql)
@@ -161,6 +182,208 @@ ${indent});
     expect(count(indented)).toBe(count(flat)) // 缩进不能改变结果
   })
 
+  /**
+   * ⭐ 第十二轮独立评审 · 中级-1：
+   * `stripSqlComments` 用 `replace(/--.*$/gm,'')` 会把**字符串字面量里的 `--`** 当注释，
+   * 连行尾的 `)` 一起吞掉 → 括号失衡 → 表体吞掉下一个 create table → 幻影列 `create`。
+   * 后果：合法 schema 被判「生产库缺列」，pre-push 假红中止推送。
+   * 现在改成词法扫描（识别字符串 / 标识符 / dollar-quote / 注释）。
+   */
+  it('字符串字面量里的 -- 不能被当成注释（评审中级-1）', () => {
+    const sql = `
+create table if not exists public.users (
+  id uuid primary key,
+  name text check (name <> '--')
+);
+create table if not exists public.patients (
+  id uuid primary key,
+  name text
+);
+`
+    const { tables, columns } = parseSchema(sql)
+    expect(tables).toEqual(['users', 'patients'])
+    const keys = columns.map((c) => `${c.table}.${c.column}`)
+    expect(keys).toEqual(['users.id', 'users.name', 'patients.id', 'patients.name'])
+    // 幻影列（括号失衡后的典型产物）
+    expect(keys).not.toContain('users.create')
+  })
+
+  it('字符串字面量里的块注释符号与括号不能干扰解析（评审中级-1）', () => {
+    const sql = `
+create table if not exists public.t (
+  id uuid primary key,
+  note text default 'a /* b */ c',
+  v text default ')',
+  w text default '(',
+  z int
+);
+`
+    const { columns } = parseSchema(sql)
+    const keys = columns.map((c) => `${c.table}.${c.column}`)
+    expect(keys).toEqual(['t.id', 't.note', 't.v', 't.w', 't.z'])
+  })
+
+  /**
+   * ⭐ 第十二轮独立评审 · 中级-2：
+   * 标准 SQL 风格的多行外键续行会被逐行匹配当成列 `references` / `on` → 幻影列 → 假红。
+   * 现在按**顶层逗号**切片段，整个 constraint 是一个片段。
+   */
+  it('多行外键续行不能当成列（评审中级-2）', () => {
+    const sql = `
+create table if not exists public.sessions (
+  id uuid primary key,
+  patient_id uuid not null,
+  constraint fk_patient foreign key (patient_id)
+    references public.patients(id)
+    on delete cascade
+);
+`
+    const { columns } = parseSchema(sql)
+    const keys = columns.map((c) => `${c.table}.${c.column}`)
+    expect(keys).toEqual(['sessions.id', 'sessions.patient_id'])
+    expect(keys).not.toContain('sessions.references')
+    expect(keys).not.toContain('sessions.on')
+    expect(keys).not.toContain('sessions.constraint')
+  })
+
+  it('dollar-quoted 函数体（含内部注释）不能破坏后续建表解析', () => {
+    const sql = `
+create or replace function public.f()
+returns trigger
+as $$
+begin
+  -- 函数内注释
+  insert into public.users (id) values (new.id);
+  return new;
+end;
+$$;
+create table if not exists public.after_fn (
+  id uuid primary key,
+  name text
+);
+`
+    const { tables, columns } = parseSchema(sql)
+    expect(tables).toEqual(['after_fn'])
+    const keys = columns.map((c) => `${c.table}.${c.column}`)
+    expect(keys).toEqual(['after_fn.id', 'after_fn.name'])
+  })
+
+  it('表级 unique / primary key 约束不算列', () => {
+    const sql = `
+create table if not exists public.pm (
+  id uuid primary key,
+  patient_id uuid not null,
+  user_id uuid not null,
+  unique (patient_id, user_id)
+);
+create table if not exists public.rl (
+  bucket text not null,
+  key text not null,
+  count int not null default 0,
+  primary key (bucket, key)
+);
+`
+    const { columns } = parseSchema(sql)
+    const keys = columns.map((c) => `${c.table}.${c.column}`)
+    expect(keys).not.toContain('pm.unique')
+    expect(keys).not.toContain('rl.primary')
+    expect(keys).toContain('pm.patient_id')
+    expect(keys).toContain('rl.bucket')
+  })
+
+  it('嵌套块注释', () => {
+    const sql = `
+/* outer /* inner */ still comment */
+create table if not exists public.n1 (
+  id uuid primary key
+);
+`
+    const { tables, columns } = parseSchema(sql)
+    expect(tables).toEqual(['n1'])
+    expect(columns.map((c) => `${c.table}.${c.column}`)).toEqual(['n1.id'])
+  })
+
+  /**
+   * ⭐ 第十二轮独立评审 · 中级-1 的**加强版**：
+   * 只有**一个**字符串含 `--` 时，括号失衡恰好还能被后续 `);` 抵消（变异实测：44 条全绿）；
+   * **两个**才会真的丢列。所以这里放两个 —— 这才钉得住「词法剥离」这一层。
+   */
+  it('多个字符串字面量各含 -- 时列不能丢（加强版，钉住词法剥离）', () => {
+    const sql = `
+create table if not exists public.t (
+  a text check (a <> '--'),
+  b text check (b <> '--'),
+  c int
+);
+`
+    const { columns } = parseSchema(sql)
+    const keys = columns.map((c) => `${c.table}.${c.column}`)
+    expect(keys).toEqual(['t.a', 't.b', 't.c'])
+  })
+
+  /**
+   * ⭐ 第十二轮独立评审：dollar-quote 必须整块识别。
+   * 函数体里的**动态 SQL 字符串**如果被当成真 SQL，会解析出「幻影表」——
+   * 明明生产库没有这张表，脚本却去探测它，然后报「生产库缺表」（假红中止推送）。
+   */
+  it('dollar-quote 函数体里的动态 SQL 不能变成幻影表', () => {
+    const sql = `
+create or replace function public.f() returns void as $$
+begin
+  execute 'create table if not exists public.ghost (id int)';
+end;
+$$;
+create table if not exists public.real_t (
+  id uuid primary key
+);
+`
+    const { tables } = parseSchema(sql)
+    expect(tables).toEqual(['real_t'])
+    expect(tables).not.toContain('ghost')
+  })
+
+  /**
+   * 直接钉住 `splitTopLevel`：多行定义必须切成「一个片段」而不是「一行一个」。
+   * （评审中级-2 的根因就是逐行匹配；这条用例直接压住切分器本身。）
+   */
+  it('splitTopLevel 按顶层逗号切分，多行定义不被拆散', () => {
+    const body = `id uuid primary key,
+patient_id uuid not null
+  references public.patients(id)
+  on delete cascade,
+note text`
+    const parts = splitTopLevel(body)
+    expect(parts.length).toBe(3)
+    expect(parts[0]).toContain('id')
+    expect(parts[1]).toContain('references')
+    expect(parts[2]).toContain('note')
+  })
+
+  it('splitTopLevel 不在括号或字符串内部切分', () => {
+    const body = `a numeric check (a in (1, 2)), b text default 'x,y', c int`
+    const parts = splitTopLevel(body)
+    expect(parts.length).toBe(3)
+    expect(parts[0]).toContain('check')
+    expect(parts[1]).toContain('x,y')
+    expect(parts[2]).toContain('c int')
+  })
+  /**
+   * 真实 schema.sql 里没有幻影列（关键字被当成列名）。
+   * 这是「解析器把 SQL 结构误读成列」的总兜底。
+   */
+  it('真实 schema.sql 解析结果不含任何幻影列', async () => {
+    const { readFileSync } = await import('node:fs')
+    const sql = readFileSync('supabase/schema.sql', 'utf8')
+    const { columns } = parseSchema(sql)
+    const bad = [
+      'create', 'table', 'constraint', 'primary', 'unique', 'foreign', 'check',
+      'references', 'on', 'as', 'begin', 'end', 'return', 'select', 'insert',
+      'replace', 'function', 'trigger', 'if', 'then', 'else', 'declare',
+      'language', 'security', 'using', 'with', 'not', 'default', 'generated',
+    ]
+    const phantoms = columns.filter((c) => bad.includes(c.column.toLowerCase()))
+    expect(phantoms).toEqual([])
+  })
   it('真实 schema.sql 必须能解析出本轮依赖的两个结构', async () => {
     const { readFileSync } = await import('node:fs')
     const sql = readFileSync('supabase/schema.sql', 'utf8')
@@ -170,14 +393,19 @@ ${indent});
     expect(keys).toContain('blood_pressures.pulse')
   })
 
-  it('真实 schema.sql 解析出的表/列数量不能大幅缩水（防静默漏检）', async () => {
+  it('真实 schema.sql 解析出的表/列数量必须精确（轻微-5：>= 抓不到「少一列多一列」）', async () => {
     const { readFileSync } = await import('node:fs')
     const sql = readFileSync('supabase/schema.sql', 'utf8')
     const { tables, columns } = parseSchema(sql)
-    // 当前是 13 张表 / 89 个列声明（去重后 84）
-    // 这里卡下限而不是精确值：加表加列不该红，但漏解析一大片必须红
-    expect(tables.length).toBeGreaterThanOrEqual(13)
-    expect(dedupeColumns(columns).length).toBeGreaterThanOrEqual(84)
+    // ⚠️ 第十二轮评审·轻微-5：原来写 `>= 13` / `>= 84`，于是「删一列加一列」（净数不变）
+    // 全绿 —— 而这正是解析器回归最典型的形态。改成精确值。
+    //
+    // 加表/加列时这里会红，但那是**期望行为**：`schema-baseline.spec.ts` 的手写清单
+    // 也要同步改，两处一起更新才说明结构变更是有意的。
+    expect(tables.length).toBe(13)
+    expect(dedupeColumns(columns).length).toBe(84)
+    // 顺带钉住原始声明数（去重前 89，含 alter 的 5 个）
+    expect(columns.length).toBe(89)
   })
 })
 
@@ -223,33 +451,33 @@ describe('生产库结构检查 · 配置读取与目标校验', () => {
 
 describe('生产库结构检查 · 探测结果分类', () => {
   it('200 → ok', () => {
-    expect(classify({ ok: true }, 'table')).toBe('ok')
+    expect(classify({ ok: true })).toBe('ok')
   })
 
   it('404 PGRST205 → 缺表（这次事故的直接信号）', () => {
-    expect(classify({ ok: false, status: 404, code: 'PGRST205' }, 'table')).toBe('missing-table')
+    expect(classify({ ok: false, status: 404, code: 'PGRST205' })).toBe('missing-table')
   })
 
   it('42P01 → 缺表', () => {
-    expect(classify({ ok: false, status: 400, code: '42P01' }, 'table')).toBe('missing-table')
+    expect(classify({ ok: false, status: 400, code: '42P01' })).toBe('missing-table')
   })
 
   it('400 42703 → 缺列（心率 pulse 那次就是这个）', () => {
-    expect(classify({ ok: false, status: 400, code: '42703' }, 'column')).toBe('missing-column')
+    expect(classify({ ok: false, status: 400, code: '42703' })).toBe('missing-column')
   })
 
   it('401/403 → unknown（不能当成结构 OK）', () => {
-    expect(classify({ ok: false, status: 401, code: null }, 'table')).toBe('unknown')
-    expect(classify({ ok: false, status: 403, code: null }, 'table')).toBe('unknown')
+    expect(classify({ ok: false, status: 401, code: null })).toBe('unknown')
+    expect(classify({ ok: false, status: 403, code: null })).toBe('unknown')
   })
 
   it('fetch 失败 / 超时 → unknown', () => {
-    expect(classify({ ok: null, error: 'fetch failed' }, 'table')).toBe('unknown')
-    expect(classify({ ok: null, timeout: true, error: '超时 8000ms' }, 'table')).toBe('unknown')
+    expect(classify({ ok: null, error: 'fetch failed' })).toBe('unknown')
+    expect(classify({ ok: null, timeout: true, error: '超时 8000ms' })).toBe('unknown')
   })
 
   it('未知错误码 → unknown（不能猜成 OK）', () => {
-    expect(classify({ ok: false, status: 500, code: 'XX000' }, 'table')).toBe('unknown')
+    expect(classify({ ok: false, status: 500, code: 'XX000' })).toBe('unknown')
   })
 })
 
@@ -474,18 +702,43 @@ describe('生产库结构检查 · 退出码（事故依赖的判定链）', () 
 })
 
 describe('生产库结构检查 · 真实 schema.sql 端到端（离线 mock 探测）', () => {
-  it('用真实 schema.sql + 全绿 mock probe → exit 0', async () => {
+  it('用真实 schema.sql + 全绿 mock probe → exit 0，且探测项数量精确是 97', async () => {
     const { readFileSync } = await import('node:fs')
     const sql = readFileSync('supabase/schema.sql', 'utf8')
+    // 收下 probe 实际被问了哪些 (table, column)，用来做**集合**断言
+    const asked = []
     const r = await runCheck({
       readFile: makeReadFile({ '.env.production': envFile(), 'supabase/schema.sql': sql }),
       exists: () => true,
-      probeFn: fakeProbe({}),
+      probeFn: async (_u, _a, table, column) => {
+        asked.push({ table, column })
+        return { ok: true }
+      },
       logger: quietLogger,
     })
     expect(r.code).toBe(0)
-    // 13 张表 + 84 列 = 97 项
+
+    // ⚠️ 第十二轮评审·中级-4：这里原来是**自指**的 ——
+    // `expected` 由同一个 `parseSchema(sql)` 构造，等于断言 `f(x) == f(x)`，
+    // 解析器少解析一张表时两边同时少、仍然相等；`okCount === tables.length + cols.length`
+    // 和 `okCount === asked.length` 更是纯算术恒真。
+    //
+    // 改成**独立的魔数**：97 = 13 张表 + 84 个列。这个数字由
+    // `tests/guards/schema-baseline.spec.ts` 的**手写清单**独立钉住（那边每表精确
+    // 列出列名），所以这里写死 97 不会变成「改测试而不是信守卫」——
+    // 结构真变了，baseline 那条会先红、提醒你两处一起更新。
+    expect(asked.length).toBe(97)
     expect(r.okCount).toBe(97)
+    // 再点名几个关键探测项，防止「97 个全问同一张表」这种畸形通过
+    const askedKeys = asked.map((x) => `${x.table}.${x.column}`)
+    expect(askedKeys).toContain('blood_pressures.*')
+    expect(askedKeys).toContain('blood_pressures.pulse')
+    expect(askedKeys).toContain('patient_change_logs.*')
+    expect(askedKeys).toContain('patient_change_logs.old_value')
+    expect(askedKeys).toContain('sessions.*')
+    expect(askedKeys).toContain('sessions.doctor_uf')
+    // 每张表都必须被探测到（不能漏表）
+    expect(new Set(asked.map((x) => x.table)).size).toBe(13)
   })
 
   it('真实 schema.sql + 缺 patient_change_logs → exit 1（复现第十一轮事故）', async () => {
