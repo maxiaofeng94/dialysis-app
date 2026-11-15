@@ -26,6 +26,13 @@ function read(rel: string): string {
   return readFileSync(`${ROOT}/${rel}`, 'utf8')
 }
 
+/** 去掉注释，避免把说明文字里的内容当成代码（本项目其他守卫同款实现） */
+function stripComments(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1")
+}
+
 /** 工作流目录（从磁盘读：新加的 workflow 可能还没提交） */
 function workflowFiles(): string[] {
   return readdirSync(`${ROOT}/.github/workflows`).filter((f) => /\.ya?ml$/.test(f))
@@ -161,6 +168,61 @@ describe('静态守卫 · 构建与发布不变式', () => {
         /chmod\s+\+x\s+gradlew/.test(src),
         'build-apk.yml 缺 `chmod +x gradlew` 兜底：gradlew 权限一旦掉成 100644，CI 直接 Permission denied',
       ).toBe(true)
+    })
+  })
+
+  describe('PWA 预缓存上限（构建不能因主包体积而整份失败）', () => {
+    /**
+     * 中级-2（第八轮测试有效性评审）：`vite.config.ts` 的 workbox 预缓存上限**零测试守护**。
+     *
+     * 实测过的失败现场：主包 `index-*.js` 2,098 kB 超过 workbox 默认 2 MiB 上限时，
+     * `npm run build` 会在打印「✓ built in 899ms」**之后**抛出：
+     *   error during build: Configure "workbox.maximumFileSizeToCacheInBytes" ...
+     *   - assets/index-*.js is 2.1 MB, and won't be precached.
+     * 而同一份代码 `npx vitest run` 是 **1813 条全绿** —— 也就是说测试层面对此完全无感，
+     * 很容易「测试全绿就推送」，然后在 CI 里构建失败。
+     *
+     * 所以这里用静态断言把「必须显式抬高预缓存上限」钉住。
+     */
+    it('vite.config.ts 必须显式抬高 workbox 预缓存上限（主包已超 2 MiB 默认值）', () => {
+      const src = stripComments(read('vite.config.ts'))
+      expect(
+        /workbox\s*:\s*\{/.test(src),
+        'vite.config.ts 里没有 workbox 配置块。主包已超 2 MiB 默认预缓存上限，' +
+          '缺了它会**整个构建失败**（error during build: PLUGIN_ERROR），而不是只丢预缓存。',
+      ).toBe(true)
+
+      const m = src.match(/maximumFileSizeToCacheInBytes\s*:\s*([^,\n]+)/)
+      expect(
+        m,
+        'vite.config.ts 没有设置 maximumFileSizeToCacheInBytes：' +
+          '主包 2.1 MB 超过 workbox 默认 2 MiB → npm run build 失败（报错在 built in 之后才出现，极易漏看）',
+      ).toBeTruthy()
+
+      // 解析实参：只接受「数字 * 1024 * 1024」这类可静态求值的写法，值必须 ≥ 2.5 MiB
+      const expr = m![1].trim()
+      const parts = expr.split('*').map((x) => x.trim())
+      let bytes = 1
+      for (const part of parts) {
+        const n = Number(part)
+        expect(
+          Number.isFinite(n),
+          `maximumFileSizeToCacheInBytes 的表达式「${expr}」含无法静态求值的项「${part}」，` +
+            '守卫没法判断它够不够大。请写成 4 * 1024 * 1024 这种形式。',
+        ).toBe(true)
+        bytes *= n
+      }
+      // 第九轮独立评审轻微-3：原来断言「≥ 2.5 MiB」，比配置值（4 MiB）松 ——
+      // 主包从 2.1 MB 慢慢涨到 3.9 MB 时守卫照样绿，等于没守住体积失控。
+      // 改成**精确等于 4 MiB**：谁把这个值改小（哪怕是「省点预缓存」）都会立刻红，
+      // 逼迫改动者显式面对「主包已经 2.1 MB」这件事。
+      expect(
+        bytes,
+        `maximumFileSizeToCacheInBytes 是 ${bytes} 字节（${(bytes / 1024 / 1024).toFixed(2)} MiB），` +
+          '期望恰好 4 MiB（4 * 1024 * 1024）。\n' +
+          '调小它会让「主包 2.1 MB」重新顶破预缓存上限 → npm run build 整个失败；\n' +
+          '⚠️ 而且抬上限只是**止血**不是解法：正解是代码分割（ECharts / Vant 按需 / 后台模块懒加载）。',
+      ).toBe(4 * 1024 * 1024)
     })
   })
 

@@ -1945,16 +1945,22 @@ describe('SessionView · 进行中按当前档案计算（需求①）', () => {
   })
 
   /**
-   * P2（本轮自查）：`patient.value = p` 原本在第二次 `stateSnapshot()` 复查**之前**执行。
+   * P2：`patient.value = p` 原本在第二次 `stateSnapshot()` 复查**之前**执行。
    *
    * 场景：用户在详情页改「记录人」/「上机前称重」，此时另一端改了档案并触发后台刷新 →
    * `mergeRemoteIfUntouched` 里 `stateSnapshot() !== knownSnapshot` 会挡住**表单回填**，
    * 但 `patient.value` 已经被换掉了 → 页面上「上机前实际 / 计划脱水」等**派生数字跳变**，
    * 而用户正在输入。虽然表单没被覆盖，数字突然变化同样会让人以为「我填错了」。
    *
-   * 修法：把 `patient.value = p` 也放到复查之后。
+   * ⚠️ 第四轮测试评审实测：本条用例原本是**假绿** —— `getPatient` 立即 resolve，
+   * `patient.value` 的赋值落在「用户输入」**之前**，所以删掉复查、或把赋值移回复查之前，
+   * 它都照样绿（`1 passed | 122 skipped`）。现在改成**把 `getPatient` 挂在 promise 上**，
+   * 让用户输入发生在 `await` 期间，才真正测得到赋值时机。
+   *
+   * 判别力（实测）：`patient.value = p` 移回复查之前 → 本用例红
+   * （`expected '66.6kg' to be '60.0kg'`）。
    */
-  it('用户正在输入时后台刷新：派生数字也不许跳变（patient 更新同样要等复查）', async () => {
+  it('用户正在输入时后台刷新：派生数字也不许跳变（把网络挂住才测得到时序）', async () => {
     const w = await mountSession(
       defaultData({
         session: makeSession({
@@ -1971,12 +1977,24 @@ describe('SessionView · 进行中按当前档案计算（需求①）', () => {
     // 挂载时：80 − 20 = 60
     expect(w.findAll('.flow-val')[0].text()).toBe('60.0kg')
 
-    // 用户开始输入（记录人），stateSnapshot 与 knownSnapshot 不再相等
+    // 把 getPatient 挂住，让「用户输入」能发生在 await 期间
+    let releasePatient: (v: ReturnType<typeof makePatient>) => void = () => {}
+    vi.mocked(repository.getPatient).mockReturnValue(
+      new Promise((resolve) => {
+        releasePatient = resolve as never
+      }) as never,
+    )
+
+    // 触发后台刷新（进入 await，卡在挂住的 getPatient 上）
+    cacheVersion.value += 1
+    await flushPromises()
+
+    // 用户**在等待期间**开始输入（stateSnapshot 与 knownSnapshot 不再相等）
     await fieldInput(w, '记录人').setValue('李护士')
 
-    // 另一端把档案改成 13.4 并触发后台刷新
-    vi.mocked(repository.getPatient).mockResolvedValue(makePatient({ wheelchairWeight: 13.4 }))
-    cacheVersion.value += 1
+    // 网络回来：另一端把档案改成 13.4
+    releasePatient(makePatient({ wheelchairWeight: 13.4 }))
+    await flushPromises()
     await flushPromises()
 
     // 用户正在输入 → 合并整体跳过，派生数字必须还是 60.0（不能跳到 66.6）

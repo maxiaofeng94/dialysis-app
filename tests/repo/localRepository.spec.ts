@@ -643,6 +643,180 @@ describe('localRepository · 变更记录的导入导出', () => {
 
     expect(await db.patientChangeLogs.count()).toBe(0)
   })
+
+  /**
+   * 轻微-4（第四轮独立评审）：`validateBackup` 不校验数值量程。
+   *
+   * 为什么必须在这里拦：迁移路径（`lib/migrate.ts`）会把患者档案喂给 `create-patient`，
+   * 而那个 Edge Function 有 100kg / 2000ml 上限。手改过的备份能塞进
+   * `wheelchairWeight: 101`，导入阶段一切正常，等到「迁移到云端」才被服务端 400 拒掉 ——
+   * 而迁移本身**没有幂等保护**（`migrate.ts:12-13` 已承认），用户重试就会在云端
+   * 造出重复病人（App 内删不掉）。
+   *
+   * ⚠️ 第六轮测试评审 E17：数值必须**贴着边界**（101 / 2001）。
+   * 原来写 1500 / 5000，把上限改成 1000 / 4000 也照样超限 → 用例照绿，
+   * 「上限就是 100 / 2000」这件事等于没有断言。
+   *
+   * 判别力：去掉 `validateBackup` 里新增的 `check('轮椅及衣物重量…')` → 本用例红；
+   * 把上限 100 改成 1000 → 也红。
+   */
+  it('导入的备份里轮椅重量超量程时整份拒绝（坏数据要在导入阶段就拦下，不能等到迁移才炸）', async () => {
+    await localRepository.addPatientChangeLog(makeChangeLog({ id: 'keep' }))
+
+    await expect(
+      localRepository.importAll(
+        JSON.stringify({ patients: [makePatient({ id: 'p1', wheelchairWeight: 101 })] }),
+      ),
+      '101kg 的轮椅重量被放行了 → 迁移时会被服务端 400 拒掉，重试造重复病人',
+    ).rejects.toThrow(/轮椅及衣物重量/)
+
+    // 先校验再清库：已有数据不能被清掉
+    expect(await db.patientChangeLogs.count()).toBe(1)
+    expect(await db.patients.count()).toBe(0)
+  })
+
+  it('导入的备份里回水量超量程时整份拒绝', async () => {
+    await expect(
+      localRepository.importAll(
+        JSON.stringify({ patients: [makePatient({ id: 'p1', rinseBackVolume: 2001 })] }),
+      ),
+    ).rejects.toThrow(/回水量/)
+    expect(await db.patients.count()).toBe(0)
+  })
+
+  /**
+   * 第六轮测试评审 R3 / R4：负值与 `NaN` 分支无覆盖。
+   *
+   * 手改备份能塞进 `-5`（Vant 的 number 输入也允许前导负号），
+   * 或者干脆写成 `'abc'`。两条分支行为正确但**没有回归防线**。
+   */
+  it('导入的备份里轮椅重量为负时整份拒绝', async () => {
+    await expect(
+      localRepository.importAll(
+        JSON.stringify({ patients: [makePatient({ id: 'p1', wheelchairWeight: -5 })] }),
+      ),
+    ).rejects.toThrow(/轮椅及衣物重量/)
+    expect(await db.patients.count()).toBe(0)
+  })
+
+  it('导入的备份里轮椅重量不是数字时整份拒绝', async () => {
+    await expect(
+      localRepository.importAll(
+        JSON.stringify({ patients: [makePatient({ id: 'p1', wheelchairWeight: 'abc' })] }),
+      ),
+    ).rejects.toThrow(/轮椅及衣物重量/)
+    expect(await db.patients.count()).toBe(0)
+  })
+
+  /**
+   * 中级-2（第五轮 + 第六轮独立评审双重坐实）：`Number()` 强转让非数字值「通过校验」。
+   *
+   * `Number('')===0`、`Number('   ')===0`、`Number(true)===1`、`Number([])===0`、
+   * `Number([50])===50` —— 全都落在 0~100 内，于是能原样入库。后果：
+   * - 首页 `w - p.wheelchairWeight` → NaN，上机前实际体重与计划脱水都显示「—」
+   * - `migrate.ts` 把 `''`/`[]` 喂给 `create-patient`，服务端 `Number(x ?? 0)` 得 0
+   *   → **云端静默存 0kg**（不报错、不提示）
+   *
+   * 判别力：删掉 `validateBackup` 里的类型闸门（`typeof value !== 'number'` 分支）→ 三条全红。
+   */
+  it.each([
+    ['空字符串', ''],
+    ['纯空格', '   '],
+    ['布尔 true', true],
+    ['空数组', []],
+  ])('导入的备份里轮椅重量是「%s」时整份拒绝（Number() 会把它转成 0/1 混过校验）', async (_label, bad) => {
+    await expect(
+      localRepository.importAll(
+        JSON.stringify({ patients: [makePatient({ id: 'p1', wheelchairWeight: bad })] }),
+      ),
+    ).rejects.toThrow(/轮椅及衣物重量/)
+    expect(await db.patients.count(), '非数字值入库 → 首页会显示「—」并让迁移静默存 0kg').toBe(0)
+  })
+
+  /**
+   * 第六轮测试评审 E18：`Number(value)` 的语义要明确。
+   *
+   * 设计意图是「数字字符串也算数字」（备份文件是 JSON，手写时很容易把 `50` 写成 `"50"`），
+   * 所以 `Number('50')` 必须被接受。把 `Number(value)` 去掉（直接用 `value as number`）
+   * → `'50'` 会走 `!Number.isFinite('50')` 被拒 → 本用例红。
+   */
+  it('导入的备份里数值写成字符串（"50"）时照常接受（手写 JSON 的常见形态）', async () => {
+    await expect(
+      localRepository.importAll(
+        JSON.stringify({ patients: [makePatient({ id: 'p1', wheelchairWeight: '50' })] }),
+      ),
+    ).resolves.toBeUndefined()
+    expect(await db.patients.count()).toBe(1)
+  })
+
+  /**
+   * 轻微-2（第八轮独立评审）：字符串数字必须**规范化成真数字**再入库，不能原样留着。
+   *
+   * 原状：`"50"` 能通过校验，但写回库的仍是字符串 `"50"` →
+   * `fmt()` 用 `Number.isFinite` 判字符串为 false → 显示「—」；
+   * `HomeView` 的 `w - p.wheelchairWeight` 直接算出 `NaN`。
+   *
+   * 判别力：删掉 `normalizeBackupPatients` 的调用（`const data = parsed`）→ 本用例红。
+   */
+  it('字符串形式的数值导入后要变成真数字（否则下游算出 NaN / 显示「—」）', async () => {
+    await expect(
+      localRepository.importAll(
+        JSON.stringify({
+          patients: [makePatient({ id: 'p1', wheelchairWeight: '50', rinseBackVolume: ' 300 ' })],
+        }),
+      ),
+    ).resolves.toBeUndefined()
+    const got = await db.patients.get('p1')
+    expect(typeof got?.wheelchairWeight, '字符串原样入库 → fmt() 显示「—」、减法得 NaN').toBe('number')
+    expect(got?.wheelchairWeight).toBe(50)
+    expect(typeof got?.rinseBackVolume).toBe('number')
+    expect(got?.rinseBackVolume).toBe(300)
+  })
+
+  // ⚠️ 这两条走的是**规范十进制校验**那条分支：`Number('1e2')===100`、`Number('0x10')===16`
+  // 都落在量程内，只靠量程检查拦不住，必须靠正则。删掉正则 → 两条都红（实测）。
+  it.each([
+    ['指数写法 1e2', '1e2'],
+    ['十六进制 0x10', '0x10'],
+  ])('导入的备份里数值写成「%s」时整份拒绝（Number() 会把它当数字，但下游认不出来）', async (_l, bad) => {
+    await expect(
+      localRepository.importAll(
+        JSON.stringify({ patients: [makePatient({ id: 'p1', wheelchairWeight: bad })] }),
+      ),
+    ).rejects.toThrow(/轮椅及衣物重量/)
+    expect(await db.patients.count()).toBe(0)
+  })
+
+  // ⚠️ 这条走的是**量程**分支（`Number('100kg')` 是 NaN），不是正则分支 ——
+  // 单列出来并写明走哪条，免得以后有人以为它在守护正则（实测删掉正则它照样绿）。
+  it('导入的备份里数值带单位（100kg）时整份拒绝（走量程分支：Number() 得 NaN）', async () => {
+    await expect(
+      localRepository.importAll(
+        JSON.stringify({ patients: [makePatient({ id: 'p1', wheelchairWeight: '100kg' })] }),
+      ),
+    ).rejects.toThrow(/轮椅及衣物重量/)
+    expect(await db.patients.count()).toBe(0)
+  })
+
+  it('量程内的边界值照常导入（100kg / 2000ml 是合法的，别把上限本身也拦掉）', async () => {
+    await expect(
+      localRepository.importAll(
+        JSON.stringify({ patients: [makePatient({ id: 'p1', wheelchairWeight: 100, rinseBackVolume: 2000 })] }),
+      ),
+    ).resolves.toBeUndefined()
+    expect((await db.patients.get('p1'))?.wheelchairWeight).toBe(100)
+  })
+
+  it('旧备份缺 wheelchairWeight / rinseBackVolume 时照常导入（兜底交给页面，不在这里拒绝）', async () => {
+    await expect(
+      localRepository.importAll(
+        JSON.stringify({
+          patients: [{ id: 'p-old', name: '旧病人', createdAt: 1, updatedAt: 1 }],
+        }),
+      ),
+    ).resolves.toBeUndefined()
+    expect(await db.patients.count()).toBe(1)
+  })
 })
 
 /**

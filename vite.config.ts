@@ -73,6 +73,18 @@ export default defineConfig(({ mode }) => {
         : [
             VitePWA({
               registerType: 'autoUpdate',
+              workbox: {
+                // ⚠️ 主包体积已经顶到 workbox 默认 2 MiB 预缓存上限的**上面**（实测 2,098 kB），
+                // 不加这一行 `npm run build` 会**整个失败**，而且报错埋在 vite reporter 里：
+                // 先打印「✓ built in 899ms」，再突然 `error during build: PLUGIN_ERROR`
+                // （`hook: closeBundle`，`assets/index-*.js is 2.1 MB, and won't be precached`）。
+                // 报错文案只提示「Configure maximumFileSizeToCacheInBytes」，很容易被当成警告忽略。
+                //
+                // 这里显式抬到 4 MiB 并留余量。但**这是一笔债，不是解法**：主包 2.1 MB（gzip 663 kB）
+                // 对透析室弱网是真实负担，正解是做代码分割（ECharts / Vant 按需 / 后台模块懒加载）。
+                // 抬上限只是让「多写几行代码就构建失败」不再发生。
+                maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
+              },
               includeAssets: [
                 'icon.svg',
                 'pwa-192.png',

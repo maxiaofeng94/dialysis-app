@@ -62,6 +62,24 @@ async function call(action, payload, token) {
   return body.data
 }
 
+/**
+ * 调用**应当被拒绝**的写接口，返回 `{ status, error }`。
+ *
+ * ⚠️ 中级-3（第六轮独立评审坐实）：这份脚本原来把全部超限 payload 都改成了量程内，
+ * 于是「上限拒绝」这条真实运行路径彻底没有验证 —— 把 `admin-api` 的 `value > 100`
+ * 改成 `value > 10000`，脚本照样全绿。而静态守卫只比对源码文本，测不出运行时行为。
+ * 现在补了 N1/N2 两条负向步骤（贴边界 101kg / 2001ml），断言服务端真的 400。
+ */
+async function callExpectReject(action, payload, token) {
+  const res = await fetch(`${url}/functions/v1/admin-api`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', apikey: anon, Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ action, payload: payload ?? {} }),
+  })
+  const body = await res.json().catch(() => ({}))
+  return { status: res.status, error: String(body.error ?? '') }
+}
+
 /** 跑一步，断言返回值；返回 data 供后续步骤使用 */
 async function step(id, desc, fn, assert) {
   try {
@@ -117,7 +135,7 @@ await step(
     const res = await fetch(`${url}/functions/v1/create-patient`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', apikey: anon, Authorization: `Bearer ${plain.token}` },
-      body: JSON.stringify({ name: '后台验证临时病人', wheelchairWeight: 1500, rinseBackVolume: 300 }),
+      body: JSON.stringify({ name: '后台验证临时病人', wheelchairWeight: 13.4, rinseBackVolume: 300 }),
     })
     const body = await res.json().catch(() => ({}))
     if (!res.ok || !body.patient) throw new Error(body.error ?? `HTTP ${res.status}`)
@@ -139,15 +157,30 @@ await step(
 // ---------- 写接口 ----------
 await step(
   'W1',
-  'patient.update 修改病人配置（轮椅及衣物重量 1500→2000）',
-  () => call('patient.update', { patientId: tempPatientId, wheelchairWeight: 2000 }, admin.token),
+  'patient.update 修改病人配置（轮椅及衣物重量 13.4→14.0）',
+  () => call('patient.update', { patientId: tempPatientId, wheelchairWeight: 14.0 }, admin.token),
   () => true,
 )
 await step(
   'W1b',
   '回读确认配置已生效',
   () => call('patient.get', { patientId: tempPatientId }, admin.token),
-  (d) => d.patient.wheelchairWeight === 2000,
+  (d) => d.patient.wheelchairWeight === 14.0,
+)
+
+// ---------- 负向：量程上限必须真的被拒（中级-3，第六轮独立评审） ----------
+// 用**贴边界**的 101 / 2001（不是 1500 / 5000）：上限一旦被改大，贴边界的值才会漏过。
+await step(
+  'N1',
+  'patient.update 轮椅及衣物重量 101kg 必须被拒（>100）',
+  () => callExpectReject('patient.update', { patientId: tempPatientId, wheelchairWeight: 101 }, admin.token),
+  (r) => r.status === 400 && /100/.test(r.error),
+)
+await step(
+  'N2',
+  'patient.update 回水量 2001ml 必须被拒（>2000）',
+  () => callExpectReject('patient.update', { patientId: tempPatientId, rinseBackVolume: 2001 }, admin.token),
+  (r) => r.status === 400 && /2000/.test(r.error),
 )
 
 await step(

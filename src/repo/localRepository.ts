@@ -89,6 +89,89 @@ function validateBackup(data: unknown): asserts data is BackupData {
       }
     })
   }
+  // ⚠️ 轻微-4（第四轮独立评审）：患者表的数值必须在这里就拦住量程外的手改值。
+  //
+  // 为什么必须现在拦：迁移路径（`lib/migrate.ts`）会把患者档案喂给 `create-patient`，
+  // 而那个 Edge Function 有 100kg / 2000ml 上限（`轻微-8` 加的）。手改过的备份能塞进
+  // `wheelchairWeight: 1500`，导入阶段一切正常，等到「迁移到云端」才被服务端 400 拒掉 ——
+  // 而迁移本身**没有幂等保护**（`migrate.ts:12-13` 的注释已承认），用户重试就会在云端
+  // 造出重复病人（App 内删不掉）。所以在导入这一步就拒绝，代价是用户改一下备份文件。
+  const patients = d.patients
+  if (Array.isArray(patients)) {
+    patients.forEach((row, i) => {
+      const p = row as { wheelchairWeight?: unknown; rinseBackVolume?: unknown }
+      const check = (label: string, value: unknown, max: number) => {
+        if (value == null) return // 旧备份缺字段：由各页面的兜底逻辑处理，不在这里拒绝
+        // ⚠️ 中级-2（第五轮/第六轮独立评审双重坐实）：**必须先做类型闸门，再谈量程**。
+        // 原来直接 `const n = Number(value)`，而 `Number('')===0`、`Number('   ')===0`、
+        // `Number(true)===1`、`Number([])===0`、`Number([50])===50` —— 这些全都落在 0~100 内，
+        // 于是空字符串 / 布尔 / 数组能「通过校验」原样入库：
+        //   · 首页 `w - p.wheelchairWeight` 变 NaN → 上机前实际体重与计划脱水都显示「—」
+        //   · `migrate.ts` 把 `''`/`[]` 喂给 `create-patient`，服务端 `Number(x ?? 0)` 得 0
+        //     → **云端静默存 0kg**（不报错、不提示）
+        // 只放行「数字」与「非空数字字符串」（备份是手写 JSON，`"50"` 很常见）。
+        if (typeof value === 'string') {
+          if (value.trim() === '') {
+            throw new Error(
+              `备份文件里第 ${i + 1} 个病人的${label}是空字符串，请填一个 0~${max} 的数字再导入`,
+            )
+          }
+          // ⚠️ 轻微-2（第八轮独立评审）：只接受**规范十进制**写法。
+          // `Number('1e2')===100`、`Number('0x10')===16`、`Number(' 50 ')===50` 都能通过量程检查，
+          // 但原值（字符串）会被原样写回库 —— 下游 `fmt('50')` 因 `Number.isFinite` 判字符串为 false
+          // 而显示「—」，`HomeView` 的 `w - p.wheelchairWeight` 更是直接算出 NaN。
+          // 这里拒掉指数 / 十六进制 / 带空格 / 带单位的写法，要求就是普通十进制数字。
+          if (!/^\d+(?:\.\d+)?$/.test(value.trim())) {
+            throw new Error(
+              `备份文件里第 ${i + 1} 个病人的${label}是「${value}」，请写成普通的十进制数字（例如 13.4）再导入`,
+            )
+          }
+        } else if (typeof value !== 'number') {
+          throw new Error(
+            `备份文件里第 ${i + 1} 个病人的${label}是 ${typeof value} 类型的值，请填一个 0~${max} 的数字再导入`,
+          )
+        }
+        const n = Number(value)
+        if (!Number.isFinite(n) || n < 0 || n > max) {
+          throw new Error(
+            `备份文件里第 ${i + 1} 个病人的${label}是 ${String(value)}，超出 0~${max} 的量程，请先修正备份文件再导入`,
+          )
+        }
+      }
+      check('轮椅及衣物重量（kg）', p.wheelchairWeight, 100)
+      check('回水量（ml）', p.rinseBackVolume, 2000)
+    })
+  }
+}
+
+/**
+ * 把备份里「字符串形式的数字」规范成真数字（轻微-2，第八轮独立评审）。
+ *
+ * 为什么必须做：`validateBackup` 允许 `"13.4"` / `"50"` 这种手写 JSON 常见的写法（否则会误拒
+ * 合法备份），但**原值（字符串）会被原样写回库**。下游 `fmt()` 用 `Number.isFinite` 判字符串
+ * 为 false → 显示「—」；`HomeView` 的 `w - p.wheelchairWeight` 更是直接算出 `NaN`。
+ * 所以在校验通过之后、写库之前，把这两个字段统一转成 `number`。
+ *
+ * 只处理这两个已知字段，其余字段原样保留 —— 不做通用「猜字符串数字」的魔法，
+ * 免得把 `note: "50"` 这种本该是文本的字段也改掉。
+ */
+function normalizeBackupPatients(data: BackupData): BackupData {
+  if (!Array.isArray(data.patients)) return data
+  const NUMERIC_KEYS = ['wheelchairWeight', 'rinseBackVolume'] as const
+  return {
+    ...data,
+    patients: data.patients.map((p) => {
+      const row = { ...p } as Record<string, unknown>
+      for (const key of NUMERIC_KEYS) {
+        const v = row[key]
+        if (typeof v === 'string') {
+          const n = Number(v.trim())
+          if (Number.isFinite(n)) row[key] = n
+        }
+      }
+      return row as unknown as (typeof data.patients)[number]
+    }),
+  }
 }
 
 class LocalRepository implements Repository {
@@ -232,7 +315,8 @@ class LocalRepository implements Repository {
     }
     // 先整体校验：这一步抛错时，本机数据一个字节都没动
     validateBackup(parsed)
-    const data = parsed
+    // 校验通过后把字符串数字规范成真数字，避免 `"50"` 原样入库导致下游算出 NaN
+    const data = normalizeBackupPatients(parsed)
 
     // 清空 + 写入放在同一个事务里：中途失败会整体回滚，不会留下「清了一半」的库
     await db.transaction(

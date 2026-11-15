@@ -148,7 +148,24 @@ describe('SettingsView 的留痕纪律（源码级守卫）', () => {
     // 只在 savePatient 函数体内比较，别处的同名赋值不算数
     const fnStart = settingsSrc.indexOf('async function savePatient')
     expect(fnStart).toBeGreaterThan(-1)
-    const body = settingsSrc.slice(fnStart, settingsSrc.indexOf('\n}\n', fnStart))
+    // ⚠️ 必须是 `'\n}'` 而不是 `'\n}\n'`（第四轮测试评审实测）：
+    // 本文件是 **CRLF**，函数结尾是 `\r\n}\r\n`，`'\n}\n'` 永远匹配不到 →
+    // `indexOf` 返回 -1 → `slice(fnStart, -1)` 把函数体放大到文件尾（实测 21KB，
+    // 含后面好几个函数）。那样只要文件后半段任何位置出现 `patient.value = p`，
+    // 断言就会「侥幸通过」；一旦 savePatient 内那行被删，这条守卫会**假绿**。
+    const end = settingsSrc.indexOf('\n}', fnStart)
+    expect(end, '找不到 savePatient 的函数结尾（改写法了？请同步更新本守卫）').toBeGreaterThan(fnStart)
+    const body = settingsSrc.slice(fnStart, end)
+    // 自检①：切片不能把下一个函数吞进来，否则边界又错了（挡「截太多」）
+    expect(body).not.toContain('async function flushPendingWheelchairLog')
+    // 自检②：切片也不能**提前截断**（第六轮独立评审轻微-4）——
+    // `indexOf('\n}')` 取的是第一个行首 `}`，一旦 savePatient 体内出现行首 `}`（模板字符串、
+    // 或将来把某段抽成嵌套对象字面量），切片会在 `prevWheelchair` 之前结束。
+    // 只查「不吞下一个函数」挡不住这种提前截断，所以再钉住两个必须出现的锚点。
+    expect(body, '切片提前截断了（savePatient 里出现了行首 }？请改本守卫的边界取法）').toContain(
+      'const prevWheelchair',
+    )
+    expect(body, '切片提前截断了（没走到 savePatient 的 finally）').toContain('savingPatient.value = false')
     const prevIdx = body.indexOf('const prevWheelchair')
     const assignIdx = body.indexOf('patient.value = p')
     expect(prevIdx).toBeGreaterThan(-1)

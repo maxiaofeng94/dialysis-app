@@ -33,6 +33,10 @@ const { user, isLoggedIn, logout } = useAuth()
 /** 各操作的进行中状态：按钮 loading/disabled 用，防止连点造成重复写入（新建/迁移各建一个病人） */
 const savingPatient = ref(false)
 const savingDw = ref(false)
+/** 删除干体重在途（含「确认框开着」那段窗口）。与 `savingDw` 分开，见 `removeDw` 注释 */
+const deletingDw = ref(false)
+/** 导入备份在途（含「确认框开着」那段窗口）。整库替换必须防连点，见 `onImportFile` */
+const importing = ref(false)
 const savingName = ref(false)
 const creatingPatient = ref(false)
 const migrating = ref(false)
@@ -111,15 +115,43 @@ const newPatientForm = reactive({ name: '', wheelchairWeight: '', rinseBackVolum
 /** 首次加载（本机还没有缓存）时的骨架占位 */
 const loading = ref(true)
 /**
- * 「档案正在重新加载」的独立标记（不控制骨架屏）。
+ * 「档案正在重新加载」的**计数器**（不控制骨架屏、**也不控制 UI 灰化**）。
  *
  * ⚠️ 不能复用 `loading`：它的语义是「首屏还没好」，只在首次加载时为 true。
  * 若让 `load()` 每次都把它置 true，迁移后刷新、干体重保存后重载都会闪一下整页骨架，
  * 用户正在看的表单被替换成占位块（实测会打挂「迁移：连点只迁移一次」）。
  * 但 `switchPatient` 又确实需要知道「有加载在途」—— 否则甲的档案会落到乙的上下文。
- * 所以用一个不影响渲染的独立标记。
+ *
+ * ⚠️ 为什么是**计数器**而不是布尔（第五轮测试评审坐实）：这个标记有**两个所有者** ——
+ * `switchPatient`（覆盖 setCurrentPatientId + refreshCurrentRole + load 整段）与
+ * `load()`（自己被 6 处调用）。用布尔时，`load()` 的 `finally` 会**无条件清掉**
+ * `switchPatient` 持有的标记：`removeDw()` / `saveDw()` 都是 `await load()`，
+ * 干体重请求在途时切病人 → 干体重那次 load 用**新 pid** 跑完并清标记 →
+ * `switchPatient` 的守卫失效 → 点保存写出「乙的 id + 甲的姓名生日」，且
+ * `updatedAtIso: null` 绕过乐观锁（探针实测已复现，见 SettingsView.spec.ts 对应用例）。
+ * 计数器让每个持有者只管自己那一份，谁都不会清掉别人的。
+ *
+ * ⚠️ 中级-1（第四轮独立评审）：**只有「切换病人」这一条链才锁 UI**。
+ * 干体重保存/删除触发的 `load()` 也会持有本计数器，如果拿它去灰化病人列表、
+ * 禁用保存按钮，那么每次正常存一条干体重都会让整块列表变灰点不动
+ * （`resilientFetch` 最坏 3×15s + 退避 ≈ 46s 无任何加载指示），用户以为 App 卡死。
+ * 而 `load()` 保护用户输入靠的是 `formSnapshot` 比对，本来就不需要锁 UI。
+ * 所以 UI 灰化只看 `switchingPatient`，本计数器只给「拒绝保存/切换」的守卫用。
  */
-const reloading = ref(false)
+const reloadingCount = ref(0)
+const reloading = computed(() => reloadingCount.value > 0)
+/** 只有它控制 UI 灰化（见上面 `reloadingCount` 的注释） */
+const switchingPatient = ref(false)
+/** 取一份「加载在途」持有权；返回释放函数（必须放在 finally 里调用） */
+function beginReloading(): () => void {
+  reloadingCount.value += 1
+  let released = false
+  return () => {
+    if (released) return // 幂等：重复释放不能让计数变负
+    released = true
+    reloadingCount.value = Math.max(0, reloadingCount.value - 1)
+  }
+}
 /** 加载失败：骨架必须收起并给出「重试」，否则用户只能杀进程（与首页/详情页保持一致） */
 const loadError = ref('')
 /** 当前版本：装机后想确认「装的是哪一版」时，不用再翻系统设置 */
@@ -205,8 +237,19 @@ function pickAddedPatientId(beforeIds: Set<string>): string | null {
  * 这是「病人身份」级别的数据污染，任何页面都不会提示。
  *
  * 保存通常只等几百毫秒，等一下比写错病人档案好得多。
+ *
+ * ⚠️ 第四轮自查（取证用例坐实）：`setCurrentPatientId(id)` 原来在 `await refreshCurrentRole()`
+ * **之前**执行，而 `reloading` 要到 `load(true)` 才置 true。这段窗口（弱网下 1~15 秒）里：
+ * 当前病人 id 已是乙、表单还是甲的、保存按钮可点 → 点保存就写出
+ * `{ id: 'patient-b', name: '甲', birthday: …, updatedAtIso: null }`，
+ * **甲的姓名生日被直接覆盖进乙的档案**（`updatedAtIso: null` 还绕过了乐观锁）。
+ * 所以整个切换流程都要持有 `reloading`，并且 `savePatient` 也要拒绝在途加载时保存。
  */
 async function switchPatient(id: string) {
+  // ⚠️ 轻微-1（第四轮独立评审）：同 id 早退必须排在守卫**之前**。
+  // 否则用户在保存/加载在途时点了**自己那一行**，会被告知「正在保存档案，请稍候再切换病人」——
+  // 但用户根本没在切换（点的是当前病人），文案误导。
+  if (id === currentPatientId.value) return // 重复点同一行：没必要重新加载
   if (savingPatient.value) {
     showToast('正在保存档案，请稍候再切换病人')
     return
@@ -215,11 +258,33 @@ async function switchPatient(id: string) {
     showToast('正在加载病人档案，请稍候再切换')
     return
   }
-  if (id === currentPatientId.value) return // 重复点同一行：没必要重新加载
-  setCurrentPatientId(id)
-  await refreshCurrentRole()
-  showToast('已切换病人')
-  await load(true) // 换病人：无条件用新档案回填表单
+  // ⚠️ 必须在 `setCurrentPatientId` **之前**取持有权，覆盖 `refreshCurrentRole()` 这段网络等待。
+  // 用 `beginReloading()` 而不是直接置 true：`load()` 也会持有同一个计数器，
+  // 布尔方案下 `load()` 的 finally 会把这里的持有权提前清掉（第五轮评审坐实）。
+  const release = beginReloading()
+  // 只有「切换病人」这条链锁 UI（中级-1：干体重重载不该让列表变灰）
+  switchingPatient.value = true
+  try {
+    setCurrentPatientId(id)
+    try {
+      await refreshCurrentRole()
+    } catch (err) {
+      // 角色刷新失败不该阻断切换（病人已经切了），但也**不能把异常抛给模板 @click** ——
+      // 那会变成未捕获的 Vue 错误、用户什么提示都看不到。按「权限未知」继续：
+      // ⚠️ 注意 `canEditConfig` 对 `currentRole === null` 是**放行**的（见其定义处注释：
+      // 纯本地单机模式没有角色概念，必须能编辑），所以这里只是提示，不阻断操作。
+      // （第六轮独立评审轻微-2：原注释写反成「保守的不可编辑」，会误导后人把单机模式锁死。）
+      console.error(err)
+      showToast('已切换病人，但权限刷新失败，部分操作可能暂时不可用')
+    }
+    showToast('已切换病人')
+    await load(true) // 换病人：无条件用新档案回填表单
+  } finally {
+    // `refreshCurrentRole()` 抛错时这里是**唯一**出口 —— 漏了就让 reloading 永久 > 0，
+    // 用户再也切不了病人（第五轮评审坐实的新死锁）。
+    release()
+    switchingPatient.value = false
+  }
 }
 
 function openNewPatient() {
@@ -255,6 +320,11 @@ async function onCreatePatient() {
     // 否则用户会再点一次，造出 App 内删不掉的重复病人。
     setCurrentPatientId(res.data.patient.id)
     showNewPatient.value = false
+    // ⚠️ 第五轮测试评审坐实：这里原来**不持有** reloading —— 而 `setCurrentPatientId`
+    // 已把当前病人换成新建的丙，表单却还是甲的内容。列表刷新 + 角色刷新 + load 在弱网下
+    // 要 1~15 秒，这期间点保存就写出「丙的 id + 甲的姓名生日」，`updatedAtIso: null`
+    // 绕过乐观锁。新建病人是低频但必然发生的操作，且用户刚填完姓名，点保存很自然。
+    const release = beginReloading()
     try {
       await reloadMyPatients() // 强制重拉：否则命中旧缓存，新病人不在列表里（M2）
       await refreshCurrentRole()
@@ -263,6 +333,8 @@ async function onCreatePatient() {
     } catch (err) {
       console.error(err)
       showToast('病人已创建，但列表刷新失败，请检查网络后重试')
+    } finally {
+      release()
     }
   } catch (err) {
     console.error(err)
@@ -297,13 +369,20 @@ async function onMigrate() {
     // migrateLocalToCloud 的 message 形如「已迁移 N 条透析记录到云端」
     showToast(`已在云端新建病人「${name}」，${res.message}`)
     try {
-      await reloadMyPatients()
-      // 优先用迁移接口返回的新病人 id；老版本/异常情况下退回「列表里新出现的那个」
-      const newId = res.patientId ?? pickAddedPatientId(beforeIds)
-      if (newId) setCurrentPatientId(newId)
-      else await ensureCloudPatient() // 列表没变化时退回按列表校准
-      await refreshCurrentRole()
-      await load(true)
+      // ⚠️ 与 onCreatePatient 同理（第五轮测试评审坐实）：这段里 `setCurrentPatientId(newId)`
+      // 会把当前病人换掉，而表单还是迁移前那位的内容，弱网下有几秒窗口。
+      const release = beginReloading()
+      try {
+        await reloadMyPatients()
+        // 优先用迁移接口返回的新病人 id；老版本/异常情况下退回「列表里新出现的那个」
+        const newId = res.patientId ?? pickAddedPatientId(beforeIds)
+        if (newId) setCurrentPatientId(newId)
+        else await ensureCloudPatient() // 列表没变化时退回按列表校准
+        await refreshCurrentRole()
+        await load(true)
+      } finally {
+        release()
+      }
     } catch (err) {
       console.error(err)
       showToast('迁移已完成，但列表刷新失败，请检查网络后重试')
@@ -348,8 +427,8 @@ async function load(force = false, opts: { fresh?: boolean } = {}) {
   loadError.value = ''
   // ⚠️ 第四轮自查：`loading` 只在 `finally` 里置 false、**从不重新置 true** ——
   // 于是 `switchPatient` 的 `if (loading.value)` 守卫在首屏之后永远不成立（死代码）。
-  // 这里用独立的 `reloading` 标记（不动骨架屏，见其定义处的注释）。
-  reloading.value = true
+  // 这里用独立的计数器（不动骨架屏，见其定义处的注释）。
+  const release = beginReloading()
   try {
     const pid = currentPatientId.value
     const [p, dw] = await Promise.all([repository.getPatient(pid, opts), repository.listDryWeights(pid)])
@@ -372,7 +451,9 @@ async function load(force = false, opts: { fresh?: boolean } = {}) {
   } finally {
     // 无论成败都要收起骨架（首页/详情页/趋势页/报告页都是这么做的）
     loading.value = false
-    reloading.value = false
+    // ⚠️ 只释放**自己**这一份持有权，不能把 `switchPatient` 那份一起清掉
+    // （第五轮评审坐实：`removeDw`/`saveDw` 的 `await load()` 会提前清掉守卫）。
+    release()
   }
 }
 
@@ -412,13 +493,29 @@ function rangeError(label: string, value: number, min: number, max: number): str
  * ⚠️ 别改成「先取回最新版本号再带条件重试」—— `getPatient` 是缓存优先的，
  * 拿回来的往往还是旧版本，于是又冲突一次、再弹一次窗，用户点了覆盖却什么也没写进去。
  */
-async function savePatient(opts: { override?: boolean } = {}) {
+async function savePatient(opts: { override?: boolean; expectPatientId?: string } = {}) {
   // 非 owner 的保存会被数据库 RLS 静默拦成 0 行，绝不能提示「已保存」（假值还会污染本机缓存）
   if (!canEditConfig.value) {
     showToast('仅创建者可修改病人配置')
     return
   }
   if (savingPatient.value) return
+  // ⚠️ 切换病人途中（`setCurrentPatientId(乙)` 已生效、乙的档案还没加载回来）时，
+  // 表单还是甲的，此时点保存会写出「乙的 id + 甲的姓名生日」，且 `updatedAtIso: null`
+  // 绕过乐观锁直接覆盖 —— 病人身份级污染。宁可让用户等一下再点。
+  if (reloading.value) {
+    showToast('正在加载病人档案，请稍候再保存')
+    return
+  }
+  // ⚠️ 严重-4（第四轮独立评审）：冲突对话框里的「覆盖保存」重试必须确认
+  // 「当前病人还是发起冲突那位」。切换本身是允许的（那时没有保存/加载在途），
+  // 不确认就会对**另一个病人**做无条件整行 upsert。
+  // 这里再兜一层（调用方 `resolvePatientConflict` 已复核过）：`p.id` 取自
+  // `currentPatientId.value`，一旦 pid 变了，写进去的就是别人的档案。
+  if (opts.expectPatientId && currentPatientId.value !== opts.expectPatientId) {
+    showToast('你已切换到其他病人，这次修改已放弃')
+    return
+  }
 
   const wheelchairWeight = parseNum(form.wheelchairWeight) ?? 0
   const rinseBackVolume = parseNum(form.rinseBackVolume) ?? DEFAULT_RINSE_BACK_ML
@@ -519,7 +616,8 @@ async function savePatient(opts: { override?: boolean } = {}) {
       // ⚠️ 必须先放开 in-flight 守卫再问用户：否则用户选「覆盖保存」时，
       // 那次重试会被 savingPatient 自己挡掉，点了覆盖什么也没发生
       savingPatient.value = false
-      await resolvePatientConflict()
+      // 传发起冲突时的 pid：用户在对话框停留期间可能切走（严重-4）
+      await resolvePatientConflict(p.id)
       return
     }
     if (isNotFoundError(err)) {
@@ -739,15 +837,35 @@ async function openChangeLog() {
   showChangeLog.value = true
   changeLogLoading.value = true
   changeLogError.value = ''
+  // ⚠️ 中级-2（第四轮独立评审）：`await` 之后必须复查「当前病人还是不是发起时那位」。
+  // 不复查的后果：点「变更历史」（甲的）→ 弱网请求在途 → 切到乙 → 请求返回 →
+  // 弹窗里显示的是**甲的体重变更历史**，用户会据此判断「乙的轮椅重量被改过」。
+  // 与 `load()` 的 pid 复查是同一个模式。
+  const pid = currentPatientId.value
   try {
-    const list = await repository.listPatientChangeLogs(currentPatientId.value, { fresh: true })
+    const list = await repository.listPatientChangeLogs(pid, { fresh: true })
+    if (currentPatientId.value !== pid) {
+      // 已切走：这份记录不属于当前病人，丢弃。
+      // ⚠️ 必须**同时关掉弹窗**：只 `return` 的话，弹窗还开着、里面是甲的记录，
+      // 用户会以为那是乙的（正是中级-2 要防的串数据，只是从「请求返回前」挪到了「返回后」）。
+      showChangeLog.value = false
+      return
+    }
     changeLogs.value = list
   } catch (err) {
     console.error(err)
+    if (currentPatientId.value !== pid) {
+      showChangeLog.value = false // 同上：别把错误提示落到别人页面上
+      return
+    }
     // 读失败绝不能显示成「暂无变更记录」：那会让用户以为从没改过，反而更不信这份数据
     changeLogError.value = '变更记录加载失败，请检查网络后重试'
     changeLogs.value = []
   } finally {
+    // ⚠️ 中级-1（第五轮独立评审坐实）：这里原来写成 `if (currentPatientId.value === pid)`，
+    // 于是「请求在途时切了病人」这条路径上 loading **永远停在 true** ——
+    // 弹窗一直转圈、没有重试、也没有失败提示，用户以为记录读不出来（实测 DOM 里
+    // 「加载中」常驻、「暂无变更记录」永不出现）。复位必须无条件。
     changeLogLoading.value = false
   }
 }
@@ -758,7 +876,7 @@ function changeLogText(log: PatientChangeLog): string {
 }
 
 /** 档案版本冲突：编辑期间别人也保存过 —— 让用户选「重新加载」还是「覆盖保存」 */
-async function resolvePatientConflict(): Promise<void> {
+async function resolvePatientConflict(conflictPatientId: string): Promise<void> {
   try {
     await showConfirmDialog({
       title: '病人档案已被其他人修改',
@@ -768,14 +886,35 @@ async function resolvePatientConflict(): Promise<void> {
       cancelButtonText: '覆盖保存',
       messageAlign: 'left',
     })
+    // ⚠️ 严重-4（第四轮独立评审）：用户在对话框停留期间可能切了病人。
+    // 切换本身是允许的（此时没有保存/加载在途，守卫放行），于是「覆盖保存」会变成
+    // 对**另一个病人**的无条件整行 upsert：甲刚改的轮椅重量静默丢失、乙的档案被平白覆盖一次，
+    // 而用户以为自己在覆盖甲的。所以两边都要复核 pid，不一致就不动手。
+    if (currentPatientId.value !== conflictPatientId) {
+      showToast('你已切换到其他病人，这次修改已放弃')
+      return
+    }
     // 必须绕过缓存：缓存里是冲突前那份档案，照常读会让用户以为对方没改过
     await load(true, { fresh: true })
   } catch {
-    await savePatient({ override: true })
+    // 同上：`showConfirmDialog` 被 reject 只代表用户点了「覆盖保存」，不代表 pid 没变
+    if (currentPatientId.value !== conflictPatientId) {
+      showToast('你已切换到其他病人，这次修改已放弃')
+      return
+    }
+    await savePatient({ override: true, expectPatientId: conflictPatientId })
   }
 }
 
 function openDw() {
+  // ⚠️ 中级-2（第五轮独立评审坐实）：切换病人途中不能开「新增干体重」。
+  // 否则用户点完「＋ 新增」、填好、提交时 `saveDw` 会用自己的 `currentPatientId.value`
+  // 拼记录 —— 那时已经切到乙了，于是**干体重挂到乙名下**，而页面显示的还是甲的列表。
+  // 干体重直接决定脱水量，写错病人等于改错治疗方案。
+  if (reloading.value) {
+    showToast('正在加载病人档案，请稍候再操作')
+    return
+  }
   dwForm.value = ''
   dwForm.effectiveDate = todayStr()
   dwForm.note = ''
@@ -798,6 +937,13 @@ async function saveDw() {
     return
   }
   if (savingDw.value) return
+  // ⚠️ 中级-2（第五轮独立评审）：这里原来只守 `savingDw`，不守 `reloading`。
+  // 切换病人途中（`switchPatient` 的 `load()` 挂在弱网）点保存 →
+  // `patientId` 取的是**已经切换后**的新 pid，记录挂到新病人名下。
+  if (reloading.value) {
+    showToast('正在加载病人档案，请稍候再保存')
+    return
+  }
   const d: DryWeight = {
     id: uuid(),
     patientId: currentPatientId.value,
@@ -808,6 +954,8 @@ async function saveDw() {
     updatedAt: Date.now(),
   }
   savingDw.value = true
+  // 持有 reloading 覆盖「保存 + 随后的 load()」整段，防止这段期间又切病人
+  const release = beginReloading()
   try {
     await repository.saveDryWeight(d)
     showDwForm.value = false
@@ -818,6 +966,7 @@ async function saveDw() {
     showToast(`保存失败：${errorText(err)}`)
   } finally {
     savingDw.value = false
+    release()
   }
 }
 
@@ -826,20 +975,54 @@ async function removeDw(d: DryWeight) {
     showToast('仅创建者可修改病人配置')
     return
   }
-  try {
-    await showConfirmDialog({
-      title: '删除',
-      message: `删除干体重 ${fmt(d.value)}kg（${d.effectiveDate}）？删除后该日期之后的记录会按更早的干体重重新计算，请确认。`,
-    })
-  } catch {
+  // ⚠️ 中级-3（第四轮独立评审）：原来没有 in-flight 守卫，弱网下连点删除会发出
+  // 两个 `deleteDryWeight` + 两个并发 `load()`：第二次走 NotFound，且两个 load
+  // 各持一份 reloading、各自用不同 pid 跑完，切/存行为变得不可预测。
+  //
+  // ⚠️ 第六轮测试评审坐实：**必须用独立标记 `deletingDw`，并且从「弹确认框之前」就置位**。
+  // 原来复用 `savingDw` 且只在对话框关闭后才置 true，于是「用户正在读确认框」的那几秒
+  // 里守卫是空的 —— 连点两次会弹出**两个**删除确认框（实测 `showConfirmDialog` 被调 2 次），
+  // 用户点完第一个确定、第二个框还挂着。
+  if (savingDw.value || deletingDw.value) return
+  // ⚠️ 中级-2（第五轮独立评审）：切换病人途中不许删 —— 删除后 `load()` 用的是新 pid，
+  // 用户以为在删甲的干体重，实际清的是乙的列表。
+  if (reloading.value) {
+    showToast('正在加载病人档案，请稍候再操作')
     return
   }
+  deletingDw.value = true
   try {
-    await repository.deleteDryWeight(d.id)
-    await load()
-  } catch (err) {
-    console.error(err)
-    showToast(`删除失败：${errorText(err)}`)
+    try {
+      await showConfirmDialog({
+        title: '删除',
+        message: `删除干体重 ${fmt(d.value)}kg（${d.effectiveDate}）？删除后该日期之后的记录会按更早的干体重重新计算，请确认。`,
+      })
+    } catch {
+      return // 用户取消
+    }
+    // 确认框开着期间可能被别的写操作占了（例如用户在别的入口存了干体重），
+    // 也可能用户在这段时间切了病人
+    if (savingDw.value) return
+    if (reloading.value) {
+      showToast('正在加载病人档案，请稍候再操作')
+      return
+    }
+    savingDw.value = true
+    // 持有 reloading 覆盖「删除 + 随后的 load()」整段
+    const release = beginReloading()
+    try {
+      await repository.deleteDryWeight(d.id)
+      await load()
+    } catch (err) {
+      console.error(err)
+      showToast(`删除失败：${errorText(err)}`)
+    } finally {
+      savingDw.value = false
+      release()
+    }
+  } finally {
+    // 无论取消、失败、成功都要放开 —— 漏了会让删除功能永久失效
+    deletingDw.value = false
   }
 }
 
@@ -917,6 +1100,15 @@ async function onImportFile(e: Event) {
       showToast('云端模式下数据在服务器，恢复备份请先退出登录')
       return
     }
+    // ⚠️ 中级-2（第五轮独立评审坐实）：导入会整份替换本机数据，必须有 in-flight 守卫。
+    // 原来连防连点都没有：用户连选两次文件 = 两次 `importAll` + 两个并发 `load(true)`。
+    if (importing.value) return
+    // 切换病人途中也不许导入：末尾的 `load(true)` 用的是**当时**的 pid，
+    // 整库被替换后如果已经切到乙，回填的就是乙的档案（与 saveDw/removeDw 同一条理由）。
+    if (reloading.value) {
+      showToast('正在加载病人档案，请稍候再操作')
+      return
+    }
     const text = await file.text()
     let parsed: unknown
     try {
@@ -936,6 +1128,21 @@ async function onImportFile(e: Event) {
     } catch {
       return // 用户取消：一个字节都不动
     }
+    if (reloading.value) {
+      // ⚠️ 轻微-2（第八轮测试有效性评审）：这里**只留 `reloading` 一道**，原来还有一道
+      // `if (importing.value) return`，但那道是**不可达的防御代码** ——
+      // `importing` 唯一的置位点就在下面（确认框之后），所以「确认框开着期间 importing 被
+      // 另一次导入置 true」这件事在当前结构下不可能发生（实测：删掉那道，用例依然全绿，
+      // 因为根本走不到）。留着它会让人误以为它在守护某个真实窗口，反而掩盖了「真正
+      // 需要复查的是 pid 是否已变」这一点。若将来把 `importing = true` 提前到确认框之前，
+      // 必须把这道检查一起加回来。
+      showToast('正在加载病人档案，请稍候再操作')
+      return
+    }
+    importing.value = true
+    // 持有 reloading 覆盖「导入 + load(true)」整段：整库被替换后如果又切病人，
+    // 回填的会是另一个人的档案
+    const release = beginReloading()
     try {
       await repository.importAll(text)
       showToast('导入成功')
@@ -944,6 +1151,9 @@ async function onImportFile(e: Event) {
       console.error(err)
       // 展示仓储抛出的真实原因（如「备份文件格式不正确：patients 第 1 条缺少 id」）
       showToast(`导入失败：${errorText(err)}`)
+    } finally {
+      importing.value = false
+      release()
     }
   } finally {
     input.value = '' // 任何分支都清空，保证同一个文件能再次选中
@@ -1020,7 +1230,14 @@ function showHelp() {
     <div class="card">
       <div class="row">
         <div class="card-title" style="margin: 0">干体重历史</div>
-        <van-button size="small" type="primary" plain :disabled="!canEditConfig" @click="openDw">＋ 新增</van-button>
+        <van-button
+          size="small"
+          type="primary"
+          plain
+          :disabled="!canEditConfig || switchingPatient"
+          @click="openDw"
+          >＋ 新增</van-button
+        >
       </div>
       <div v-if="!canEditConfig" class="muted" style="margin: 6px 0 4px">仅创建者可修改病人配置</div>
       <div class="muted" style="margin: 6px 0 4px">
@@ -1037,8 +1254,8 @@ function showHelp() {
           <van-icon
             v-if="canEditConfig"
             name="delete-o"
-            color="#ee0a24"
-            style="cursor: pointer"
+            :color="deletingDw || switchingPatient ? '#c8c9cc' : '#ee0a24'"
+            :style="{ cursor: deletingDw || switchingPatient ? 'not-allowed' : 'pointer' }"
             @click="removeDw(d)"
           />
           <van-icon v-else name="delete-o" color="#c8c9cc" />
@@ -1108,8 +1325,11 @@ function showHelp() {
           borderTop: '1px solid #f2f3f5',
           // 保存/加载在途时病人行点不动：切过去会污染档案（见 switchPatient 注释），
           // 用样式和 cursor 让用户看得出来，而不是点了没反应
-          cursor: savingPatient || reloading ? 'not-allowed' : 'pointer',
-          opacity: savingPatient || reloading ? 0.5 : 1,
+          // ⚠️ 中级-1（第四轮独立评审）：这里只能用 `switchingPatient`，不能用 `reloading` ——
+          // 后者被 `saveDw`/`removeDw` 触发的 `load()` 持有，用它灰化会让「存一条干体重」
+          // 就锁死整块病人列表最长 46 秒（`resilientFetch` 3×15s + 退避），且没有加载指示。
+          cursor: savingPatient || switchingPatient ? 'not-allowed' : 'pointer',
+          opacity: savingPatient || switchingPatient ? 0.5 : 1,
         }"
         @click="switchPatient(item.patient.id)"
       >

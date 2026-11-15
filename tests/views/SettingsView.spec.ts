@@ -1935,20 +1935,1793 @@ describe('SettingsView · 轮椅及衣物重量变更记录（运行时行为）
    */
   it('加载在途时调用 switchPatient：必须挡住并提示', async () => {
     currentPatientIdRef.value = 'patient-a'
+    // ⚠️ 必须让 setCurrentPatientId 真的改 ref，否则第二次调用会命中
+    // `if (id === currentPatientId.value) return`（同 id 早退，轻微-1 调整后的正确行为），
+    // 测到的是「点自己那一行」而不是「加载在途」。
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
     const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
 
-    // 让下一次 load 挂住 → loading 停在 true
+    // 让下一次 load 挂住 → reloading 停在 true
     vi.mocked(repository.getPatient).mockReturnValue(new Promise(() => {}) as never)
     const vm = w.vm as unknown as { switchPatient: (id: string) => Promise<void> }
     // 先触发一次挂住的加载（不 await，让它停在 await 上）
     void vm.switchPatient('patient-b')
     await flushPromises()
 
-    // 此时 loading 为 true：再切一次必须被挡
+    // 此时 reloading 为 true：再切到**另一个**病人必须被挡
     mocks.showToast.mockClear()
-    await vm.switchPatient('patient-a')
+    await vm.switchPatient('patient-c')
     await flushPromises()
     expect(mocks.showToast).toHaveBeenCalledWith('正在加载病人档案，请稍候再切换')
+    expect(currentPatientIdRef.value, '加载在途时不该真的切走').toBe('patient-b')
+  })
+
+  /**
+   * `load()` 的失败路径（第四轮测试评审：M20 变异——去掉 `loadError.value = ...` 后全绿）。
+   *
+   * 弱网 / 令牌失效时首次加载失败：骨架必须收起，给出可点的「重试」。
+   * 没有这条出口，用户只能杀进程（这是此前轮次在首页/详情页修过同类问题，
+   * 设置页的 `catch` 是后来补的，但一直没被用例守住）。
+   *
+   * 判别力：删掉 catch 里的 `loadError.value = '加载失败，请检查网络后重试'` → 本用例红。
+   */
+  it('档案加载失败：收起骨架并给出可点的「重试」，不能停在空白页', async () => {
+    vi.mocked(repository.getPatient).mockRejectedValueOnce(new Error('offline'))
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
+
+    // 错误态必须可见，且不是骨架
+    expect(w.find('.load-error').exists()).toBe(true)
+    expect(w.find('.load-error-text').text()).toBe('加载失败，请检查网络后重试')
+    expect(w.find('.van-skeleton').exists()).toBe(false)
+
+    // 「重试」必须真的能重新加载（点了之后走成功路径，表单正常回填）
+    vi.mocked(repository.getPatient).mockResolvedValue(makePatient({ id: 'patient-default', name: '重试成功' }))
+    await buttonByText(w.find('.load-error'), '重试').trigger('click')
+    await flushPromises()
+    expect(w.find('.load-error').exists()).toBe(false)
+    expect(fieldInput(w, '姓名').element.value).toBe('重试成功')
+  })
+
+  /**
+   * 「重新加载不得渲染首屏骨架」（第四轮测试评审 M25）：
+   *
+   * 原来唯一抓到「`load()` 误把 `loading` 置 true」的是一条与骨架语义无关的断言
+   * （迁移用例里 `btn.classes()` 不含 `van-button--loading`）。用错用例兜对语义 =
+   * 漏测，所以这里直接钉住「重载期间不得出现骨架屏」。
+   *
+   * 判别力：让 `load()` 入口置 `loading.value = true` → 本用例红。
+   */
+  it('重新加载（非首屏）期间不得渲染骨架屏：不能把用户正在看的表单换成占位块', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', name: '张三' }) })
+    // 首屏已经好了：没有骨架
+    expect(w.find('.van-skeleton').exists()).toBe(false)
+
+    // 让重载挂住，观察这期间页面是否被换成骨架
+    let release!: (v: ReturnType<typeof makePatient>) => void
+    vi.mocked(repository.getPatient).mockReturnValue(
+      new Promise((resolve) => {
+        release = resolve as never
+      }) as never,
+    )
+    const vm = w.vm as unknown as { load: (force?: boolean) => Promise<void> }
+    void vm.load(true)
+    await flushPromises()
+
+    // 关键：重载在途时不能有骨架屏，表单仍在
+    expect(w.find('.van-skeleton').exists()).toBe(false)
+    expect(fieldInput(w, '姓名').element.value).toBe('张三')
+
+    release(makePatient({ id: 'patient-default', name: '李四' }))
+    await flushPromises()
+    expect(fieldInput(w, '姓名').element.value).toBe('李四')
+  })
+
+  /**
+   * `load()` 的 pid 复查早退（第四轮测试评审 M06 + M04）：
+   *
+   * 两处 `await` 后复查「当前病人还是不是发起时那位」，不一致就 `return`。
+   * 早退必须走 `finally` 把 `reloading` 复位，否则**下一次**切病人会被
+   * 「正在加载病人档案」永久挡住（用户再也无法切换）。
+   * 而且要确认：旧 load 返回后不能把甲的档案写进乙的页面。
+   *
+   * 判别力：去掉 `if (currentPatientId.value !== pid) return` → 本用例红。
+   */
+  it('加载期间切走：旧加载结果不能落到新病人页面，且 reloading 必须复位', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    // ⚠️ 首屏必须正常完成：`mountSettings` 内部会 `stubSettingsData()` 覆盖 getPatient 的
+    // mock，所以挂起要放在**挂载之后**、再手动触发第二次 load。
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
+    expect(fieldInput(w, '姓名').element.value).toBe('甲')
+
+    let releaseLoad!: (v: ReturnType<typeof makePatient>) => void
+    vi.mocked(repository.getPatient).mockReturnValue(
+      new Promise((resolve) => {
+        releaseLoad = resolve as never
+      }) as never,
+    )
+    const vm = w.vm as unknown as {
+      load: (force?: boolean) => Promise<void>
+      switchPatient: (id: string) => Promise<void>
+    }
+    // 触发第二次加载（pid = patient-a）并挂住
+    void vm.load(true)
+    await flushPromises()
+
+    // 挂住期间切到乙；表单仍是甲（用户没输入过，但当前病人已经是乙）
+    currentPatientIdRef.value = 'patient-b'
+    // 放行：返回的是**甲**的档案（带明显不同的姓名，方便断言）
+    releaseLoad(makePatient({ id: 'patient-a', name: '甲的旧档案', wheelchairWeight: 13.4 }))
+    await flushPromises()
+
+    // 关键：旧加载结果必须被丢弃，页面不能被回填成甲的旧档案
+    // （pid 复查在 await 之后挡住；没有它，这里会被写成「甲的旧档案」，
+    //  下一次保存就是乙的 id + 甲的值 —— 严重-1 的根因）
+    expect(fieldInput(w, '姓名').element.value).toBe('甲')
+
+    // 而且 reloading 必须已复位 —— 用「再切一次没被挡住」来证明
+    mocks.showToast.mockClear()
+    vi.mocked(repository.getPatient).mockResolvedValue(makePatient({ id: 'patient-b', name: '乙' }))
+    await vm.switchPatient('patient-a')
+    await flushPromises()
+    expect(mocks.showToast).not.toHaveBeenCalledWith('正在加载病人档案，请稍候再切换')
+    expect(mocks.showToast).toHaveBeenCalledWith('已切换病人')
+  })
+
+  /**
+   * `savePatient` 的 pid 复查（第四轮测试评审 M04：去掉 `===` 判断后全绿）。
+   *
+   * 严重-1 的另一半：保存已经发出、还没回来时用户切到了别处。
+   * 若此时无条件回写 `patient.value` / `knownPatientUpdatedAtIso` / `formSnapshot`，
+   * 页面就变成「乙的 id + 甲的版本号和表单」，下一次保存直接把甲的值写进乙。
+   *
+   * 这里用「放行保存后再改一次重量并保存」来间接断言：如果回写被污染，
+   * `prevWheelchair` 会取到错的值，写出的日志与 `savePatient` 的 id 对不上。
+   *
+   * 判别力：把 `if (currentPatientId.value === p.id)` 改成 `if (true)` → 本用例红。
+   */
+  it('保存期间切走病人：不能把甲的版本号与表单回写到乙的页面', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    let releaseSave!: () => void
+    vi.mocked(repository.savePatient).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseSave = () => resolve('2026-01-01T00:00:00.000000+00:00')
+        }),
+    )
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', wheelchairWeight: 13.4 }) })
+    await fieldInput(w, '轮椅及衣物重量').setValue('13.5')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 保存还没回来，切到乙
+    currentPatientIdRef.value = 'patient-b'
+    await w.vm.$nextTick()
+    releaseSave()
+    await flushPromises()
+
+    // 已明确告知「当前页面未更新」（另一条用例断言过这句 toast）
+    // 关键：`patient.value` **不能**被回写成刚保存的甲档案（13.5）——
+    // 那是当前页面的状态，而当前病人已经是乙。若被回写，下一次保存时
+    // 会拿甲的 id/版本号/表单值去写乙的档案（严重-1 的根因）。
+    // 直接读组件内部的 patient ref（setupState）来证明，不靠间接推断。
+    // setupState 里的 ref 已被 Vue 解包：直接是档案对象，不是 { value }
+    const setupState = (w.vm as unknown as { $: { setupState: Record<string, unknown> } }).$.setupState
+    const patientVal = setupState.patient as { wheelchairWeight?: number } | undefined
+    expect(patientVal?.wheelchairWeight).not.toBe(13.5)
+    // 而且这次保存不能额外写出一条「phantom」变更日志（中级-4）
+    expect(repository.addPatientChangeLog).toHaveBeenCalledTimes(1)
+    const log = vi.mocked(repository.addPatientChangeLog).mock.calls[0][0]
+    expect(log.patientId).toBe('patient-a')
+    expect(log).toMatchObject({ oldValue: 13.4, newValue: 13.5 })
+  })
+
+  /**
+   * 保存档案的 in-flight 守卫（第四轮测试评审 M27）。
+   *
+   * ⚠️ 按钮上已经有 `:disabled="!canEditConfig || savingPatient"` 挡住后续点击，
+   * 所以**点按钮连点测不到**函数内的 `if (savingPatient.value) return`（实测：删掉
+   * 那个 return 后点按钮的用例照样绿）。要测第二道防线必须直接调方法 ——
+   * 它在真实路径上并非多余：`resolvePatientConflict()` 的「覆盖保存」重试、
+   * 以及将来任何程序化调用都不会经过按钮的 disabled。
+   *
+   * 连点的后果：两次 savePatient 并发，第二次用**旧的** `knownPatientUpdatedAtIso`
+   * 去写 → 自己跟自己冲突（弹「另一端改了」的假冲突窗）。
+   *
+   * 判别力：删掉 `if (savingPatient.value) return` → 本用例红。
+   */
+  it('保存档案：函数级 in-flight 守卫（按钮 disabled 之外的第二道防线）', async () => {
+    let releaseSave!: () => void
+    vi.mocked(repository.savePatient).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseSave = () => resolve('2026-01-01T00:00:00.000000+00:00')
+        }),
+    )
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', name: '张三' }) })
+    await fieldInput(w, '姓名').setValue('张三丰')
+
+    const vm = w.vm as unknown as { savePatient: () => Promise<void> }
+    // 并发发起三次（不 await 第一次，模拟程序化重入）
+    void vm.savePatient()
+    void vm.savePatient()
+    void vm.savePatient()
+    await flushPromises()
+
+    expect(repository.savePatient).toHaveBeenCalledTimes(1)
+
+    releaseSave()
+    await flushPromises()
+    expect(repository.savePatient).toHaveBeenCalledTimes(1)
+    expect(mocks.showToast).toHaveBeenCalledWith('已保存')
+  })
+
+  /**
+   * `savePatient` 的 else 分支（第四轮测试评审 M22：删掉这句 toast 后全绿）。
+   *
+   * 严重-1 的修复有两半：①挡住「保存在途时切病人」；②万一已经切走了，
+   * 保存结果不能污染当前页面，并且**必须告诉用户**当前页没跟着更新。
+   * ②这一半一直没有用例（全仓搜「保存期间切换了病人」= 0 处）。
+   *
+   * 判别力：删掉 else 分支的 `showToast('已保存（保存期间切换了病人，当前页面未更新）')` → 本用例红。
+   */
+  it('保存期间切走了病人：结果不回写当前页面，但必须告诉用户「当前页未更新」', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    let releaseSave!: () => void
+    vi.mocked(repository.savePatient).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseSave = () => resolve('2026-01-01T00:00:00.000000+00:00')
+        }),
+    )
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
+    await fieldInput(w, '姓名').setValue('甲改')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 保存还没回来，用户切到了乙（直接改 ref 模拟「已在别处切走」）
+    currentPatientIdRef.value = 'patient-b'
+    await w.vm.$nextTick()
+
+    releaseSave()
+    await flushPromises()
+
+    // 必须明确告知：存上了，但当前页不会跟着变
+    expect(mocks.showToast).toHaveBeenCalledWith('已保存（保存期间切换了病人，当前页面未更新）')
+  })
+
+  /**
+   * 严重-1 的漏网路径（第四轮源码评审取证坐实，见下方实测输出）：
+   *
+   * `switchPatient` 里 `setCurrentPatientId(乙)` 在 `await refreshCurrentRole()` **之前**执行，
+   * 而 `reloading` 原来要到 `load(true)` 才置 true。这段窗口（弱网下 1~15 秒）里：
+   * 当前病人 id 已是乙、表单还是甲的（姓名「甲」/生日/轮椅 13.4）、保存按钮可点。
+   * 取证实测（修复前）：
+   *   `>>> 点乙后 pid = patient-b ｜reloading = false ｜savingPatient = false`
+   *   `>>> 第 1 次 = {"id":"patient-b","name":"甲","birthday":"1960-01-01",…,"updatedAtIso":null}`
+   *   `>>> toast = ["已保存"]`
+   * 即**甲的姓名生日被直接覆盖进乙的档案**，且 null 版本号绕过乐观锁，页面还报「已保存」。
+   *
+   * 修法：整个切换流程持有 `reloading`（在 setCurrentPatientId 之前置位），
+   * 并且 `savePatient` 在 reloading 期间拒绝保存。
+   *
+   * 判别力：去掉 `savePatient` 的 reloading 守卫、或把置位挪到 refreshCurrentRole 之后 → 本用例红。
+   */
+  it('切换病人途中（角色刷新在途）点保存：必须拒绝，不能把甲的姓名写进乙的档案', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    // `setCurrentPatientId` 在本 spec 里是空 mock，这里让它真的改 ref ——
+    // 否则测不出「pid 已切到乙、表单还是甲的」这个窗口
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-a', name: '甲', birthday: '1960-01-01', wheelchairWeight: 13.4 }),
+    })
+    await flushPromises()
+
+    // 切到乙之后，`load(true)` 会拿乙的档案回填表单
+    vi.mocked(repository.getPatient).mockImplementation(async (id: string) =>
+      id === 'patient-b'
+        ? makePatient({ id: 'patient-b', name: '乙' })
+        : makePatient({ id: 'patient-a', name: '甲' }),
+    )
+
+    // 让 refreshCurrentRole 挂住（真实实现是一次网络请求，弱网下 1~15 秒）
+    let releaseRole!: () => void
+    mocks.refreshCurrentRole.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseRole = resolve
+        }),
+    )
+
+    const rowB = w.findAll('.row').find((r) => r.text().includes('乙'))
+    expect(rowB, '找不到乙那一行').toBeTruthy()
+    void rowB!.trigger('click')
+    await flushPromises()
+
+    // 此刻：pid 已是乙，但表单还是甲的
+    expect(currentPatientIdRef.value).toBe('patient-b')
+    expect(fieldInput(w, '姓名').element.value).toBe('甲')
+
+    // 用户在这段窗口里改了重量并点保存 —— 必须被拒绝
+    await fieldInput(w, '轮椅及衣物重量').setValue('13.5')
+    mocks.showToast.mockClear()
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    expect(mocks.showToast).toHaveBeenCalledWith('正在加载病人档案，请稍候再保存')
+    expect(repository.savePatient).not.toHaveBeenCalled() // 一次都不能写
+
+    releaseRole()
+    await flushPromises()
+    // 切换完成后表单必须换成乙的档案，不能残留甲的
+    expect(fieldInput(w, '姓名').element.value).toBe('乙')
+  })
+
+  /**
+   * 漏洞 A（第五轮测试评审坐实）：`load()` 抢走 `switchPatient` 的 `reloading` 所有权。
+   *
+   * 真实可达的顺序是：**先点切换病人**（此时没有加载在途，通过守卫并持有标记），
+   * 再点「删除干体重」—— `removeDw()` 里 `await load()` 会发网络请求，
+   * 它返回时的 `finally` 在布尔方案下会把 `switchPatient` 持有的标记一起清掉。
+   *
+   * ⚠️ 反过来（先删干体重再切换）**不可达**：`switchPatient` 的 `if (reloading.value)`
+   * 会直接挡住并提示「正在加载病人档案，请稍候再切换」（实测确认）。所以本用例必须按
+   * 「先切换、后删干体重」的顺序构造，否则测的是被守卫挡住的路径、拿不到判别力。
+   *
+   * 修法：`reloading` 从布尔改成**计数器**，每个持有者只释放自己那一份。
+   *
+   * 判别力：把 `beginReloading()` 换回 `reloading.value = true/false` → 本用例红。
+   */
+  it('切换病人途中又触发干体重重载：load 不能抢走切换的 in-flight 持有权', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-a', name: '甲', birthday: '1960-01-01', wheelchairWeight: 13.4 }),
+      dryWeights: [makeDryWeight({ id: 'dw-1', patientId: 'patient-a', weight: 60 })],
+    })
+    await flushPromises()
+
+    const vm = w.vm as unknown as {
+      removeDw: (id: string) => Promise<void>
+      switchPatient: (id: string) => Promise<void>
+    }
+
+    // ① 先切到乙：refreshCurrentRole 挂住 → switchPatient 持有 1 份
+    let releaseRole!: () => void
+    mocks.refreshCurrentRole.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseRole = resolve
+        }),
+    )
+    void vm.switchPatient('patient-b')
+    await flushPromises()
+    expect(currentPatientIdRef.value).toBe('patient-b')
+
+    // ② 切换在途时用户又点了「删除干体重」：removeDw 内部的 load 挂住
+    let releaseLoad!: () => void
+    vi.mocked(repository.getPatient).mockReturnValue(
+      new Promise((resolve) => {
+        releaseLoad = () => resolve(makePatient({ id: 'patient-b', name: '乙' }) as never)
+      }) as never,
+    )
+    void vm.removeDw('dw-1')
+    await flushPromises()
+
+    // ③ 放行干体重那次 load —— 布尔方案下它会把 switchPatient 的标记一起清掉
+    releaseLoad()
+    await flushPromises()
+
+    // 关键：切换还没完成（refreshCurrentRole 仍挂住），reloading 必须仍为 true
+    const setupState = (w.vm as unknown as { $: { setupState: Record<string, unknown> } }).$.setupState
+    expect(
+      setupState.reloading as boolean,
+      'reloading 被干体重那次 load 提前清掉了 → 保存守卫失效',
+    ).toBe(true)
+
+    // 于是点保存必须被拒绝（否则写出「乙的 id + 甲的姓名生日」）
+    mocks.showToast.mockClear()
+    vi.mocked(repository.savePatient).mockClear()
+    await fieldInput(w, '轮椅及衣物重量').setValue('13.5')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+    expect(repository.savePatient).not.toHaveBeenCalled()
+
+    releaseRole()
+    await flushPromises()
+  })
+
+  /**
+   * 漏洞 B（第五轮测试评审坐实）：`onCreatePatient` 的窗口没有 `reloading` 保护。
+   *
+   * 新建成功后 `setCurrentPatientId(丙)` 已生效，但表单还是甲的内容；随后
+   * `reloadMyPatients` + `refreshCurrentRole` + `load` 在弱网下要 1~15 秒。
+   * 这期间点保存 → 写出「丙的 id + 甲的姓名生日」，绕过乐观锁。
+   *
+   * 判别力：去掉 `onCreatePatient` 里的 `beginReloading()` → 本用例红。
+   */
+  it('新建病人后的列表刷新在途时点保存：必须拒绝，不能把甲的姓名写进丙的档案', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-a', name: '甲', birthday: '1960-01-01', wheelchairWeight: 13.4 }),
+    })
+    await flushPromises()
+
+    // 让 createPatient 立即成功，但之后的 reloadMyPatients 挂住
+    vi.mocked(createPatient).mockResolvedValue({
+      ok: true,
+      data: { patient: { id: 'patient-c', name: '丙' } },
+    } as never)
+    let releaseList!: () => void
+    vi.mocked(listMyPatients).mockReturnValue(
+      new Promise((resolve) => {
+        releaseList = () => resolve([] as never)
+      }) as never,
+    )
+
+    const vm = w.vm as unknown as {
+      openNewPatient: () => void
+      onCreatePatient: () => Promise<void>
+      newPatientForm: { name: string; wheelchairWeight: string; rinseBackVolume: string }
+    }
+    vm.openNewPatient()
+    await w.vm.$nextTick()
+    vm.newPatientForm.name = '丙'
+    vm.newPatientForm.wheelchairWeight = '12'
+    vm.newPatientForm.rinseBackVolume = '300'
+    void vm.onCreatePatient()
+    await flushPromises()
+
+    // 此刻：pid 已是丙，列表刷新在途，表单还是甲的
+    expect(currentPatientIdRef.value).toBe('patient-c')
+    expect(fieldInput(w, '姓名').element.value).toBe('甲')
+
+    mocks.showToast.mockClear()
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+    expect(mocks.showToast).toHaveBeenCalledWith('正在加载病人档案，请稍候再保存')
+    expect(repository.savePatient).not.toHaveBeenCalled()
+
+    releaseList()
+    await flushPromises()
+  })
+
+  /**
+   * 漏洞 C（第五轮测试评审坐实的新死锁）：`refreshCurrentRole()` 抛错后
+   * `switchPatient` 的 `finally` 是**唯一**出口。漏了释放 → `reloading` 永久 > 0 →
+   * 用户再也切不了病人（只能杀进程）。这是本次改动**引入**的新失败模式。
+   *
+   * 另外：`refreshCurrentRole` 抛错原来会**直接抛给模板 `@click`** ——
+   * Vue 里就是一条未捕获错误，用户看不到任何提示、页面还停在半切换状态。
+   * 现在由 `switchPatient` 自己兜住：病人照常切过去（id 已经改了，不回滚），
+   * 提示「权限刷新失败」，并按「权限未知」保守处理（不可编辑比误以为能编辑安全）。
+   *
+   * 判别力：去掉 `switchPatient` 的 `finally { release() }` → 本用例红。
+   */
+  it('角色刷新抛错：不抛给模板、reloading 复位、用户还能再切病人（不能永久卡死）', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
+    await flushPromises()
+
+    const vm = w.vm as unknown as { switchPatient: (id: string) => Promise<void> }
+    // 第一次切换：角色刷新抛错。不能把异常抛出去（否则模板 @click 里是未捕获错误）
+    mocks.refreshCurrentRole.mockRejectedValueOnce(new Error('network down'))
+    mocks.showToast.mockClear()
+    await expect(vm.switchPatient('patient-b')).resolves.toBeUndefined()
+    await flushPromises()
+    expect(mocks.showToast).toHaveBeenCalledWith('已切换病人，但权限刷新失败，部分操作可能暂时不可用')
+
+    const setupState = (w.vm as unknown as { $: { setupState: Record<string, unknown> } }).$.setupState
+    expect(setupState.reloading, 'reloading 卡在 true → 切病人永久被挡').toBe(false)
+
+    // 第二次切换必须能成功（不被「正在加载病人档案」挡住）
+    mocks.showToast.mockClear()
+    mocks.refreshCurrentRole.mockResolvedValue(undefined)
+    vi.mocked(repository.getPatient).mockImplementation(async (id: string) =>
+      makePatient({ id, name: id === 'patient-b' ? '乙' : '甲' }),
+    )
+    await vm.switchPatient('patient-b')
+    await flushPromises()
+    expect(mocks.showToast).not.toHaveBeenCalledWith('正在加载病人档案，请稍候再切换')
+  })
+
+  /**
+   * 首屏骨架（第五轮测试评审 M59）：全仓 `.van-skeleton` 断言原来只有 3 处、
+   * 全是 `toBe(false)`，**没有一条正向断言「首屏加载时骨架存在」**。
+   * 把 `const loading = ref(true)` 改成 `ref(false)` 后 96 条全绿 —— 首屏会直接
+   * 渲染空表单（姓名空白、轮椅 0），用户以为数据丢了。
+   *
+   * 判别力：`loading = ref(false)` → 本用例红。
+   */
+  it('首屏加载期间必须显示骨架屏（不能直接渲染空表单）', async () => {
+    // ⚠️ 不能走 `mountSettings`：它内部 `await flushPromises()` 会让首屏请求完成，
+    // 挂载返回时 loading 已经是 false，测不到骨架。这里手动挂载并让 getPatient 一直挂着。
+    stubSettingsData({ patient: makePatient({ id: 'patient-default' }) })
+    let releasePatient!: () => void
+    vi.mocked(repository.getPatient).mockReturnValue(
+      new Promise((resolve) => {
+        releasePatient = () => resolve(makePatient({ id: 'patient-default' }) as never)
+      }) as never,
+    )
+    router = createRouter({
+      history: createMemoryHistory(),
+      routes: [
+        { path: '/', component: defineComponent({ render: () => h('div') }) },
+        { path: '/login', component: defineComponent({ render: () => h('div') }) },
+        { path: '/members', component: defineComponent({ render: () => h('div') }) },
+      ],
+    })
+    await router.push('/')
+    await router.isReady()
+    const w = mount(SettingsView, {
+      global: { plugins: [Vant, router], stubs: { teleport: true } },
+    })
+    await flushPromises()
+
+    // 首屏请求还没回来：必须是骨架
+    expect(w.find('.van-skeleton').exists(), '首屏没有骨架 → 用户看到空表单以为数据丢了').toBe(true)
+    expect(w.find('.load-error').exists()).toBe(false)
+
+    releasePatient()
+    await flushPromises()
+    expect(w.find('.van-skeleton').exists()).toBe(false)
+  })
+
+  /**
+   * 版本号回写（第五轮测试评审 M17 / M33 / M22 三条变异均全绿）：
+   *
+   * 保存成功后必须把新版本号写回 `knownPatientUpdatedAtIso`，否则**下一次防抖保存
+   * 拿旧版本去比 → 自己跟自己冲突**（AGENTS.md 明确点过的坑）。
+   * 现有唯一断版本号入参的两处只断「IRS」与「null」，**没有一条断言「第二次保存
+   * 要带第一次返回的新版本号」** —— 删掉 `knownPatientUpdatedAtIso = iso` 也全绿。
+   *
+   * 判别力：`knownPatientUpdatedAtIso = iso` → `= null`，或 `if (iso)` → `if (false)` → 本用例红。
+   */
+  it('保存成功后回写新版本号：第二次保存要带第一次返回的版本（否则自己跟自己冲突）', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', name: '张三' }) })
+    const firstIso = '2026-01-01T00:00:00.000001+00:00'
+    const secondIso = '2026-01-01T00:00:00.000002+00:00'
+    vi.mocked(repository.savePatient)
+      .mockResolvedValueOnce(firstIso as never)
+      .mockResolvedValueOnce(secondIso as never)
+
+    await fieldInput(w, '姓名').setValue('张三丰')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+    expect(repository.savePatient).toHaveBeenCalledTimes(1)
+    // 第一次：初始档案没有 updatedAtIso → 传 null
+    expect(vi.mocked(repository.savePatient).mock.calls[0][1]).toBeNull()
+
+    // 第二次保存：必须带第一次返回的新版本号（不是 null、也不是旧值）
+    await fieldInput(w, '姓名').setValue('张三丰2')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+    expect(repository.savePatient).toHaveBeenCalledTimes(2)
+    expect(
+      vi.mocked(repository.savePatient).mock.calls[1][1],
+      '第二次保存没带新版本号 → 会自己跟自己冲突',
+    ).toBe(firstIso)
+  })
+
+  /**
+   * `formSnapshot` 回写（第五轮测试评审 M16 全绿）：
+   *
+   * 保存成功后必须更新「干净快照」，否则下一次 `load()` 会认为「用户改过表单」
+   * 而不回填 → 页面停在旧数据，且下次保存重复写一条变更记录。
+   *
+   * 判别力：删掉 `formSnapshot = snapshotForm()` → 本用例红。
+   */
+  it('保存成功后更新表单快照：之后的 load 必须能正常回填（不能一直判成「用户改过」）', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', name: '张三' }) })
+    vi.mocked(repository.savePatient).mockResolvedValueOnce('2026-01-01T00:00:00.000001+00:00' as never)
+
+    await fieldInput(w, '姓名').setValue('张三丰')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 保存后档案在服务端变成了「张三丰」，触发一次普通 load（非 force）
+    vi.mocked(repository.getPatient).mockResolvedValue(
+      makePatient({ id: 'patient-default', name: '张三丰', updatedAtIso: '2026-01-01T00:00:00.000001+00:00' }),
+    )
+    const vm = w.vm as unknown as { load: (force?: boolean) => Promise<void> }
+    await vm.load()
+    await flushPromises()
+
+    // 表单没被用户改过（刚保存完，快照应该已同步）→ 必须回填
+    expect(fieldInput(w, '姓名').element.value).toBe('张三丰')
+  })
+
+  /**
+   * 严重-4（第四轮独立评审）：冲突对话框里的「覆盖保存」不复核 pid。
+   *
+   * 触发路径（触发成本极低）：
+   * ① 甲改轮椅重量 → 保存 → 冲突 → 弹「病人档案已被其他人修改」（用户正在读）
+   * ② 这期间点乙那一行切过去 —— 此时没有保存/加载在途，守卫放行，切换正常完成
+   * ③ 回来点「覆盖保存」→ 原来会拿 `currentPatientId.value`（= 乙）做无条件整行 upsert：
+   *    甲刚改的重量静默丢失，**乙的档案被平白覆盖一次**，而用户以为在覆盖甲的
+   *
+   * 修法：`resolvePatientConflict(conflictPatientId)` 在两个分支（重新加载 / 覆盖保存）
+   * 都复核 pid；`savePatient` 再加 `expectPatientId` 兜一层。
+   *
+   * 判别力：去掉 `resolvePatientConflict` 里的 pid 复核 → 本用例红。
+   */
+  it('冲突对话框停留期间切了病人：覆盖保存必须放弃，不能把甲的表单写进乙', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-a', name: '甲', birthday: '1960-01-01', wheelchairWeight: 13.4 }),
+    })
+    await flushPromises()
+
+    // 第一次保存：冲突（乐观锁）
+    const { ConflictError } = await import('../../src/lib/errors')
+    vi.mocked(repository.savePatient).mockRejectedValueOnce(new ConflictError('conflict'))
+
+    // 对话框挂住：模拟用户正在读弹窗
+    let releaseDialog!: () => void
+    let rejectDialog!: (e: unknown) => void
+    mocks.showConfirmDialog.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          releaseDialog = resolve
+          rejectDialog = reject
+        }),
+    )
+
+    await fieldInput(w, '轮椅及衣物重量').setValue('25')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+    expect(mocks.showConfirmDialog).toHaveBeenCalledTimes(1)
+    const callsAfterConflict = vi.mocked(repository.savePatient).mock.calls.length
+
+    // ② 对话框还开着，用户切到乙（此时无保存/加载在途 → 守卫放行）
+    vi.mocked(repository.getPatient).mockImplementation(async (id: string) =>
+      makePatient({ id, name: id === 'patient-b' ? '乙' : '甲', birthday: '1970-02-02', wheelchairWeight: 20 }),
+    )
+    const vm = w.vm as unknown as { switchPatient: (id: string) => Promise<void> }
+    await vm.switchPatient('patient-b')
+    await flushPromises()
+    expect(currentPatientIdRef.value).toBe('patient-b')
+    expect(fieldInput(w, '姓名').element.value).toBe('乙')
+
+    // ③ 用户点「覆盖保存」（reject = cancel 按钮）
+    mocks.showToast.mockClear()
+    rejectDialog(new Error('cancel'))
+    await flushPromises()
+
+    // 必须放弃重试，而不是对乙做一次无条件 upsert
+    expect(
+      vi.mocked(repository.savePatient).mock.calls.length,
+      '覆盖保存写进了乙的档案（甲的修改本应放弃）',
+    ).toBe(callsAfterConflict)
+    expect(mocks.showToast).toHaveBeenCalledWith('你已切换到其他病人，这次修改已放弃')
+    void releaseDialog
+  })
+
+  /**
+   * 中级-1（第四轮独立评审）：干体重重载不该锁 UI。
+   *
+   * `saveDw` / `removeDw` 内部都 `await load()`，若 `load()` 持有的标记参与 UI 灰化，
+   * 那么**每次正常存一条干体重**都会让整块病人列表变灰、点不动、保存被拒，
+   * 最长 46 秒（`resilientFetch` 3×15s + 退避）且**没有任何加载指示** —— 用户以为 App 卡死。
+   *
+   * 修法：UI 灰化只看 `switchingPatient`；`reloading` 只给「拒绝保存/切换」的守卫用。
+   *
+   * 判别力：模板灰化条件换回 `reloading` → 本用例红。
+   */
+  it('干体重重载在途时病人列表不能变灰（正常操作不该冻结 UI）', async () => {
+    isLoggedInRef.value = true
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-default', name: '甲' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-default', name: '甲' }),
+      dryWeights: [makeDryWeight({ id: 'dw-1', patientId: 'patient-default', weight: 60 })],
+    })
+    await flushPromises()
+
+    // 让 saveDw 之后的 load 挂住
+    let releaseLoad!: () => void
+    vi.mocked(repository.getPatient).mockReturnValue(
+      new Promise((resolve) => {
+        releaseLoad = () => resolve(makePatient({ id: 'patient-default', name: '甲' }) as never)
+      }) as never,
+    )
+    const vm = w.vm as unknown as { removeDw: (id: string) => Promise<void> }
+    void vm.removeDw('dw-1')
+    await flushPromises()
+
+    // 干体重重载在途：病人行不能变灰
+    const rows = w.findAll('.row').filter((r) => r.text().includes('甲'))
+    expect(rows.length, '没找到病人行，选择器需更新').toBeGreaterThan(0)
+    const rowStyle = rows[0].attributes('style') ?? ''
+    expect(rowStyle, '干体重重载把病人列表灰化了 → 正常操作冻结 UI').not.toContain('opacity: 0.5')
+
+    releaseLoad()
+    await flushPromises()
+  })
+
+  /**
+   * 中级-5（第四轮独立评审）：`onMigrate` 的 in-flight 持有权零覆盖。
+   *
+   * 代码已经对了（`beginReloading()` 包住刷新段），但**没有任何用例** ——
+   * 下次重构删掉它不会有任何提示，而它守的正是病人身份级污染。
+   * 结构照 `新建病人后的列表刷新在途时点保存` 写。
+   *
+   * 判别力：`onMigrate` 的 `beginReloading()` → `() => {}` → 本用例红。
+   */
+  it('迁移后的列表刷新在途时点保存：必须拒绝，不能把甲的表单写进新病人', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
+    await flushPromises()
+
+    mocks.migrateLocalToCloud.mockResolvedValue({
+      ok: true,
+      message: '已迁移 2 条透析记录到云端',
+      patientId: 'patient-c',
+    } as never)
+    // ⚠️ 窗口在 `setCurrentPatientId(newId)` **之后**（`reloadMyPatients` 之前还没有新 id），
+    // 所以要让 `refreshCurrentRole` 挂住，不是 `reloadMyPatients`。
+    let releaseRole!: () => void
+    mocks.refreshCurrentRole.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseRole = resolve
+        }),
+    )
+
+    const vm = w.vm as unknown as { onMigrate: () => Promise<void> }
+    void vm.onMigrate()
+    // onMigrate 先弹二次确认（不可逆操作），默认 mock 已 resolve
+    await flushPromises()
+    await flushPromises()
+
+    // 迁移已成功：pid 已换成新病人，但表单还是甲的
+    expect(currentPatientIdRef.value).toBe('patient-c')
+    expect(fieldInput(w, '姓名').element.value).toBe('甲')
+
+    mocks.showToast.mockClear()
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+    expect(mocks.showToast).toHaveBeenCalledWith('正在加载病人档案，请稍候再保存')
+    expect(repository.savePatient).not.toHaveBeenCalled()
+
+    releaseRole()
+    await flushPromises()
+  })
+
+  /**
+   * 中级-2（第四轮独立评审）：`openChangeLog` 跨病人串显变更记录。
+   *
+   * 点「变更历史」（甲的）→ 弱网请求在途 → 切到乙 → 请求返回 →
+   * 弹窗里显示的是**甲的体重变更历史**，用户会据此判断「乙的轮椅重量被改过」。
+   * 与 `load()` 的 pid 复查是同一模式，原来没有复查、也没有用例。
+   *
+   * 判别力：去掉 `openChangeLog` 里的 `if (currentPatientId.value !== pid) return` → 本用例红。
+   */
+  it('变更历史请求在途时切了病人：甲的记录不能显示在乙的页面上', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-a', name: '甲' }),
+      changeLogs: [makeChangeLog({ patientId: 'patient-a', oldValue: 13.4, newValue: 13.5 })],
+    })
+    await flushPromises()
+
+    // 让甲的变更记录请求挂住
+    let releaseLogs!: () => void
+    vi.mocked(repository.listPatientChangeLogs).mockReturnValue(
+      new Promise((resolve) => {
+        releaseLogs = () =>
+          resolve([makeChangeLog({ patientId: 'patient-a', oldValue: 13.4, newValue: 13.5 })] as never)
+      }) as never,
+    )
+    const vm = w.vm as unknown as {
+      openChangeLog: () => Promise<void>
+      switchPatient: (id: string) => Promise<void>
+      $: { setupState: Record<string, unknown> }
+    }
+    void vm.openChangeLog()
+    await flushPromises()
+
+    // 请求在途时切到乙
+    vi.mocked(repository.getPatient).mockImplementation(async (id: string) =>
+      makePatient({ id, name: id === 'patient-b' ? '乙' : '甲' }),
+    )
+    await vm.switchPatient('patient-b')
+    await flushPromises()
+
+    // 放行甲的记录
+    releaseLogs()
+    await flushPromises()
+
+    // 当前是乙：甲的变更记录不能被写进页面状态
+    const logs = vm.$.setupState.changeLogs as Array<{ patientId: string }>
+    expect(
+      logs.some((l) => l.patientId === 'patient-a'),
+      '甲的变更记录落到了乙的页面',
+    ).toBe(false)
+  })
+
+  /**
+   * 中级-1（第五轮独立评审坐实）：`openChangeLog` 的 `changeLogLoading` 必须**无条件**复位。
+   *
+   * 原来写的是 `if (currentPatientId.value === pid) changeLogLoading.value = false` ——
+   * 于是「请求在途时切了病人」这条路径上 loading **永远停在 true**：弹窗一直转圈、
+   * 没有重试、也没有失败提示，用户以为记录读不出来（实测 DOM 里「加载中」常驻、
+   * 「暂无变更记录」永不出现）。
+   *
+   * 判别力：把 finally 改成条件复位 → 本用例红。
+   */
+  it('变更历史请求在途时切了病人：弹窗不能永久停在「加载中」', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
+    await flushPromises()
+
+    let releaseLogs!: () => void
+    vi.mocked(repository.listPatientChangeLogs).mockReturnValue(
+      new Promise((resolve) => {
+        releaseLogs = () => resolve([] as never)
+      }) as never,
+    )
+    const vm = w.vm as unknown as {
+      openChangeLog: () => Promise<void>
+      switchPatient: (id: string) => Promise<void>
+      $: { setupState: Record<string, unknown> }
+    }
+    void vm.openChangeLog()
+    await flushPromises()
+
+    vi.mocked(repository.getPatient).mockImplementation(async (id: string) =>
+      makePatient({ id, name: id === 'patient-b' ? '乙' : '甲' }),
+    )
+    await vm.switchPatient('patient-b')
+    await flushPromises()
+
+    releaseLogs()
+    await flushPromises()
+
+    expect(
+      vm.$.setupState.changeLogLoading,
+      'loading 卡在 true → 弹窗永久转圈，用户以为记录读不出来',
+    ).toBe(false)
+  })
+
+  /**
+   * 中级-2（第五轮独立评审坐实）：`saveDw` 在切换病人途中必须被挡住。
+   *
+   * 原来它只守 `savingDw`、不守 `reloading`，且自己不持有 reloading。
+   * 切换途中点「＋ 新增」→ 填好 → 提交，`patientId` 取的是**已经切换后**的新 pid
+   * → 干体重挂到新病人名下，而页面显示的还是旧病人的列表。
+   * 干体重直接决定脱水量，写错病人等于改错治疗方案。
+   *
+   * 判别力：去掉 `saveDw` 的 `if (reloading.value)` 守卫 → 本用例红。
+   */
+  it('切换病人途中提交干体重：必须挡住（否则干体重挂到新病人名下）', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-a', name: '甲' }),
+      dryWeights: [makeDryWeight({ id: 'dw-a', patientId: 'patient-a', weight: 60 })],
+    })
+    await flushPromises()
+
+    // 让切换病人的 load 挂住
+    vi.mocked(repository.getPatient).mockReturnValue(new Promise(() => {}) as never)
+    const vm = w.vm as unknown as {
+      switchPatient: (id: string) => Promise<void>
+      saveDw: () => Promise<void>
+      $: { setupState: Record<string, unknown> }
+    }
+    void vm.switchPatient('patient-b')
+    await flushPromises()
+    expect(currentPatientIdRef.value).toBe('patient-b')
+
+    mocks.showToast.mockClear()
+    vi.mocked(repository.saveDryWeight).mockClear()
+    ;(vm.$.setupState.dwForm as Record<string, unknown>).value = '61'
+    await vm.saveDw()
+    await flushPromises()
+
+    expect(
+      vi.mocked(repository.saveDryWeight).mock.calls.length,
+      '切换途中把干体重存了下去 → 记录挂到新病人名下（页面还显示旧病人的列表）',
+    ).toBe(0)
+    expect(mocks.showToast).toHaveBeenCalledWith('正在加载病人档案，请稍候再保存')
+  })
+
+  /**
+   * 中级-2（第五轮独立评审坐实）：`removeDw` 在切换病人途中必须被挡住。
+   *
+   * 判别力：去掉 `removeDw` 的 `if (reloading.value)` 守卫 → 本用例红。
+   */
+  it('切换病人途中删除干体重：必须挡住', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-a', name: '甲' }),
+      dryWeights: [makeDryWeight({ id: 'dw-a', patientId: 'patient-a', weight: 60 })],
+    })
+    await flushPromises()
+
+    vi.mocked(repository.getPatient).mockReturnValue(new Promise(() => {}) as never)
+    const vm = w.vm as unknown as {
+      switchPatient: (id: string) => Promise<void>
+      removeDw: (d: unknown) => Promise<void>
+    }
+    void vm.switchPatient('patient-b')
+    await flushPromises()
+
+    mocks.showToast.mockClear()
+    vi.mocked(repository.deleteDryWeight).mockClear()
+    await vm.removeDw(makeDryWeight({ id: 'dw-a', patientId: 'patient-a', weight: 60 }))
+    await flushPromises()
+
+    expect(
+      vi.mocked(repository.deleteDryWeight).mock.calls.length,
+      '切换途中把干体重删了 → load() 用的是新 pid，用户以为在删旧病人的',
+    ).toBe(0)
+  })
+
+  /**
+   * 中级-2（第五轮独立评审坐实）：`onImportFile` 必须防连点（整库替换）。
+   *
+   * 原来连 in-flight 标记都没有：用户连选两次文件 = 两次 `importAll` +
+   * 两个并发 `load(true)`。
+   *
+   * 判别力：去掉 `if (importing.value) return` → 本用例红。
+   */
+  /**
+   * 轻微-1（第八轮测试有效性评审）：`removeDw` 确认框**之后**那道 `reloading` 复查无守护。
+   *
+   * `removeDw` 有两道 `reloading` 判断：进函数时一道、确认框关闭后再一道。
+   * 现有用例只覆盖了第一道（「切换病人途中删除」——进入时就已经在加载）。
+   * 第二道守的是另一个窗口：**用户停在「确定删除？」框上的那几秒里切了病人**。
+   * 实测：只删第二道 → 122 条全绿。
+   *
+   * 判别力：删掉确认框之后的 `if (reloading.value)` → 本用例红。
+   */
+  it('删除确认框开着期间切了病人：点确定必须放弃删除', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-a', name: '甲' }),
+      dryWeights: [makeDryWeight({ id: 'dw-a', patientId: 'patient-a', weight: 60 })],
+    })
+    await flushPromises()
+
+    // 把确认框挂住，模拟「用户正看着确认框」
+    let releaseDialog!: () => void
+    mocks.showConfirmDialog.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseDialog = resolve
+        }),
+    )
+
+    const vm = w.vm as unknown as {
+      removeDw: (d: unknown) => Promise<void>
+      switchPatient: (id: string) => Promise<void>
+    }
+    const removePromise = vm.removeDw(
+      makeDryWeight({ id: 'dw-a', patientId: 'patient-a', weight: 60 }),
+    )
+    await flushPromises()
+    expect(mocks.showConfirmDialog).toHaveBeenCalledTimes(1)
+
+    // 确认框还开着 —— 这期间用户切到了乙（并让乙的加载挂住，使 reloading 为 true）
+    vi.mocked(repository.getPatient).mockReturnValue(new Promise(() => {}) as never)
+    void vm.switchPatient('patient-b')
+    await flushPromises()
+
+    mocks.showToast.mockClear()
+    vi.mocked(repository.deleteDryWeight).mockClear()
+    releaseDialog() // 用户点了「确定」
+    await removePromise
+    await flushPromises()
+
+    expect(
+      vi.mocked(repository.deleteDryWeight).mock.calls.length,
+      '确认框期间已切到乙，点确定却删了 → 删的是甲的干体重，而随后的 load() 用的是乙的 pid',
+    ).toBe(0)
+  })
+
+  it('导入备份连点：只导入一次（整库替换不能并发）', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', name: '甲' }) })
+    await flushPromises()
+
+    let releaseImport!: () => void
+    vi.mocked(repository.importAll).mockReturnValue(
+      new Promise<void>((resolve) => {
+        releaseImport = resolve
+      }) as never,
+    )
+    const vm = w.vm as unknown as { onImportFile: (e: Event) => Promise<void> }
+
+    const file = new File(['{"patients":[]}'], 'backup.json', { type: 'application/json' })
+    const makeEvent = () =>
+      ({
+        target: { files: [file], value: 'backup.json' },
+      }) as unknown as Event
+
+    void vm.onImportFile(makeEvent())
+    await flushPromises()
+    void vm.onImportFile(makeEvent()) // 连选第二次
+    await flushPromises()
+
+    expect(
+      vi.mocked(repository.importAll).mock.calls.length,
+      '连点导入了两次 → 两个并发 load(true)，数据可能被清两次',
+    ).toBe(1)
+
+    releaseImport()
+    await flushPromises()
+  })
+
+  /**
+   * 轻微-1（第五轮独立评审）：`onMigrate` 的 `else await ensureCloudPatient()` 分支零覆盖。
+   *
+   * 这是「老版本/异常情况下迁移接口没返回 patientId」的兜底：退回按列表校准。
+   * 删掉它（变异 `else void 0`）后 115 条全绿 —— 没有任何用例走进这个分支。
+   *
+   * 判别力：把 `else await ensureCloudPatient()` 换成 `else void 0` → 本用例红。
+   */
+  it('迁移接口没返回 patientId 且列表无新增：退回按列表校准（不能什么都不做）', async () => {
+    currentPatientIdRef.value = 'patient-default'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    // 迁移前后列表**完全相同**（没有新增病人）
+    const sameList = [{ patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' }]
+    vi.mocked(listMyPatients).mockResolvedValue(sameList as never)
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', name: '甲' }) })
+    await flushPromises()
+
+    // 迁移成功但**没有 patientId**
+    mocks.migrateLocalToCloud.mockResolvedValue({
+      ok: true,
+      message: '已迁移 2 条透析记录到云端',
+    } as never)
+    mocks.ensureCloudPatient.mockClear()
+    const vm = w.vm as unknown as { onMigrate: () => Promise<void> }
+    await vm.onMigrate()
+    await flushPromises()
+
+    expect(
+      mocks.ensureCloudPatient.mock.calls.length,
+      '迁移没返回 patientId、列表也没新增时什么都没做 → 当前病人仍是默认 id，后续保存全落空',
+    ).toBeGreaterThan(0)
+  })
+
+  /**
+   * 中级-3（第四轮独立评审）：`removeDw` 没有 in-flight 守卫。
+   *
+   * 弱网下连点删除 → 两个 `deleteDryWeight` + 两个并发 `load()`：
+   * 第二次走 NotFound，两个 load 各持一份 reloading、各自用不同 pid 跑完。
+   *
+   * ⚠️ 第六轮实测：这条只能杀死「两道守卫同时删」（第一次点击已越过前置守卫并把
+   * `savingDw` 置 true，删掉前置后还有后置挡）。三道守卫的独立窗口见下面 D12/D14。
+   *
+   * 判别力：两道守卫同时删 → 本用例红。
+   */
+  it('删除干体重连点：只删一次（并发 load 会让切/存行为不可预测）', async () => {
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-default', name: '甲' }),
+      dryWeights: [makeDryWeight({ id: 'dw-1', patientId: 'patient-default', weight: 60 })],
+    })
+    await flushPromises()
+
+    // 确认框立即通过；deleteDryWeight 挂住，制造「在途」
+    let releaseDelete!: () => void
+    vi.mocked(repository.deleteDryWeight).mockReturnValue(
+      new Promise<void>((resolve) => {
+        releaseDelete = resolve
+      }) as never,
+    )
+    const dw = makeDryWeight({ id: 'dw-1', patientId: 'patient-default', weight: 60 })
+    const vm = w.vm as unknown as { removeDw: (d: unknown) => Promise<void> }
+
+    void vm.removeDw(dw)
+    await flushPromises()
+    void vm.removeDw(dw) // 连点第二次
+    await flushPromises()
+
+    expect(
+      vi.mocked(repository.deleteDryWeight).mock.calls.length,
+      '连点删除了两次 → 第二次 NotFound + 两个并发 load',
+    ).toBe(1)
+
+    releaseDelete()
+    await flushPromises()
+  })
+
+  /**
+   * 中级-1（第八轮测试有效性评审）：`saveDw` 新增的 `release()` **零守护**。
+   *
+   * 本轮把 `saveDw` 从「只当 `reloading` 的读者」改成「自己持有」（`beginReloading()` +
+   * `finally { release() }`），但**没有一条用例断言保存结束后 `reloading` 会归零**。
+   * 实测：删掉 `saveDw` 里的 `release()` → 122 条全绿。
+   *
+   * 后果比「多一个守卫」严重得多：`reloadingCount` 泄漏后 `reloading` 永久为 true，
+   * 之后**所有**切病人 / 保存 / 删除 / 导入都被静默挡住，用户点什么都只弹一句
+   * 「正在加载病人档案，请稍候再操作」，且**永远不会恢复**（只能杀进程）。
+   *
+   * 判别力：删掉 `saveDw` 的 `finally` 里的 `release()` → 本用例红。
+   */
+  it('保存干体重成功后 reloading 必须归零（否则之后所有写操作被永久挡住）', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = false
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-a', name: '甲' }),
+      dryWeights: [makeDryWeight({ id: 'dw-a', patientId: 'patient-a', weight: 60 })],
+    })
+    await flushPromises()
+
+    const vm = w.vm as unknown as {
+      saveDw: () => Promise<void>
+      switchPatient: (id: string) => Promise<void>
+      $: { setupState: Record<string, unknown> }
+    }
+    ;(vm.$.setupState.dwForm as Record<string, unknown>).value = '61'
+    await vm.saveDw()
+    await flushPromises()
+
+    expect(
+      vm.$.setupState.reloading,
+      'saveDw 的 release() 没执行 → reloadingCount 泄漏 → reloading 永久为 true，' +
+        '之后切病人 / 保存 / 删除 / 导入全部被静默挡住且永不恢复',
+    ).toBe(false)
+
+    // 行为级：reloading 若泄漏，切病人会被「正在加载病人档案」挡住
+    mocks.showToast.mockClear()
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(repository.getPatient).mockImplementation(async (id: string) =>
+      makePatient({ id, name: id === 'patient-b' ? '乙' : '甲' }),
+    )
+    await vm.switchPatient('patient-b')
+    await flushPromises()
+    expect(
+      currentPatientIdRef.value,
+      '保存干体重后切不动病人 → reloading 被 saveDw 泄漏了（用户会以为 App 卡死）',
+    ).toBe('patient-b')
+  })
+
+  /**
+   * 中级-2（第五轮独立评审）·导入入口的 `reloading` 守卫。
+   *
+   * 导入末尾的 `load(true)` 用的是**当时**的 pid。切换病人途中导入 → 整库被替换后
+   * 已经切到乙，回填的就是乙的档案（与 `saveDw` / `removeDw` 同一条理由）。
+   *
+   * 判别力：删掉 `onImportFile` 里的 `if (reloading.value)` 守卫 → 本用例红。
+   */
+  it('切换病人途中导入备份：必须挡住（否则整库替换后回填错病人）', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
+    await flushPromises()
+
+    // 让切换病人的 load 挂住
+    vi.mocked(repository.getPatient).mockReturnValue(new Promise(() => {}) as never)
+    const vm = w.vm as unknown as {
+      switchPatient: (id: string) => Promise<void>
+      onImportFile: (e: Event) => Promise<void>
+    }
+    void vm.switchPatient('patient-b')
+    await flushPromises()
+
+    mocks.showToast.mockClear()
+    vi.mocked(repository.importAll).mockClear()
+    // ⚠️ 导入只在单机模式可用（云端模式下会先走「请先退出登录」分支直接 return）——
+    // 不把它改回 false，本用例会走那个分支，删掉 reloading 守卫也照样绿（实测假绿）。
+    isLoggedInRef.value = false
+    const file = new File(['{"patients":[]}'], 'backup.json', { type: 'application/json' })
+    await vm.onImportFile({ target: { files: [file], value: 'backup.json' } } as unknown as Event)
+    await flushPromises()
+
+    expect(
+      vi.mocked(repository.importAll).mock.calls.length,
+      '切换途中导入了 → 整库被替换，随后 load(true) 用新 pid 回填错病人的档案',
+    ).toBe(0)
+    expect(mocks.showToast).toHaveBeenCalledWith('正在加载病人档案，请稍候再操作')
+  })
+
+  /**
+   * 轻微-1（第六轮独立评审）：`removeDw` 确认框**之后**的 `savingDw` 复查要用例锁定。
+   *
+   * 窗口：用户停在「确定删除？」框上时，另一个入口（干体重新增弹窗）刚好在存数据。
+   * 此时点「确定」必须放弃删除 —— 否则两个干体重写操作并发，随后两个 load() 各用不同
+   * pid 跑完，列表与当前病人的对应关系被打乱。
+   *
+   * 判别力：删掉确认框之后的 `if (savingDw.value) return` → 本用例红。
+   */
+  it('删除确认框开着期间另一个干体重写操作开始：点确定必须放弃删除', async () => {
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-default', name: '甲' }),
+      dryWeights: [makeDryWeight({ id: 'dw-1', patientId: 'patient-default', weight: 60 })],
+    })
+    await flushPromises()
+
+    // 让确认框挂住，期间把 savingDw 占住（模拟另一个入口正在存干体重）
+    let releaseDialog!: () => void
+    mocks.showConfirmDialog.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseDialog = resolve
+        }),
+    )
+    vi.mocked(repository.deleteDryWeight).mockClear()
+    const dw = makeDryWeight({ id: 'dw-1', patientId: 'patient-default', weight: 60 })
+    const vm = w.vm as unknown as {
+      removeDw: (d: unknown) => Promise<void>
+      $: { setupState: Record<string, unknown> }
+    }
+    void vm.removeDw(dw)
+    await flushPromises()
+
+    // 确认框开着时，另一个写操作占住 savingDw
+    vm.$.setupState.savingDw = true
+    releaseDialog()
+    await flushPromises()
+
+    expect(
+      vi.mocked(repository.deleteDryWeight).mock.calls.length,
+      '另一个干体重写操作在途时仍然删了 → 两个并发写 + 两个并发 load',
+    ).toBe(0)
+  })
+
+  /**
+   * D12（第六轮测试评审）：确认框开着时连点，不能弹**两个**确认框。
+   *
+   * 实测真实缺陷：`savingDw` 原来在对话框**关闭之后**才置 true，所以「用户正在读
+   * 『确定删除？』」的那几秒守卫是空的 → 连点两次弹两个框，用户点完第一个确定、
+   * 第二个框还挂着。
+   *
+   * 判别力：把 `deletingDw.value = true` 移到 `showConfirmDialog` 之后 → 本用例红。
+   */
+  it('删除确认框开着时连点：不能弹出两个确认框', async () => {
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-default', name: '甲' }),
+      dryWeights: [makeDryWeight({ id: 'dw-1', patientId: 'patient-default', weight: 60 })],
+    })
+    await flushPromises()
+
+    // 让确认框一直开着
+    mocks.showConfirmDialog.mockImplementation(() => new Promise<void>(() => {}))
+    const dw = makeDryWeight({ id: 'dw-1', patientId: 'patient-default', weight: 60 })
+    const vm = w.vm as unknown as { removeDw: (d: unknown) => Promise<void> }
+
+    void vm.removeDw(dw)
+    await flushPromises()
+    void vm.removeDw(dw) // 用户连点
+    await flushPromises()
+
+    expect(
+      mocks.showConfirmDialog.mock.calls.length,
+      '确认框开着时连点弹了多个框 → 用户点完第一个确定，第二个框还挂着',
+    ).toBe(1)
+  })
+
+  /**
+   * D14（第六轮测试评审）：删除失败后 `savingDw` / `deletingDw` 必须复位。
+   *
+   * 漏了复位 → 之后「新增干体重」永久失效（点了没反应），用户只能杀进程。
+   *
+   * 判别力：删掉 `removeDw` 的 `finally { deletingDw.value = false }` → 本用例红。
+   */
+  it('删除干体重失败后守卫必须复位（否则之后新增干体重永久失效）', async () => {
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-default', name: '甲' }),
+      dryWeights: [makeDryWeight({ id: 'dw-1', patientId: 'patient-default', weight: 60 })],
+    })
+    await flushPromises()
+
+    vi.mocked(repository.deleteDryWeight).mockRejectedValueOnce(new Error('offline') as never)
+    const dw = makeDryWeight({ id: 'dw-1', patientId: 'patient-default', weight: 60 })
+    const vm = w.vm as unknown as {
+      removeDw: (d: unknown) => Promise<void>
+      $: { setupState: Record<string, unknown> }
+    }
+    await vm.removeDw(dw)
+    await flushPromises()
+
+    expect(
+      vm.$.setupState.savingDw,
+      '删除失败后 savingDw 卡在 true → 之后新增干体重永久失效',
+    ).toBe(false)
+    expect(vm.$.setupState.deletingDw, '删除失败后 deletingDw 卡在 true').toBe(false)
+  })
+
+
+  /**
+   * 严重-4 的另一半（第六轮测试评审 C9）：冲突对话框的「**重新加载**」分支也必须复核 pid。
+   *
+   * 上面那条只点了「覆盖保存」（走 catch 分支）。「重新加载」（try 分支的 `await load(true)`）
+   * 这一支**零覆盖** —— 用户点「重新加载」时若已切到乙，会把乙的档案灌进页面，
+   * 用户以为在重新加载甲的冲突。实测：删掉 try 分支的 pid 复核 → 全量 1786 条全绿。
+   *
+   * 判别力：删掉 `resolvePatientConflict` try 分支的 pid 复核 → 本用例红。
+   */
+  it('冲突对话框停留期间切了病人：点「重新加载」也必须放弃，不能把乙的档案灌进来', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
+    await flushPromises()
+
+    const { ConflictError } = await import('../../src/lib/errors')
+    vi.mocked(repository.savePatient).mockRejectedValueOnce(new ConflictError('conflict'))
+
+    let releaseDialog!: () => void
+    mocks.showConfirmDialog.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseDialog = resolve
+        }),
+    )
+
+    await fieldInput(w, '轮椅及衣物重量').setValue('25')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+    expect(mocks.showConfirmDialog).toHaveBeenCalledTimes(1)
+
+    // 对话框还开着，切到乙
+    vi.mocked(repository.getPatient).mockImplementation(async (id: string) =>
+      makePatient({ id, name: id === 'patient-b' ? '乙' : '甲' }),
+    )
+    const vm = w.vm as unknown as { switchPatient: (id: string) => Promise<void> }
+    await vm.switchPatient('patient-b')
+    await flushPromises()
+    expect(currentPatientIdRef.value).toBe('patient-b')
+
+    // 记录切完之后 getPatient 的调用次数
+    const callsBeforeReload = vi.mocked(repository.getPatient).mock.calls.length
+
+    // 点「重新加载」（resolve = confirm 按钮）
+    mocks.showToast.mockClear()
+    releaseDialog()
+    await flushPromises()
+
+    // 必须放弃重新加载：不能再多发一次 getPatient
+    expect(
+      vi.mocked(repository.getPatient).mock.calls.length,
+      '对话框期间已切到乙，点「重新加载」却又加载了一次 → 甲的冲突被乙的数据顶掉',
+    ).toBe(callsBeforeReload)
+    expect(mocks.showToast).toHaveBeenCalledWith('你已切换到其他病人，这次修改已放弃')
+  })
+
+  /**
+   * 第六轮测试评审 A4d：`load()` **自己**持有的 `reloading` 零覆盖。
+   *
+   * 这是「加载在途时保存被挡」这条防线的唯一来源。删掉 `load()` 里的
+   * `beginReloading()` → 全量 1786 条全绿 —— 因为现有用例覆盖的都是**外层**
+   * （`switchPatient` / `savePatient` 自己持有），没有一条断言「`load()` 单独调用期间
+   * `reloading` 为 true」。
+   *
+   * 判别力：把 `load()` 里的 `const release = beginReloading()` 换成 `() => {}` → 本用例红。
+   */
+  it('load() 在途时必须持有 reloading（否则加载期间的保存会被放行）', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', name: '甲' }) })
+    await flushPromises()
+
+    let releaseLoad!: () => void
+    vi.mocked(repository.getPatient).mockReturnValue(
+      new Promise((resolve) => {
+        releaseLoad = () => resolve(makePatient({ id: 'patient-default', name: '甲' }) as never)
+      }) as never,
+    )
+    const vm = w.vm as unknown as {
+      load: (force?: boolean) => Promise<void>
+      savePatient: () => Promise<void>
+      $: { setupState: Record<string, unknown> }
+    }
+    void vm.load(true)
+    await flushPromises()
+
+    expect(
+      vm.$.setupState.reloading,
+      'load() 没有持有 reloading → 加载在途时保存会被放行',
+    ).toBe(true)
+
+    // 行为级断言：此期间保存必须被拒
+    mocks.showToast.mockClear()
+    vi.mocked(repository.savePatient).mockClear()
+    await vm.savePatient()
+    await flushPromises()
+    expect(mocks.showToast).toHaveBeenCalledWith('正在加载病人档案，请稍候再保存')
+    expect(repository.savePatient).not.toHaveBeenCalled()
+
+    releaseLoad()
+    await flushPromises()
+    expect(vm.$.setupState.reloading, 'load() 结束后必须释放').toBe(false)
+  })
+
+  /**
+   * 第六轮测试评审 A5b / A5c：新建 / 迁移成功后 `reloading` 必须归零。
+   *
+   * 现有用例只测了「刷新在途时点保存被拒」，**没测「刷新结束后守卫已释放」**。
+   * `reloadingCount` 泄漏后 `reloading` 永久为 true → 之后**任何**切病人 / 保存都被静默挡住，
+   * 用户点保存没反应。这两条路径低频但必然发生。
+   *
+   * 判别力：删掉 `onCreatePatient` 的 `finally { release() }` → A5b 红；`onMigrate` 同理。
+   */
+  it('新建病人成功后 reloading 必须归零（否则之后切病人被永久挡住）', async () => {
+    currentPatientIdRef.value = 'patient-default'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', name: '甲' }) })
+    await flushPromises()
+
+    // ⚠️ 必须构造 `{ ok, data: { patient } }`：`onCreatePatient` 读的是 `res.data?.patient`，
+    // 给成 `{ ok, patient }` 会走「创建失败」分支提前 return，`reloading` 永远是 false
+    // → 用例恒真（第六轮实测：这种写法下删掉 finally 的 release() 也全绿）。
+    vi.mocked(createPatient).mockResolvedValue({
+      ok: true,
+      data: { patient: makePatient({ id: 'patient-new', name: '丙' }) },
+    } as never)
+    const vm = w.vm as unknown as {
+      onCreatePatient: () => Promise<void>
+      $: { setupState: Record<string, unknown> }
+    }
+    // 姓名必填，否则也提前 return
+    ;(vm.$.setupState.newPatientForm as Record<string, unknown>).name = '丙'
+    await vm.onCreatePatient()
+    await flushPromises()
+
+    expect(
+      vm.$.setupState.reloading,
+      '新建后 reloading 卡在 true → 之后切病人/保存全被挡住',
+    ).toBe(false)
+  })
+
+  it('迁移成功后 reloading 必须归零（否则之后切病人被永久挡住）', async () => {
+    currentPatientIdRef.value = 'patient-default'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', name: '甲' }) })
+    await flushPromises()
+
+    mocks.migrateLocalToCloud.mockResolvedValue({
+      ok: true,
+      message: '已迁移 2 条透析记录到云端',
+      patientId: 'patient-c',
+    } as never)
+    const vm = w.vm as unknown as {
+      onMigrate: () => Promise<void>
+      $: { setupState: Record<string, unknown> }
+    }
+    await vm.onMigrate()
+    await flushPromises()
+
+    expect(
+      vm.$.setupState.reloading,
+      '迁移后 reloading 卡在 true → 之后切病人/保存全被挡住',
+    ).toBe(false)
+  })
+
+  /**
+   * 第六轮测试评审 B7a / B7b：`switchingPatient` 的置位 / 复位零覆盖。
+   *
+   * 上面那条「干体重重载不能变灰」只断言 `reloading` **不该**灰化，它**不关心
+   * `switchingPatient` 到底有没有被置位**。删掉置位 → 切换期间列表不变灰，
+   * 用户以为没点上继续连点；删掉复位 → 列表永久变灰、再也点不动。
+   *
+   * 判别力：删掉 `switchingPatient.value = true` → 本用例红；删掉 `= false` 同理。
+   */
+  /**
+   * 轻微-5（第八轮测试有效性评审）：模板是否**真的**据 `switchingPatient` 置灰，零覆盖。
+   *
+   * 现有用例只断言了 `setupState.switchingPatient` 这个 ref 的置位 / 复位，
+   * 没有断言模板把它用上了。实测：把「＋ 新增」按钮的
+   * `:disabled="!canEditConfig || switchingPatient"` 改回 `:disabled="!canEditConfig"`，
+   * 或者把删除图标的颜色写死成红 —— 123 条全绿。
+   *
+   * 判别力：删掉模板里的 `|| switchingPatient` → 本用例红。
+   */
+  it('切换病人途中「＋ 新增」必须置灰（否则点了会把干体重挂到新病人名下）', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-a', name: '甲' }),
+      dryWeights: [makeDryWeight({ id: 'dw-a', patientId: 'patient-a', weight: 60 })],
+    })
+    await flushPromises()
+
+    const addBtn = (): HTMLButtonElement | undefined =>
+      [...w.findAll('button')]
+        .find((b) => b.text().includes('新增'))
+        ?.element as HTMLButtonElement | undefined
+
+    expect(addBtn()?.disabled, '静止时「＋ 新增」不该置灰').toBe(false)
+
+    // 让切换病人的 load 挂住 → switchingPatient 为 true
+    vi.mocked(repository.getPatient).mockReturnValue(new Promise(() => {}) as never)
+    const vm = w.vm as unknown as { switchPatient: (id: string) => Promise<void> }
+    void vm.switchPatient('patient-b')
+    await flushPromises()
+
+    expect(
+      addBtn()?.disabled,
+      '切换病人途中「＋ 新增」没有置灰 → 用户能点开并提交，干体重会挂到新病人名下',
+    ).toBe(true)
+  })
+
+  /**
+   * 轻微-3（第八轮测试有效性评审）：`openDw` 的 `reloading` 守卫零覆盖。
+   *
+   * 判别力：删掉 `openDw` 里的 `if (reloading.value)` → 本用例红。
+   */
+  it('切换病人途中点「＋ 新增」干体重：必须挡住并提示', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({
+      patient: makePatient({ id: 'patient-a', name: '甲' }),
+      dryWeights: [makeDryWeight({ id: 'dw-a', patientId: 'patient-a', weight: 60 })],
+    })
+    await flushPromises()
+
+    vi.mocked(repository.getPatient).mockReturnValue(new Promise(() => {}) as never)
+    const vm = w.vm as unknown as {
+      switchPatient: (id: string) => Promise<void>
+      openDw: () => void
+      $: { setupState: Record<string, unknown> }
+    }
+    void vm.switchPatient('patient-b')
+    await flushPromises()
+
+    mocks.showToast.mockClear()
+    vm.openDw()
+    await flushPromises()
+
+    expect(
+      vm.$.setupState.showDwForm,
+      '切换途中弹出了干体重表单 → 用户填完提交就挂到新病人名下',
+    ).toBe(false)
+    expect(mocks.showToast).toHaveBeenCalledWith('正在加载病人档案，请稍候再操作')
+  })
+
+  /**
+   * 轻微-4（第八轮测试有效性评审）：`openChangeLog` 里两处
+   * `showChangeLog.value = false`（切走时关弹窗）零覆盖。
+   *
+   * 注释写得很清楚「只 return 的话，弹窗还开着、里面是甲的记录」，
+   * 但现有两条用例只断言了 `changeLogs` 不含甲（数据半边），没断言弹窗被关掉。
+   *
+   * 判别力：删掉成功分支的 `showChangeLog.value = false` → 本用例红。
+   */
+  it('变更历史返回时已切走：弹窗必须关掉（否则里面还是甲的数据）', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
+    await flushPromises()
+
+    let releaseLogs!: (v: unknown[]) => void
+    vi.mocked(repository.listPatientChangeLogs).mockReturnValue(
+      new Promise((resolve) => {
+        releaseLogs = resolve as never
+      }) as never,
+    )
+    const vm = w.vm as unknown as {
+      openChangeLog: () => Promise<void>
+      switchPatient: (id: string) => Promise<void>
+      $: { setupState: Record<string, unknown> }
+    }
+    const p = vm.openChangeLog()
+    await flushPromises()
+    expect(vm.$.setupState.showChangeLog).toBe(true)
+
+    vi.mocked(repository.getPatient).mockImplementation(async (id: string) =>
+      makePatient({ id, name: id === 'patient-b' ? '乙' : '甲' }),
+    )
+    await vm.switchPatient('patient-b')
+    await flushPromises()
+
+    releaseLogs([makeChangeLog({ id: 'cl-a', patientId: 'patient-a' })])
+    await p
+    await flushPromises()
+
+    expect(
+      vm.$.setupState.showChangeLog,
+      '已切到乙，甲的变更历史弹窗却还开着 → 用户会以为那是乙的记录',
+    ).toBe(false)
+  })
+
+  it('切换病人期间 switchingPatient 置位、结束后复位（列表该灰时灰、该亮时亮）', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    mocks.setCurrentPatientId.mockImplementation((id: string) => {
+      currentPatientIdRef.value = id
+    })
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
+    await flushPromises()
+
+    let releaseRole!: () => void
+    mocks.refreshCurrentRole.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseRole = resolve
+        }),
+    )
+    const vm = w.vm as unknown as {
+      switchPatient: (id: string) => Promise<void>
+      $: { setupState: Record<string, unknown> }
+    }
+    void vm.switchPatient('patient-b')
+    await flushPromises()
+
+    expect(
+      vm.$.setupState.switchingPatient,
+      '切换在途时列表没变灰 → 用户以为没点上，继续连点',
+    ).toBe(true)
+
+    releaseRole()
+    await flushPromises()
+
+    expect(
+      vm.$.setupState.switchingPatient,
+      '切换结束后列表一直是灰的 → 再也点不动',
+    ).toBe(false)
+  })
+
+  /**
+   * 第六轮测试评审 F19：「保存在途时点**自己那一行**」的文案误导。
+   *
+   * 同 id 早退（`if (id === currentPatientId.value) return`）必须在守卫**之前**。
+   * 变异后（挪回守卫之后），用户保存在途时误触自己那一行会弹出
+   * 「正在保存档案，请稍候再切换病人」—— 用户根本没想切换。
+   *
+   * 判别力：把同 id 早退挪到 `savingPatient` 守卫之后 → 本用例红。
+   */
+  it('保存在途时点自己那一行：不该提示「正在保存档案」（用户没想切换）', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
+    await flushPromises()
+
+    // 让保存在途
+    vi.mocked(repository.savePatient).mockReturnValue(new Promise(() => {}) as never)
+    const vm = w.vm as unknown as {
+      savePatient: () => Promise<void>
+      switchPatient: (id: string) => Promise<void>
+    }
+    void vm.savePatient()
+    await flushPromises()
+
+    mocks.showToast.mockClear()
+    await vm.switchPatient('patient-a') // 点自己那一行
+    await flushPromises()
+
+    expect(
+      mocks.showToast.mock.calls.map((c) => String(c[0])).includes('正在保存档案，请稍候再切换病人'),
+      '点的是当前病人那一行（不是切换），却提示「正在保存档案，请稍候再切换病人」→ 文案误导',
+    ).toBe(false)
+    expect(mocks.setCurrentPatientId).not.toHaveBeenCalled()
   })
 
   /**
