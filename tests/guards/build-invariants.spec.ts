@@ -192,6 +192,26 @@ describe('静态守卫 · 构建与发布不变式', () => {
           '缺了它会**整个构建失败**（error during build: PLUGIN_ERROR），而不是只丢预缓存。',
       ).toBe(true)
 
+      // ⚠️ 第十轮独立评审轻微-2：上面两个匹配都是「全文件首个」，挡不住「块被挪到错的分支」。
+      // vite.config.ts 是 `DISABLE_SW ? [...] : [VitePWA({ workbox: {...} })]` 的二元分支：
+      // 若有人把 workbox 挪到 DISABLE_SW 那侧（原生壳分支，本来就不该有 SW），
+      // Web 构建会重新踩回 2 MiB 上限，而守卫全绿。所以这里钉住位置关系。
+      const vitePwaAt = src.indexOf('VitePWA(')
+      const workboxAt = src.indexOf('workbox')
+      expect(vitePwaAt, 'vite.config.ts 里找不到 VitePWA( —— 守卫的定位前提变了').toBeGreaterThanOrEqual(0)
+      expect(
+        workboxAt > vitePwaAt,
+        'workbox 配置块跑到了 VitePWA( 前面：它必须在 VitePWA 的选项里，否则等于没配。',
+      ).toBe(true)
+      // DISABLE_SW 分支（原生壳）在前、SW 分支在后；workbox 必须落在**后者**里
+      const disableSwAt = src.indexOf('DISABLE_SW')
+      expect(disableSwAt, 'vite.config.ts 里找不到 DISABLE_SW —— 守卫的定位前提变了').toBeGreaterThanOrEqual(0)
+      expect(
+        workboxAt > disableSwAt,
+        'workbox 配置块跑到了 DISABLE_SW 分支里（原生壳不该有 Service Worker）：' +
+          'Web 构建会重新踩回 workbox 默认 2 MiB 上限 → npm run build 整个失败。',
+      ).toBe(true)
+
       const m = src.match(/maximumFileSizeToCacheInBytes\s*:\s*([^,\n]+)/)
       expect(
         m,
@@ -199,18 +219,28 @@ describe('静态守卫 · 构建与发布不变式', () => {
           '主包 2.1 MB 超过 workbox 默认 2 MiB → npm run build 失败（报错在 built in 之后才出现，极易漏看）',
       ).toBeTruthy()
 
-      // 解析实参：只接受「数字 * 1024 * 1024」这类可静态求值的写法，值必须 ≥ 2.5 MiB
+      // 解析实参：只接受能静态求值的写法。
+      //
+      // ⚠️ 第十轮独立评审轻微-1：原来直接 `expr.split('*')` 逐段 Number() 相乘，
+      // 遇到 `4 * 1024 ** 2`（值等价于 4194304，合法 JS）会拆成 ["4 "," 1024 ",""," 2"]，
+      // 中间空串 `Number('') === 0` 且 isFinite(0) === true → 不报「无法求值」，
+      // 而是算出 0 字节，最终红在「期望恰好 4 MiB」，文案把人引向「值配小了」。
+      // 现在先整体求值（`**` / `<<` / `0x` 都能算对），失败再退回按 `*` 拆。
       const expr = m![1].trim()
-      const parts = expr.split('*').map((x) => x.trim())
-      let bytes = 1
-      for (const part of parts) {
-        const n = Number(part)
+      let bytes: number
+      const whole = Number(expr)
+      if (Number.isFinite(whole)) {
+        bytes = whole
+      } else {
+        const parts = expr.split('*').map((x) => x.trim())
+        // 空串是 `**`（幂运算）被拆出来的痕迹，必须明确拒绝，不能当 0 吞掉
+        const bad = parts.find((part) => part === '' || !Number.isFinite(Number(part)))
         expect(
-          Number.isFinite(n),
-          `maximumFileSizeToCacheInBytes 的表达式「${expr}」含无法静态求值的项「${part}」，` +
+          bad === undefined,
+          `maximumFileSizeToCacheInBytes 的表达式「${expr}」含无法静态求值的项「${bad ?? ''}」，` +
             '守卫没法判断它够不够大。请写成 4 * 1024 * 1024 这种形式。',
         ).toBe(true)
-        bytes *= n
+        bytes = parts.reduce((acc, part) => acc * Number(part), 1)
       }
       // 第九轮独立评审轻微-3：原来断言「≥ 2.5 MiB」，比配置值（4 MiB）松 ——
       // 主包从 2.1 MB 慢慢涨到 3.9 MB 时守卫照样绿，等于没守住体积失控。
