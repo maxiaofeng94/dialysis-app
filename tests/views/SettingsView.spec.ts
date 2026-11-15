@@ -83,6 +83,9 @@ vi.mock('../../src/stores/patient', async () => {
     refreshCurrentRole: mocks.refreshCurrentRole,
     ensureCloudPatient: mocks.ensureCloudPatient,
     __currentRole: currentRole,
+    // 测试要能真的切病人（跨病人隔离的用例需要）。`setCurrentPatientId` 是 mock，
+    // 不会改这个 ref，所以直接暴露出来让用例赋值。
+    __currentPatientId: currentPatientId,
   }
 })
 
@@ -118,6 +121,13 @@ vi.mock('vant', async (importOriginal) => {
 const isLoggedInRef = (authModule as unknown as { __isLoggedIn: { value: boolean } }).__isLoggedIn
 /** 当前账号对当前病人的角色（null = 本地模式/未知，'owner'/'caregiver'/… 由云端返回） */
 const currentRoleRef = (patientModule as unknown as { __currentRole: { value: string | null } }).__currentRole
+
+/**
+ * 当前病人 id 的真 ref。跨病人隔离的用例必须**直接改这个 ref** ——
+ * `setCurrentPatientId` 在本 spec 里是 mock，改不动它。
+ */
+const currentPatientIdRef = (patientModule as unknown as { __currentPatientId: { value: string } })
+  .__currentPatientId
 
 let wrapper: VueWrapper | null = null
 let router: Router
@@ -1456,6 +1466,53 @@ describe('SettingsView · 轮椅及衣物重量变更记录（运行时行为）
       const calls = vi.mocked(repository.addPatientChangeLog).mock.calls.map((c) => c[0])
       expect(calls[1]).toMatchObject({ oldValue: 13.4, newValue: 14 }) // 补写的旧变更
       expect(calls[2]).toMatchObject({ oldValue: 14, newValue: 15 }) // 本次新变更
+    })
+
+    /**
+     * 待补项是**模块级变量**，跨病人切换时必须带上归属，否则会把 A 的变更记到 B 名下。
+     *
+     * 真实场景：A 病人改重量时断网 → 日志写失败、进入待补 → 用户切到 B 病人
+     * （同一台手机上照护多位家属很常见）→ 在 B 的设置页保存任意字段 → 补写触发，
+     * 把「A 的 13.4→14」写成 B 的变更记录。B 的变更历史里凭空多出一条从未发生过的改动，
+     * 而 A 的那条永久缺失 —— 这份历史的可信度直接归零。
+     */
+    it('待补项不得串到别的病人，切回原病人后仍能补写', async () => {
+      currentPatientIdRef.value = 'patient-a'
+      const w = await mountSettings({ patient: makePatient({ id: 'patient-a', wheelchairWeight: 13.4 }) })
+      vi.mocked(repository.addPatientChangeLog).mockRejectedValueOnce(new Error('offline'))
+
+      // A 改重量 13.4 → 14，日志失败 → 进入待补
+      await fieldInput(w, '轮椅及衣物重量').setValue('14')
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+      expect(repository.addPatientChangeLog).toHaveBeenCalledTimes(1)
+
+      // 切到 B 病人，保存（不改重量）→ 不能触发 A 的补写
+      currentPatientIdRef.value = 'patient-b'
+      await w.vm.$nextTick()
+      await flushPromises()
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+
+      // B 名下绝不能出现任何变更记录
+      const bCalls = vi
+        .mocked(repository.addPatientChangeLog)
+        .mock.calls.map((c) => c[0])
+        .filter((l) => l.patientId === 'patient-b')
+      expect(bCalls).toHaveLength(0)
+
+      // 切回 A 后保存一次（不改重量）→ 待补项要能补写，且归属是 A（不是丢弃）
+      currentPatientIdRef.value = 'patient-a'
+      await w.vm.$nextTick()
+      await flushPromises()
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+
+      const backfilled = vi
+        .mocked(repository.addPatientChangeLog)
+        .mock.calls.map((c) => c[0])
+        .find((l) => l.oldValue === 13.4 && l.newValue === 14 && l.patientId === 'patient-a')
+      expect(backfilled).toBeTruthy()
     })
   })
 

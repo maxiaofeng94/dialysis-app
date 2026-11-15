@@ -424,7 +424,14 @@ async function savePatient(opts: { override?: boolean } = {}) {
       // 先补上次没记上的（顺序才不会乱：老变更在前、新变更在后）
       await flushPendingWheelchairLog()
       const logged = await appendWheelchairLog(prevWheelchair, wheelchairWeight)
-      if (!logged) pendingWheelchairLog = { oldValue: prevWheelchair, newValue: wheelchairWeight }
+      if (!logged) {
+        // 带上归属：切到别的病人后保存时不能把这条记到别人名下（见 pendingWheelchairLog 注释）
+        pendingWheelchairLog = {
+          patientId: currentPatientId.value,
+          oldValue: prevWheelchair,
+          newValue: wheelchairWeight,
+        }
+      }
       showToast(logged ? '已保存' : '已保存，但变更记录未能写入（下次保存时会自动补记）')
     } else {
       // 本次没改重量，但可能有上次没记上的变更 → 顺手补写
@@ -496,13 +503,27 @@ async function appendWheelchairLog(oldValue: number, newValue: number): Promise<
  *
  * 修法：写失败就把「没记上的那次变更」暂存下来，**下一次保存时自动补写**；
  * 补写成功后清空。这样用户只要再点一次保存（或再改一次）就补回来了。
+ *
+ * ⚠️ **必须带 `patientId`**：这个变量是模块级的，而用户会在同一台手机上照护多位病人。
+ * 不带归属的话，A 的待补项会在 B 的设置页保存时被补写 —— `appendWheelchairLog` 用的是
+ * `currentPatientId.value`，于是 A 的变更被记到 B 名下：B 的历史里凭空多出一条从未发生
+ * 过的改动，A 的那条永久缺失。两边都错，且这份历史的可信度直接归零。
  */
-let pendingWheelchairLog: { oldValue: number; newValue: number } | null = null
+let pendingWheelchairLog: { patientId: string; oldValue: number; newValue: number } | null = null
 
-/** 补写上次没记上的变更（如果有）。返回 true 表示没有待补项或补写成功 */
+/**
+ * 补写上次没记上的变更（如果有）。返回 true 表示没有待补项或补写成功。
+ *
+ * 只在**待补项属于当前病人**时才补：否则保留待补项不动，等用户切回原病人再补。
+ * 这样既不会串到别的病人，也不会把这条变更丢掉。
+ */
 async function flushPendingWheelchairLog(): Promise<boolean> {
   const pending = pendingWheelchairLog
   if (!pending) return true
+  if (pending.patientId !== currentPatientId.value) {
+    // 不是当前病人的待补项 —— 保留着，等切回去再补。不报错、不提示（用户没做错什么）
+    return true
+  }
   const ok = await appendWheelchairLog(pending.oldValue, pending.newValue)
   if (ok) pendingWheelchairLog = null
   return ok

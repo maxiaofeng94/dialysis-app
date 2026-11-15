@@ -150,4 +150,41 @@ describe('BaseChart', () => {
 
     wrapper.unmount()
   })
+
+  /**
+   * 评审 M1 补充：`yAxisIndex` 变化也算**结构变化**。
+   *
+   * 只看「series 数量 + 名字 + 轴数量」会漏掉这种情况：曲线名字没变、轴数量也没变，
+   * 但某条曲线从主轴挪到副轴（或反过来）。此时合并语义不会移动已有 series 的轴归属，
+   * 图上的曲线会挂在**错的坐标轴**上 —— 数值量级差几十倍，比残留曲线更误导。
+   *
+   * 真实场景：报告页的血压图，两条曲线名字固定是「高压」「低压」，轴的 name 从
+   * `mmHg` 变成 `mmHg/bpm` 双轴时，若只比名字就会走合并。
+   */
+  it('yAxisIndex 变化（曲线换轴）时也算结构变化，必须 notMerge', async () => {
+    // 双轴，两条曲线都在主轴
+    const bothOnMain = {
+      series: [
+        { name: '高压', data: [130], yAxisIndex: 0 },
+        { name: '低压', data: [80], yAxisIndex: 0 },
+      ],
+      yAxis: [{ name: 'mmHg' }, { name: 'bpm' }],
+    }
+    const wrapper = mount(BaseChart, { props: { option: bothOnMain } })
+    expect(echartsStub.chart.setOption).toHaveBeenLastCalledWith(bothOnMain, { notMerge: true })
+
+    // series 数量、名字、yAxis 数量全都没变，只有「低压」从主轴挪到副轴
+    const movedToSecondAxis = {
+      series: [
+        { name: '高压', data: [130], yAxisIndex: 0 },
+        { name: '低压', data: [80], yAxisIndex: 1 },
+      ],
+      yAxis: [{ name: 'mmHg' }, { name: 'bpm' }],
+    }
+    await wrapper.setProps({ option: movedToSecondAxis })
+    // 必须 notMerge，否则「低压」会留在原来的主轴上（量级差几十倍，比残留更误导）
+    expect(echartsStub.chart.setOption).toHaveBeenLastCalledWith(movedToSecondAxis, { notMerge: true })
+
+    wrapper.unmount()
+  })
 })
