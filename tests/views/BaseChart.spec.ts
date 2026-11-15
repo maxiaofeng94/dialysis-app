@@ -187,4 +187,34 @@ describe('BaseChart', () => {
 
     wrapper.unmount()
   })
+
+  /**
+   * M-3（独立评审）：y 轴**值域**（min/max/interval）变化也算结构变化。
+   *
+   * 合并语义下 ECharts 会**保留旧的轴视窗**。真实后果：心率 3 个点都在 75±3 时
+   * `autoValueAxis` 判定「太扁平」设了固定视窗 min=57/max=97；第 4 次记录心率 140
+   * （心动过速，最该被看见的值）→ 跨度变大、新 option 不再带 min/max，
+   * 但合并保留了旧视窗 → **140 被裁出显示范围**，曲线看起来「心率正常」。
+   * 用户表现为「图表时对时错」，刷新后又正常。
+   */
+  it('y 轴值域（min/max）变化时也算结构变化，必须 notMerge（否则新数据点被旧视窗裁掉）', async () => {
+    // 扁平视窗：3 个心率点 76/78/75，自动设固定视窗
+    const flatWindow = {
+      series: [{ name: '心率', data: [76, 78, 75], yAxisIndex: 0 }],
+      yAxis: [{ name: 'bpm', min: 57, max: 97, interval: 10 }],
+    }
+    const wrapper = mount(BaseChart, { props: { option: flatWindow } })
+    expect(echartsStub.chart.setOption).toHaveBeenLastCalledWith(flatWindow, { notMerge: true })
+
+    // 新增一条 140 → 跨度 65，不再设固定视窗（min/max 消失）
+    const wideData = {
+      series: [{ name: '心率', data: [76, 78, 75, 140], yAxisIndex: 0 }],
+      yAxis: [{ name: 'bpm' }],
+    }
+    await wrapper.setProps({ option: wideData })
+    // 必须 notMerge：否则旧的 57~97 视窗保留，140 那个点画不出来
+    expect(echartsStub.chart.setOption).toHaveBeenLastCalledWith(wideData, { notMerge: true })
+
+    wrapper.unmount()
+  })
 })

@@ -30,7 +30,15 @@ function structureKey(option: any): string {
   const axisIdx = series.map((s: any) => Number(s?.yAxisIndex ?? 0)).join(',')
   const yAxes = Array.isArray(option?.yAxis) ? option.yAxis : option?.yAxis ? [option.yAxis] : []
   const axisNames = yAxes.map((a: any) => String(a?.name ?? '')).join('|')
-  return `${series.length}#${yAxes.length}#${names}#${axisIdx}#${axisNames}`
+  // ⚠️ 值域（min/max/interval）也必须进指纹：合并语义下 ECharts **保留**旧的轴视窗。
+  // 真实后果（独立评审 M-3 实测）：心率 3 个点都在 75±3 → `autoValueAxis` 判定「太扁平」
+  // 设了固定视窗 min=57/max=97；第 4 次记录心率 140（心动过速，最该被看见的值）→
+  // 跨度变大、不再设固定视窗，但合并保留了旧视窗 57~97 → **140 那个点被裁出图表**，
+  // 曲线看起来「心率正常」。用户看到的是「图表时对时错」，刷新后又正常。
+  const axisRanges = yAxes
+    .map((a: any) => `${a?.min ?? ''}/${a?.max ?? ''}/${a?.interval ?? ''}`)
+    .join('|')
+  return `${series.length}#${yAxes.length}#${names}#${axisIdx}#${axisNames}#${axisRanges}`
 }
 
 let lastKey: string | null = null

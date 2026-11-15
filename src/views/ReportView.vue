@@ -14,6 +14,7 @@ import { useSessionExpiryRedirect } from '../lib/sessionExpiry'
 import { fmt, formatTime, calcAge, formatDateTimeCN } from '../utils/format'
 import { computeSession, getEffectiveDryWeight, resolveEffectiveConfig } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
+import { dualAxisTooltip, withUnit } from '../utils/chartTooltip'
 import BaseChart from '../components/BaseChart.vue'
 import type { DialysisSession, Patient, DryWeight, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
 
@@ -127,7 +128,13 @@ const hasBpPulse = computed(() => bps.value.some((b) => b.pulse != null))
 
 const bpOption = computed(() => {
   const base: Record<string, unknown> = {
-    tooltip: { trigger: 'axis' },
+    // 双轴（mmHg / bpm）时按 series 名分别加单位；单轴时统一 mmHg。
+    // 用 `formatter` 而非 `valueFormatter` 的原因见 utils/chartTooltip.ts 的注释 ——
+    // valueFormatter 的第二个参数是 dataIndex（数字），拿不到 seriesName，
+    // 心率会被标成「76 mmHg」（护士把心率当血压读）。
+    tooltip: hasBpPulse.value
+      ? { trigger: 'axis', formatter: dualAxisTooltip }
+      : { trigger: 'axis', valueFormatter: withUnit('mmHg') },
     legend: {
       top: 0,
       left: 'center',

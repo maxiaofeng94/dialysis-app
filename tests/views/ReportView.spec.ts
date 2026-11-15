@@ -20,6 +20,7 @@ import BaseChart from '../../src/components/BaseChart.vue'
 import { repository } from '../../src/repo'
 import { cacheVersion } from '../../src/lib/cloudCache'
 import { makePatient, makeDryWeight, makeSession, makeBp, makeBg, makeBf, makeReaction } from '../helpers/factories'
+import * as patientModule from '../../src/stores/patient'
 
 const html2canvasMock = vi.hoisted(() => vi.fn())
 const mocks = vi.hoisted(() => ({ showToast: vi.fn() }))
@@ -46,12 +47,24 @@ vi.mock('../../src/repo', () => ({
   },
 }))
 
-vi.mock('../../src/stores/patient', () => ({ currentPatientId: { value: 'patient-default' } }))
+// 用真 ref：跨病人拦截的用例需要能切病人（对象字面量改不动）
+vi.mock('../../src/stores/patient', async () => {
+  const { ref } = await import('vue')
+  const currentPatientId = ref('patient-default')
+  return { currentPatientId, __currentPatientId: currentPatientId }
+})
 
 const Blank = defineComponent({ render: () => h('div') })
 const Harness = defineComponent({ render: () => h(RouterView) })
 
 let wrapper: VueWrapper | null = null
+
+/**
+ * 当前病人 id 的真 ref。跨病人拦截的用例必须**直接改这个 ref** ——
+ * 它同时被 `ReportView` 与测试共享。
+ */
+const currentPatientIdRef = (patientModule as unknown as { __currentPatientId: { value: string } })
+  .__currentPatientId
 let router: Router
 
 function buttonByText(scope: VueWrapper, text: string): DOMWrapper<HTMLButtonElement> {
@@ -147,6 +160,8 @@ beforeEach(() => {
   })
   mocks.showToast.mockReset()
   echartsStub.init.mockClear()
+  // 每个用例从「记录与当前病人一致」的常态开始
+  currentPatientIdRef.value = 'patient-default'
   for (const fn of Object.values(repository) as unknown as ReturnType<typeof vi.fn>[]) {
     fn.mockReset()
   }
@@ -185,6 +200,33 @@ describe('ReportView · 加载', () => {
 
     expect(router.currentRoute.value.path).toBe('/')
     expect(w.find('.report-flow').exists()).toBe(false)
+  })
+
+  /**
+   * M-1（独立评审）：**跨病人拦截**的防线。
+   *
+   * 场景：用户在病人 A 的报告页 → 切到病人 B → 按返回键回到旧的 `/report/:id`。
+   * 报告会按**B 的姓名/干体重/轮椅重量**去渲染 **A 的记录** —— 一份张冠李戴的报告。
+   * `resolveEffectiveConfig` 的归属校验只能兜住重量，姓名与干体重仍会串。
+   *
+   * 独立评审实测：把 `ReportView.vue:73-77` 那段拦截整段删除，1728 条用例照样全绿 ——
+   * 该拦截此前**零覆盖**（同模式在 SessionView 有覆盖，报告页漏了）。
+   */
+  it('记录属于其他病人：提示并跳回首页，绝不渲染对方的报告（跨病人拦截）', async () => {
+    // 当前病人是 B，但这条记录属于 A
+    currentPatientIdRef.value = 'patient-b'
+    const w = await mountReport(
+      defaultData({
+        session: makeSession({ id: 'session-1', patientId: 'patient-a', date: '2024-01-10' }),
+        patient: makePatient({ id: 'patient-b', name: '李四' }),
+      }),
+    )
+
+    expect(router.currentRoute.value.path).toBe('/')
+    expect(toastText()).toContain('其他病人')
+    // 绝不能渲染出报告（尤其是 A 的数据配 B 的姓名）
+    expect(w.find('.report-flow').exists()).toBe(false)
+    expect(w.text()).not.toContain('李四')
   })
 
   it('加载失败：留在页面上给提示与重试按钮，不跳回首页、不留永久骨架（H4）', async () => {
@@ -569,6 +611,29 @@ describe('ReportView · 血压心率（需求③）', () => {
     expect(series[2].yAxisIndex).toBe(1)
     expect(series[0].yAxisIndex ?? 0).toBe(0)
     expect(series[1].yAxisIndex ?? 0).toBe(0)
+  })
+
+  /**
+   * L-3（独立评审）：报告页的双轴 tooltip 也必须有单位，且心率是 bpm。
+   *
+   * 原实现是裸的 `tooltip: { trigger: 'axis' }` —— 双轴图里心率与血压数字并列、
+   * 都不带单位，只能靠轴名区分；医生读报告时容易把 76 当成血压值。
+   * 修法与趋势页共用 `utils/chartTooltip.ts` 的 `dualAxisTooltip`。
+   */
+  it('双轴 tooltip：心率按 bpm、血压按 mmHg（运行时断言，不是源码正则）', async () => {
+    await mountReport(defaultData({ bps: bpsWithPulse }))
+
+    const tooltip = chartOption().tooltip as { formatter?: (p: unknown) => string }
+    expect(typeof tooltip.formatter).toBe('function')
+    const out = tooltip.formatter!([
+      { seriesName: '高压', value: 130, marker: '', axisValueLabel: '08:00' },
+      { seriesName: '低压', value: 80, marker: '', axisValueLabel: '08:00' },
+      { seriesName: '心率', value: 76, marker: '', axisValueLabel: '08:00' },
+    ])
+    expect(out).toContain('130 mmHg')
+    expect(out).toContain('80 mmHg')
+    expect(out).toContain('76 bpm')
+    expect(out).not.toContain('76 mmHg')
   })
 
   it('没有心率的历史数据：只画两条线，yAxis 是单对象而不是数组', async () => {

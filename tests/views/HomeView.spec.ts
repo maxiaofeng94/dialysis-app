@@ -478,6 +478,71 @@ describe('HomeView · 记录列表', () => {
     expect(months).toEqual(['2024-01', '2024-02'])
   })
 
+  /**
+   * 需求①在**首页**这条路径上的防线。
+   *
+   * ⚠️ 为什么必须让「档案重量 ≠ 记录里的快照」：`makePatient()` 默认轮椅 20kg，
+   * `makeSession()` 默认 `wheelchairWeightUsed: 20` —— 两者恰好相等，
+   * 所以传不传 `patient` 算出来都是同一个数，用例**没有判别力**。
+   * 独立评审实测：把 `summary()` 里的 `computeSession(s, dry, patient.value)` 改回
+   * `computeSession(s, dry)`（即「首页不跟随档案」这个原始 bug），1728 条用例照样全绿。
+   *
+   * 这里让档案 25kg、快照 20kg：跟随档案 = 80 − 25 = 55.0；退回快照 = 80 − 20 = 60.0。
+   */
+  it('进行中的记录：首页按当前档案算上机前实际（档案重量 ≠ 记录快照时必须跟随档案）', async () => {
+    stubData({
+      patient: makePatient({ wheelchairWeight: 25 }),
+      dryWeights: dry,
+      sessions: [
+        makeSession({
+          id: 's1',
+          date: '2024-01-10',
+          preWeightMeasured: 80,
+          wheelchairWeightUsed: 20, // 记录里的旧快照
+          status: 'ongoing',
+        }),
+      ],
+    })
+    const w = await mountHome()
+    await flushPromises()
+
+    const text = w.text()
+    expect(text).toContain('55.0') // 80 − 25（当前档案）
+    // 不能出现「上机前实际 60.0」（= 80 − 20 旧快照）。注意不能直接断言整页不含 '60.0'，
+    // 因为页头「干体重 60.0kg」也含这个子串 —— 必须定位到「上机前实际」这个标签后面。
+    expect(text).not.toMatch(/上机前实际\s*60\.0/)
+  })
+
+  it('已完成 / 已中止的记录：首页仍用记录里的快照（不受之后改档案影响）', async () => {
+    stubData({
+      patient: makePatient({ wheelchairWeight: 25 }),
+      dryWeights: dry,
+      sessions: [
+        makeSession({
+          id: 's1',
+          date: '2024-01-10',
+          preWeightMeasured: 80,
+          wheelchairWeightUsed: 20,
+          status: 'completed',
+        }),
+        makeSession({
+          id: 's2',
+          date: '2024-01-11',
+          preWeightMeasured: 80,
+          wheelchairWeightUsed: 20,
+          status: 'aborted',
+        }),
+      ],
+    })
+    const w = await mountHome()
+    await flushPromises()
+
+    const text = w.text()
+    // 两条都必须是 80 − 20 = 60.0（快照），不能变成 55.0
+    expect(text.match(/60\.0/g)?.length).toBeGreaterThanOrEqual(2)
+    expect(text).not.toContain('55.0')
+  })
+
   it('每条记录显示中文日期、状态标签、上机前实际体重与计划脱水', async () => {
     stubData({
       patient: makePatient(),

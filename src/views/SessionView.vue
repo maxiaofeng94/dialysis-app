@@ -354,7 +354,12 @@ async function mergeRemoteIfUntouched() {
     // ⚠️ 上面那次「用户动过没有」的检查是在 await **之前**做的 —— 等网络这段时间用户完全可能
     // 已经开始输入，回来后无条件回填就会把他刚敲的数字顶掉（AGENTS 明确禁止）。
     // 所以合并前再确认一次。
+    //
+    // ⚠️ `patient.value = p` 也放在这次复查**之后**：它虽然不碰表单，但会改变页面上
+    // 「上机前实际 / 计划脱水」等派生数字 —— 用户正在输入时数字突然跳变同样是惊吓。
+    // 上面先判 `if (!s) return` 与版本号，再复查一次，最后才落值。
     if (stateSnapshot() !== knownSnapshot) return
+    if (p) patient.value = p
     session.value = s
     applySessionToForm(s)
     markStateKnown()
@@ -543,10 +548,14 @@ async function persistStatus(status: DialysisSession['status'], tip: string) {
     // 的这一刻要把当前档案值固化进快照 —— 那之后 resolveEffectiveConfig 就改走快照，
     // 历史数字从此固定（给医生看过的报告不会再变）。
     //
-    // ⚠️ `prev.status === 'ongoing'` 这个前置判断不能省：
-    // 已完成/已中止 → 中止 是一次**编辑**（改中止原因），不是状态转换。
-    // 无条件固化会让 2 个月前中止的那次透析（当时轮椅 13.4kg）被今天的档案值改写，
-    // 上机前实际从 66.6 变 65.0 —— 直接违反「历史报告数字不可变」。
+    // ⚠️ `prev.status === 'ongoing'` 这个前置判断是**纵深防御**，目前恒为真：
+    // `persistStatus` 的三个调用点都是「进行中 → 完成」或「X → 进行中」，
+    // 而后一条走的是上面 `status === 'ongoing'` 的分支，进不到这里。
+    // 真正的「已完成/已中止 → 中止」路径是 `confirmAbort`（那里有自己的同名校验，
+    // 且**可以**从非 ongoing 状态进入，必须保留）。
+    // 这里仍然写着判断，是为了防止将来新增调用点（例如给已完成的记录补录信息）时
+    // 悄悄把今天的档案值写进 2 个月前那次透析的冻结快照 ——
+    // 那会让上机前实际从 66.6 变成 65.0，直接违反「历史报告数字不可变」。
     snapshotConfigInto(s, patient.value)
   }
   s.status = status

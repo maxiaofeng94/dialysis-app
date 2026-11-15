@@ -47,12 +47,25 @@ vi.mock('../../src/repo', () => ({
 
 vi.mock('../../src/stores/patient', () => ({ currentPatientId: { value: 'patient-default' } }))
 
-/** 把图表 option 打印出来，便于对系列数据做断言 */
+/**
+ * 把图表 option 打印出来，便于对系列数据做断言。
+ *
+ * ⚠️ 同时把**原始 option 对象**（含函数属性）存进 `capturedOptions`：
+ * `JSON.stringify` 会把 `formatter` / `valueFormatter` 这类函数直接丢掉，
+ * 于是「tooltip 里心率单位是不是 bpm」这种运行时行为**无法**用序列化后的文本断言 ——
+ * 之前的用例就退化成对源码做正则（断言「代码里写了 seriesName === '心率'」），
+ * 属于假绿：`valueFormatter` 的第二个参数其实是 dataIndex（数字），运行时永远输出 mmHg。
+ */
+const capturedOptions: any[] = []
+
 const BaseChartStub = defineComponent({
   name: 'BaseChart',
   props: { option: { type: Object, required: true } },
   setup(props) {
-    return () => h('pre', { class: 'chart-option' }, JSON.stringify(props.option))
+    return () => {
+      capturedOptions.push(props.option)
+      return h('pre', { class: 'chart-option' }, JSON.stringify(props.option))
+    }
   },
 })
 
@@ -123,6 +136,7 @@ beforeEach(() => {
   for (const fn of Object.values(repository) as unknown as ReturnType<typeof vi.fn>[]) {
     fn.mockReset()
   }
+  capturedOptions.length = 0 // 跨用例累积会让「取最后一次」取到别人的 option
 })
 
 afterEach(() => {
@@ -500,6 +514,45 @@ describe('TrendView · 血压图心率副轴（需求③）', () => {
     expect(opt.yAxis[1].splitLine ?? { show: false }).toEqual({ show: false })
   })
 
+  /**
+   * M-1（独立评审）：双轴 tooltip 的单位必须**按 series 分别**输出。
+   *
+   * 原实现用 `valueFormatter: (v, params) => params?.seriesName === '心率' ? 'bpm' : 'mmHg'`，
+   * 但 ECharts 的签名是 `valueFormatter(value, dataIndex: number)` —— 第二个参数是**数字下标**，
+   * `params.seriesName` 恒 undefined → 心率被标成「76 mmHg」。护士把心率当血压读，量纲错误。
+   *
+   * 为什么原用例抓不住：`BaseChartStub` 用 `JSON.stringify` 序列化 option，函数属性被丢弃，
+   * 断言只能退化成对源码做正则。这条用例直接调用 `option.tooltip.formatter`，断言**运行时输出**。
+   */
+  it('双轴 tooltip：心率按 bpm、血压按 mmHg（直接调用 formatter 断言运行时输出）', async () => {
+    const w = await mountTrend({
+      sessions: [sess],
+      bpsBySession: { s1: [makeBp({ id: 'bp1', sessionId: 's1', systolic: 130, diastolic: 80, pulse: 76 })] },
+    })
+
+    await switchTab(w, '血压')
+    // 取最后一次渲染的血压图 option（含真实函数属性）
+    const opt = capturedOptions
+      .filter((o) => o?.series?.some((s: { name: string }) => s.name === '心率'))
+      .pop()
+    expect(opt).toBeTruthy()
+    expect(typeof opt.tooltip.formatter).toBe('function')
+
+    // 模拟 ECharts 在某个 x 点上给到的 params 数组（每项带 seriesName / value / marker）
+    const out = opt.tooltip.formatter([
+      { seriesName: '高压', value: 130, marker: '', axisValueLabel: '01-05 08:00' },
+      { seriesName: '低压', value: 80, marker: '', axisValueLabel: '01-05 08:00' },
+      { seriesName: '心率', value: 76, marker: '', axisValueLabel: '01-05 08:00' },
+    ]) as string
+
+    expect(out).toContain('130 mmHg')
+    expect(out).toContain('80 mmHg')
+    expect(out).toContain('76 bpm') // 关键：心率必须是 bpm，不能是 mmHg
+    expect(out).not.toContain('76 mmHg')
+    expect(out).toContain('01-05 08:00') // 时间标题
+    void w
+  })
+
   it('没有心率（历史数据）：只画两条线，yAxis 保持单轴（不能多出一根空轴）', async () => {
     const w = await mountTrend({
       sessions: [sess],
@@ -536,13 +589,22 @@ describe('TrendView · 血压图心率副轴（需求③）', () => {
     expect(pulseSeries.data).toEqual([76, null, 82])
   })
 
-  it('双轴时 tooltip 按系列名分别加单位（mmHg / bpm 不能混成一种）', async () => {
-    // ⚠️ 这里只能做**源码级断言**：BaseChartStub 用 JSON.stringify 把 option 打进 DOM，
-    // 函数类型的 valueFormatter 序列化时会整个丢掉，拿不到它的返回值。
-    // （报告页那组用例能拿到组件实例，所以只在那边测具体拼接结果。）
-    const src = stripComments(readFileSync(resolve(process.cwd(), 'src/views/TrendView.vue'), 'utf8'))
-    expect(src).toMatch(/valueFormatter/)
-    expect(src).toMatch(/seriesName === '心率'/)
-    expect(src).toMatch(/bpm/)
+  /**
+   * ⚠️ 这条用例原本是**源码正则断言**（`expect(src).toMatch(/seriesName === '心率'/)`），
+   * 属于典型假绿：它只证明「代码里写了这两个字符串」，不证明运行时真的输出 bpm ——
+   * 而实际实现用的是 `valueFormatter`（第二参是 dataIndex，拿不到 seriesName），
+   * 心率一直显示成「76 mmHg」，用例照样绿。
+   *
+   * 现在改成上面的**运行时用例**（直接调用 `option.tooltip.formatter` 断言输出），
+   * 逻辑也抽到了 `src/utils/chartTooltip.ts` 供趋势页 / 报告页共用。
+   * 这里只留一条轻量护栏：两页都必须用共用的 `dualAxisTooltip`，别再各写一份走散。
+   */
+  it('趋势页与报告页共用同一个双轴 tooltip 实现（防止两处各写一份走散）', () => {
+    for (const file of ['src/views/TrendView.vue', 'src/views/ReportView.vue']) {
+      const src = stripComments(readFileSync(resolve(process.cwd(), file), 'utf8'))
+      expect(src, `${file} 必须用共用的 dualAxisTooltip`).toMatch(/dualAxisTooltip/)
+      // 不许再自己拼 bpm / mmHg 的单位判断
+      expect(src, `${file} 不应重复实现双轴单位判断`).not.toMatch(/seriesName === '心率'/)
+    }
   })
 })

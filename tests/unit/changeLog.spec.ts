@@ -192,13 +192,26 @@ describe('SettingsView 的留痕纪律（源码级守卫）', () => {
     expect(settingsSrc).toMatch(/cacheDelete\(\s*`patientChangeLogs:\$\{/)
   })
 
-  it('日志的 patientId / changedAt / operator 都来自当前上下文，不硬编码', () => {
+  it('日志的 patientId 来自**显式参数**（不能用全局 currentPatientId），其余来自当前上下文', () => {
     const start = settingsSrc.indexOf('async function appendWheelchairLog')
     const body = settingsSrc.slice(start, settingsSrc.indexOf('\n}', start))
-    expect(body).toMatch(/patientId:\s*currentPatientId\.value/)
+    // ⚠️ 关键：patientId 必须由调用方传入，不能在这里读 `currentPatientId.value`。
+    // 这个函数在 `await savePatient(...)` 之后才被调用 —— 等待期间用户切病人是可能的，
+    // 读全局就会把 A 的变更记录写到 B 名下（独立评审 S-1，已用用例坐实）。
+    expect(body).toMatch(/patientId[,\s]*\n/) // 简写属性 `patientId,`（来自参数）
+    expect(body).not.toMatch(/patientId:\s*currentPatientId\.value/)
+    // 缓存 key 也要用归属病人的 id，不能读全局
+    expect(body).toMatch(/cacheDelete\(\s*`patientChangeLogs:\$\{patientId\}`/)
     expect(body).toMatch(/field:\s*'wheelchairWeight'/)
     expect(body).toMatch(/changedAt:\s*Date\.now\(\)/)
     expect(body).toMatch(/operator:/)
+  })
+
+  it('调用 appendWheelchairLog 时传入**发起保存时捕获**的病人 id（p.id），不是此刻的全局值', () => {
+    // 同理：`p.id` 是在 await 之前取的，用它才不会串号
+    expect(settingsSrc).toMatch(/appendWheelchairLog\([^)]*,\s*p\.id\s*\)/)
+    // 待补队列的条目也要带 p.id
+    expect(settingsSrc).toMatch(/patientId:\s*p\.id/)
   })
 })
 

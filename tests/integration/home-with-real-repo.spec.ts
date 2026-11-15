@@ -193,8 +193,11 @@ describe('首页 × 真实本地仓储 · 记录列表', () => {
 
     rows.forEach((row, i) => {
       const session = listed[i]
-      // 与 HomeView 一样：历史记录按记录自己的日期取当时生效的干体重
-      const computed = computeSession(session, getEffectiveDryWeight(dryWeights, session.date))
+      // 与 HomeView 一样：历史记录按记录自己的日期取当时生效的干体重；
+      // ⚠️ 必须传 PATIENT —— 进行中的记录按**当前档案**的轮椅及衣物重量实时计算（需求①），
+      // 不传就退化成按快照算。这条用例原本漏传，等于把 bug 复刻进了期望值里
+      // （独立评审 S-1：把所有 `computeSession(s, dry)` 改回不带 patient，用例照样绿）。
+      const computed = computeSession(session, getEffectiveDryWeight(dryWeights, session.date), PATIENT)
       expect(row.text()).toContain(`上机前实际 ${fmt(computed.preWeightActual)} kg`)
       expect(row.text()).toContain(`计划脱水 ${fmt(computed.planUf)} L`)
     })
@@ -266,7 +269,8 @@ describe('首页 × 真实本地仓储 · 快速创建真的写库', () => {
     // 最新那条就是刚创建的：81 - 20 = 61，61 - 60 = 1
     const dryWeights = await localRepository.listDryWeights(PATIENT.id)
     const [newest] = await localRepository.listSessions(PATIENT.id)
-    const computed = computeSession(newest, getEffectiveDryWeight(dryWeights, newest.date))
+    // 进行中的记录要按当前档案算（传 PATIENT），漏传就会把「不跟随档案」这个 bug 复刻进期望值
+    const computed = computeSession(newest, getEffectiveDryWeight(dryWeights, newest.date), PATIENT)
     expect(rows[0].text()).toContain(`上机前实际 ${fmt(computed.preWeightActual)} kg`)
     expect(rows[0].text()).toContain('进行中')
   })
@@ -290,6 +294,7 @@ describe('首页 × 真实本地仓储 · 快速创建真的写库', () => {
         rinseBackVolumeUsed: PATIENT.rinseBackVolume,
       }),
       dryToday,
+      PATIENT, // 进行中的记录按当前档案算，和 HomeView 的调用保持一致
     )
 
     const preview = w.findAll('.stat-value').map((n) => n.text())
@@ -339,7 +344,11 @@ describe('首页 × 真实本地仓储 · 计算口径与仓储一致', () => {
     // 4 月那条记录：4/10 时 60kg 已生效（4/1 起），未来那条 59 不参与
     const april = listed.find((s) => s.id === APRIL_SESSION.id) as DialysisSession
     expect(getEffectiveDryWeight(dryWeights, april.date)).toBe(60)
-    expect(computeSession(april, 60).planUf).toBe(computeSession(april, getEffectiveDryWeight(dryWeights, april.date)).planUf)
+    // 已完成/已中止的记录走快照，传不传 PATIENT 结果相同 —— 但仍显式传，
+    // 保持与 HomeView 的调用形态一致（避免将来改成 ongoing 数据时这条用例变假绿）
+    expect(computeSession(april, 60, PATIENT).planUf).toBe(
+      computeSession(april, getEffectiveDryWeight(dryWeights, april.date), PATIENT).planUf,
+    )
   })
 
   it('病人档案改动后新建的记录用新快照，老记录仍是老数值（历史不被改写）', async () => {
@@ -359,11 +368,15 @@ describe('首页 × 真实本地仓储 · 计算口径与仓储一致', () => {
     const newest = listed[0]
     expect(newest.wheelchairWeightUsed).toBe(25)
     expect(newest.rinseBackVolumeUsed).toBe(400)
-    expect(computeSession(newest, 60).preWeightActual).toBe(55) // 80 - 25
+    // 这条是 **ongoing**：按需求①它实时跟随**当前档案**（此时库里已是 25kg），
+    // 所以这里必须传改过之后的档案。传 PATIENT（20kg）会算出 60 —— 那是旧快照的算法，
+    // 正是「进行中不跟随档案」这个 bug 的行为。
+    const updatedPatient = (await localRepository.getPatient(PATIENT.id))!
+    expect(computeSession(newest, 60, updatedPatient).preWeightActual).toBe(55) // 80 - 25
 
-    // 老记录（5 月那条）仍按当时的 20kg 快照计算
+    // 老记录（5 月那条，已完成）仍按当时的 20kg 快照计算，不受档案改动影响
     const may = listed.find((s) => s.id === MAY_SESSION.id) as DialysisSession
     expect(may.wheelchairWeightUsed).toBe(20)
-    expect(computeSession(may, 60).preWeightActual).toBe(59.5)
+    expect(computeSession(may, 60, updatedPatient).preWeightActual).toBe(59.5)
   })
 })

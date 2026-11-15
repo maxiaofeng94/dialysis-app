@@ -423,14 +423,16 @@ async function savePatient(opts: { override?: boolean } = {}) {
     if (wheelchairChanged) {
       // 先补上次没记上的（顺序才不会乱：老变更在前、新变更在后）
       await flushPendingWheelchairLog()
-      const logged = await appendWheelchairLog(prevWheelchair, wheelchairWeight)
+      // ⚠️ 用**发起保存时**捕获的 pid（`p.id`），不要在这里读 `currentPatientId.value`：
+      // 上面 `await savePatient(...)` 期间用户可能已经切病人了（S-1）。
+      const logged = await appendWheelchairLog(prevWheelchair, wheelchairWeight, p.id)
       if (!logged) {
-        // 带上归属：切到别的病人后保存时不能把这条记到别人名下（见 pendingWheelchairLog 注释）
-        pendingWheelchairLog = {
-          patientId: currentPatientId.value,
+        // 进队列（不是单槽覆盖）：连续两次失败时两条都要留着，且带上归属
+        pushPendingWheelchairLog({
+          patientId: p.id,
           oldValue: prevWheelchair,
           newValue: wheelchairWeight,
-        }
+        })
       }
       showToast(logged ? '已保存' : '已保存，但变更记录未能写入（下次保存时会自动补记）')
     } else {
@@ -469,10 +471,27 @@ async function savePatient(opts: { override?: boolean } = {}) {
  *   把整次保存判成失败、让用户重试 —— 那会让他以为档案没存上，反复点击）。
  *   调用方据返回值给不同的提示。
  */
-async function appendWheelchairLog(oldValue: number, newValue: number): Promise<boolean> {
+/**
+ * 追加一条「轮椅及衣物重量」变更记录。
+ *
+ * ⚠️ `patientId` **必须由调用方显式传入**（发起保存时捕获的值），不能在这里读
+ * `currentPatientId.value` —— 这个函数在 `await savePatient(...)` 之后才被调用，
+ * 等待期间用户切病人是可能的（病人列表行没有 disabled 保护），此时读到的已经是新病人。
+ * 后果：档案写对了人、变更记录写到别人名下 —— A 的历史永久缺一条真实改动，
+ * B 的历史凭空多一条从未发生的改动，整份历史的可信度归零。
+ *
+ * @returns 是否写入成功。失败时**不抛错**（档案已经保存成功了，不能因为日志失败就
+ *   把整次保存判成失败、让用户重试 —— 那会让他以为档案没存上，反复点击）。
+ *   调用方据返回值给不同的提示。
+ */
+async function appendWheelchairLog(
+  oldValue: number,
+  newValue: number,
+  patientId: string,
+): Promise<boolean> {
   const log: PatientChangeLog = {
     id: uuid(),
-    patientId: currentPatientId.value,
+    patientId,
     field: 'wheelchairWeight',
     oldValue,
     newValue,
@@ -483,8 +502,9 @@ async function appendWheelchairLog(oldValue: number, newValue: number): Promise<
   }
   try {
     await repository.addPatientChangeLog(log)
-    // 写完让「变更历史」弹窗读到新数据：它是缓存优先的，不清就是旧列表
-    await cacheDelete(`patientChangeLogs:${currentPatientId.value}`)
+    // 写完让「变更历史」弹窗读到新数据：它是缓存优先的，不清就是旧列表。
+    // key 用**归属病人**的 id（同上，不能读 currentPatientId）
+    await cacheDelete(`patientChangeLogs:${patientId}`)
     return true
   } catch (err) {
     console.error(err)
@@ -493,40 +513,94 @@ async function appendWheelchairLog(oldValue: number, newValue: number): Promise<
 }
 
 /**
- * 待补写的变更记录（评审 M2）。
+ * 待补写的变更记录（评审 M2 / M-2）。
  *
- * 问题：`savePatient` 里 `patient.value = p` 在 `appendWheelchairLog` **之前**执行。
+ * 问题一：`savePatient` 里 `patient.value = p` 在 `appendWheelchairLog` **之前**执行。
  * 日志写失败后，`patient.value` 已经是新值 —— 用户再点一次保存时 `wheelchairChanged`
- * 为 false，**永远不会补写这条日志**。断网时改一次重量，这次变更就在历史里永久缺失，
- * 而该功能的价值恰恰是「让用户信得过这份历史」。提示文案只说「请检查网络」，
- * 用户检查完网络也不知道该做什么。
+ * 为 false，**永远不会补写这条日志**。断网时改一次重量，这次变更就在历史里永久缺失。
  *
- * 修法：写失败就把「没记上的那次变更」暂存下来，**下一次保存时自动补写**；
- * 补写成功后清空。这样用户只要再点一次保存（或再改一次）就补回来了。
+ * 问题二（独立评审 M-2）：**这个变量不是模块级的**。`<script setup>` 里的 `let`
+ * 编译后落在 `setup()` 函数体内，是**组件实例级**变量 —— 而 `/settings` 没有
+ * `keep-alive`（`App.vue` 是裸 `<router-view>`），离开页面即卸载、变量随之销毁。
+ * 于是「提示说下次保存会补记 → 用户去别的页面看了看再回来 → 提示已保存 → 历史里仍然没有」
+ * 这条路径会让用户被明确告知会补记却永远补不上。
  *
- * ⚠️ **必须带 `patientId`**：这个变量是模块级的，而用户会在同一台手机上照护多位病人。
- * 不带归属的话，A 的待补项会在 B 的设置页保存时被补写 —— `appendWheelchairLog` 用的是
- * `currentPatientId.value`，于是 A 的变更被记到 B 名下：B 的历史里凭空多出一条从未发生
- * 过的改动，A 的那条永久缺失。两边都错，且这份历史的可信度直接归零。
+ * 问题三：单槽会覆盖。连续两次「改重量 + 日志失败」时，后一条把前一条整个顶掉。
+ *
+ * 修法：
+ * 1. **持久化到 localStorage**，跨页面卸载存活；
+ * 2. 用**数组**，多条待补项各自保留、按发生顺序补写；
+ * 3. 每条带 `patientId`，只在**属于当前病人**时补写，不串号。
+ *
+ * 已知边界：待补项只存本机。换手机/清数据会丢 —— 这类「日志没记上」的补偿本来
+ * 就是尽力而为，且失败时已经明确告知用户；真要强一致得让服务端在写档案时事务内写日志。
  */
-let pendingWheelchairLog: { patientId: string; oldValue: number; newValue: number } | null = null
+const PENDING_LOG_KEY = 'dialysis-pending-wheelchair-logs'
+
+interface PendingWheelchairLog {
+  patientId: string
+  oldValue: number
+  newValue: number
+}
+
+function readPendingWheelchairLogs(): PendingWheelchairLog[] {
+  try {
+    const raw = localStorage.getItem(PENDING_LOG_KEY)
+    if (!raw) return []
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    // 逐条校验：宁可丢一条坏数据，也不能让整个补写流程抛错
+    return parsed.filter(
+      (x): x is PendingWheelchairLog =>
+        !!x &&
+        typeof x === 'object' &&
+        typeof (x as PendingWheelchairLog).patientId === 'string' &&
+        Number.isFinite((x as PendingWheelchairLog).oldValue) &&
+        Number.isFinite((x as PendingWheelchairLog).newValue),
+    )
+  } catch {
+    return []
+  }
+}
+
+function writePendingWheelchairLogs(items: PendingWheelchairLog[]): void {
+  try {
+    if (items.length === 0) localStorage.removeItem(PENDING_LOG_KEY)
+    else localStorage.setItem(PENDING_LOG_KEY, JSON.stringify(items))
+  } catch {
+    // 隐私模式/配额满：存不下就只能当次会话内有效，不阻断保存流程
+  }
+}
+
+/** 记一条待补项（失败时调用） */
+function pushPendingWheelchairLog(item: PendingWheelchairLog): void {
+  const items = readPendingWheelchairLogs()
+  items.push(item)
+  writePendingWheelchairLogs(items)
+}
 
 /**
- * 补写上次没记上的变更（如果有）。返回 true 表示没有待补项或补写成功。
+ * 补写所有**属于当前病人**的待补项（按发生顺序）。返回 true 表示没有待补项或全部补写成功。
  *
- * 只在**待补项属于当前病人**时才补：否则保留待补项不动，等用户切回原病人再补。
- * 这样既不会串到别的病人，也不会把这条变更丢掉。
+ * 别的病人的待补项原样保留（等用户切回去再补），不报错、不提示 —— 用户没做错什么。
  */
 async function flushPendingWheelchairLog(): Promise<boolean> {
-  const pending = pendingWheelchairLog
-  if (!pending) return true
-  if (pending.patientId !== currentPatientId.value) {
-    // 不是当前病人的待补项 —— 保留着，等切回去再补。不报错、不提示（用户没做错什么）
-    return true
+  const all = readPendingWheelchairLogs()
+  if (all.length === 0) return true
+  const mine = all.filter((x) => x.patientId === currentPatientId.value)
+  if (mine.length === 0) return true
+
+  const remaining: PendingWheelchairLog[] = all.filter((x) => x.patientId !== currentPatientId.value)
+  let allOk = true
+  for (const item of mine) {
+    const ok = await appendWheelchairLog(item.oldValue, item.newValue, item.patientId)
+    if (ok) continue
+    // 这一条没补上：把它放回队列，后续的也别试了（网络多半还没恢复）
+    allOk = false
+    remaining.push(item)
   }
-  const ok = await appendWheelchairLog(pending.oldValue, pending.newValue)
-  if (ok) pendingWheelchairLog = null
-  return ok
+  writePendingWheelchairLogs(remaining)
+  return allOk
 }
 
 // ---------- 轮椅及衣物重量变更历史（需求②） ----------

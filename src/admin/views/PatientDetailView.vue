@@ -67,8 +67,12 @@ async function savePatient() {
     )
     return
   }
-  if (!Number.isFinite(rinse) || rinse < 0 || rinse > 5000) {
-    ElMessage.error('回水量应在 0~5000 ml 之间')
+  // ⚠️ 上限必须与**后端**（`admin-api/index.ts` 的 `> 2000` 拦截）和 **App 端**
+  // （`SettingsView.vue` 的 `RINSE_BACK_MAX = 2000`）保持一致。
+  // 曾写成 5000：管理员填 3000 时前端放行、后端返回 400，用户只看到「保存失败」
+  // 而表单没有标红，根本不知道是哪一项超了。
+  if (!Number.isFinite(rinse) || rinse < 0 || rinse > 2000) {
+    ElMessage.error('回水量应在 0~2000 ml 之间')
     return
   }
   busy.value = true

@@ -6,6 +6,7 @@ import { cacheVersion } from '../lib/cloudCache'
 import { useSessionExpiryRedirect } from '../lib/sessionExpiry'
 import { formatTime } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
+import { dualAxisTooltip, withUnit } from '../utils/chartTooltip'
 import BaseChart from '../components/BaseChart.vue'
 import type { DryWeight, DialysisSession, Patient } from '../types'
 
@@ -140,11 +141,6 @@ function autoValueAxis(
   return axis
 }
 
-/** tooltip 里的数值统一带上单位 */
-function withUnit(unit: string) {
-  return (v: unknown) => (typeof v === 'number' ? `${v} ${unit}` : '—')
-}
-
 const weightOption = computed(() => {
   const recent = [...sessions.value].sort((a, b) => a.date.localeCompare(b.date)).slice(-30)
   const dates = recent.map((s) => s.date.slice(5))
@@ -175,11 +171,7 @@ const bpOption = computed(() => {
   return {
     // 双轴时两根轴的量纲不同（mmHg / bpm），不能统一用 withUnit —— 按 series 名分别加单位
     tooltip: dual
-      ? {
-          trigger: 'axis',
-          valueFormatter: (v: unknown, params?: { seriesName?: string }) =>
-            typeof v === 'number' ? `${v} ${params?.seriesName === '心率' ? 'bpm' : 'mmHg'}` : '—',
-        }
+      ? { trigger: 'axis', formatter: dualAxisTooltip }
       : { trigger: 'axis', valueFormatter: withUnit('mmHg') },
     legend: {
       top: 0,

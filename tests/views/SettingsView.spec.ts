@@ -1559,4 +1559,112 @@ describe('SettingsView · 轮椅及衣物重量变更记录（运行时行为）
     expect(text).toContain('张三')
     expect(text).toContain('未记录')
   })
+
+  /**
+   * M-2（独立评审）：待补项原来是**单槽 + 组件实例级变量**，两个后果：
+   * ① 连续两次失败时后一条把前一条顶掉；② 离开 `/settings` 即卸载，变量销毁 → 再也补不上。
+   *
+   * 修法：改成持久化到 localStorage 的**数组队列**。下面两条分别钉住这两点。
+   */
+  it('连续两次「改重量 + 日志写失败」：两条待补项都要保留，网络恢复后按顺序全部补写', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.4 }) })
+
+    // 前三次写日志都失败（第一次 append、第二次保存前的 flush、第二次 append），
+    // 之后成功。**只记录成功的写入** —— 失败调用也留在 mock.calls 里，
+    // 用 `toContain` 断言调用过等于自欺（失败的那次也叫「调用过」）。
+    const written: string[] = []
+    let attempts = 0
+    vi.mocked(repository.addPatientChangeLog).mockImplementation(async (log) => {
+      attempts += 1
+      if (attempts <= 3) throw new Error('offline')
+      written.push(`${log.oldValue}->${log.newValue}`)
+      return undefined as never
+    })
+
+    // 第一次：13.4 → 13.5（失败）
+    await fieldInput(w, '轮椅及衣物重量').setValue('13.5')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 第二次：13.5 → 13.6（又失败）
+    await fieldInput(w, '轮椅及衣物重量').setValue('13.6')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 第三次保存（网络恢复）→ 两条待补项都要补上
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 关键：两条都必须**成功写入**，且老的在前
+    expect(written).toEqual(['13.4->13.5', '13.5->13.6'])
+    // 补完队列必须清空
+    expect(localStorage.getItem('dialysis-pending-wheelchair-logs')).toBeNull()
+  })
+
+  it('写失败后离开设置页再回来（组件重新挂载）：待补项仍在，保存时能补写', async () => {
+    currentPatientIdRef.value = 'patient-default'
+    const w1 = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.4 }) })
+    vi.mocked(repository.addPatientChangeLog).mockRejectedValueOnce(new Error('offline'))
+
+    await fieldInput(w1, '轮椅及衣物重量').setValue('13.5')
+    await buttonByText(w1, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 卸载（= 用户离开 /settings 去了别的页面）
+    w1.unmount()
+
+    // 重新挂载（= 用户回来），网络已恢复
+    vi.mocked(repository.addPatientChangeLog).mockClear()
+    const w2 = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.5 }) })
+    // 不改任何字段，直接保存 → 应触发补写
+    await buttonByText(w2, '保存档案').trigger('click')
+    await flushPromises()
+
+    const written = vi
+      .mocked(repository.addPatientChangeLog)
+      .mock.calls.map((c) => `${c[0].oldValue}->${c[0].newValue}`)
+    expect(written).toContain('13.4->13.5')
+  })
+
+  /**
+   * S-1（独立评审）：`appendWheelchairLog` 在 `await savePatient(...)` **之后**才读
+   * `currentPatientId.value` —— 保存期间切病人，档案写对了人、变更记录却写到别人名下。
+   *
+   * 触发路径真实存在：设置页的病人列表行 `@click="switchPatient(...)"` 没有 disabled 保护，
+   * `switchPatient` 也不检查 `savingPatient`；弱网下 `savePatient` 是秒级等待，
+   * 护工等不及去点另一个病人完全现实。
+   *
+   * 后果：A 的历史永久缺一条真实改动，B 的历史凭空多一条从未发生的改动。
+   */
+  it('保存档案在途时切病人：变更记录仍归原病人，不能写到新病人名下', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', wheelchairWeight: 13.4 }) })
+
+    // 让 savePatient 挂住，模拟弱网下的秒级等待
+    let releaseSave!: () => void
+    vi.mocked(repository.savePatient).mockImplementationOnce(
+      () => new Promise((resolve) => {
+        releaseSave = () => resolve('2026-01-01T00:00:00.000000+00:00')
+      }),
+    )
+
+    await fieldInput(w, '轮椅及衣物重量').setValue('13.5')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 保存还在途中 —— 用户切到 B 病人
+    currentPatientIdRef.value = 'patient-b'
+    await w.vm.$nextTick()
+    await flushPromises()
+
+    // 放行保存
+    releaseSave()
+    await flushPromises()
+
+    // 变更记录必须归属 A（发起保存时的那位），不能是 B
+    expect(repository.addPatientChangeLog).toHaveBeenCalledTimes(1)
+    const log = vi.mocked(repository.addPatientChangeLog).mock.calls[0][0]
+    expect(log.patientId).toBe('patient-a')
+    expect(log).toMatchObject({ oldValue: 13.4, newValue: 13.5 })
+  })
 })
