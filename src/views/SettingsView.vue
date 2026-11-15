@@ -20,10 +20,10 @@ import {
 } from '../stores/patient'
 import { listMyPatients, createPatient, getMyProfile, updateMyName } from '../lib/cloudAdmin'
 import { migrateLocalToCloud } from '../lib/migrate'
-import { todayStr, parseNum, fmt, formatDateCN, calcAge } from '../utils/format'
+import { todayStr, parseNum, fmt, formatDateCN, calcAge, formatDateTimeCN } from '../utils/format'
 import { getEffectiveDryWeight } from '../utils/calc'
 import { uuid } from '../utils/id'
-import type { Patient, DryWeight } from '../types'
+import type { Patient, DryWeight, PatientChangeLog } from '../types'
 
 const patient = ref<Patient | null>(null)
 const dryWeights = ref<DryWeight[]>([])
@@ -207,7 +207,7 @@ async function onCreatePatient() {
   const wheelchairWeight = parseNum(newPatientForm.wheelchairWeight) ?? 0
   const rinseBackVolume = parseNum(newPatientForm.rinseBackVolume) ?? DEFAULT_RINSE_BACK_ML
   const bad =
-    rangeError('轮椅重量', wheelchairWeight, 0, WHEELCHAIR_MAX) ??
+    rangeError('轮椅及衣物重量', wheelchairWeight, 0, WHEELCHAIR_MAX) ??
     rangeError('回水量', rinseBackVolume, 0, RINSE_BACK_MAX)
   if (bad) {
     showToast(bad)
@@ -382,12 +382,16 @@ async function savePatient(opts: { override?: boolean } = {}) {
   const wheelchairWeight = parseNum(form.wheelchairWeight) ?? 0
   const rinseBackVolume = parseNum(form.rinseBackVolume) ?? DEFAULT_RINSE_BACK_ML
   const bad =
-    rangeError('轮椅重量', wheelchairWeight, 0, WHEELCHAIR_MAX) ??
+    rangeError('轮椅及衣物重量', wheelchairWeight, 0, WHEELCHAIR_MAX) ??
     rangeError('回水量', rinseBackVolume, 0, RINSE_BACK_MAX)
   if (bad) {
     showToast(`${bad}（未保存）`)
     return
   }
+
+  // 变更记录要用「保存前的档案值」做 oldValue，必须在覆盖 patient.value 之前取
+  const prevWheelchair = patient.value?.wheelchairWeight ?? 0
+  const wheelchairChanged = Math.abs(prevWheelchair - wheelchairWeight) > 1e-9
 
   const now = Date.now()
   const p: Patient = {
@@ -409,7 +413,24 @@ async function savePatient(opts: { override?: boolean } = {}) {
     }
     patient.value = p
     formSnapshot = snapshotForm() // 保存后表单就是「服务端值」，后续 load 可正常回填
-    showToast('已保存')
+    // 需求②：轮椅及衣物重量的变更留痕。
+    // - 必须在档案保存**成功之后**写，否则会出现「日志说改了、实际没改」；
+    // - 写失败**不影响**档案保存的结果（档案已经进库了），但必须明确告诉用户日志没记上 ——
+    //   静默失败会让这份「变更记录」失去可信度，而它存在的意义就是让用户信得过。
+    // - 评审 M2：写失败要把这次变更**暂存**下来，下次保存时自动补写。
+    //   否则 `patient.value` 已被覆盖成新值，用户再点保存时 `wheelchairChanged` 为 false，
+    //   这条变更就永久缺失了（而提示只说「请检查网络」，用户不知道该做什么）。
+    if (wheelchairChanged) {
+      // 先补上次没记上的（顺序才不会乱：老变更在前、新变更在后）
+      await flushPendingWheelchairLog()
+      const logged = await appendWheelchairLog(prevWheelchair, wheelchairWeight)
+      if (!logged) pendingWheelchairLog = { oldValue: prevWheelchair, newValue: wheelchairWeight }
+      showToast(logged ? '已保存' : '已保存，但变更记录未能写入（下次保存时会自动补记）')
+    } else {
+      // 本次没改重量，但可能有上次没记上的变更 → 顺手补写
+      const flushed = await flushPendingWheelchairLog()
+      showToast(flushed ? '已保存' : '已保存，但变更记录仍未能写入（下次保存时会自动补记）')
+    }
   } catch (err) {
     console.error(err)
     if (isConflictError(err)) {
@@ -432,6 +453,89 @@ async function savePatient(opts: { override?: boolean } = {}) {
   } finally {
     savingPatient.value = false
   }
+}
+
+/**
+ * 追加一条「轮椅及衣物重量」变更记录。
+ *
+ * @returns 是否写入成功。失败时**不抛错**（档案已经保存成功了，不能因为日志失败就
+ *   把整次保存判成失败、让用户重试 —— 那会让他以为档案没存上，反复点击）。
+ *   调用方据返回值给不同的提示。
+ */
+async function appendWheelchairLog(oldValue: number, newValue: number): Promise<boolean> {
+  const log: PatientChangeLog = {
+    id: uuid(),
+    patientId: currentPatientId.value,
+    field: 'wheelchairWeight',
+    oldValue,
+    newValue,
+    // 变更人显示名：优先用本页已加载的「我的姓名」，没填就退回手机号；
+    // 云端记录里 operator_id 由仓储填当前登录用户（RLS 强制 operator_id = auth.uid()）
+    operator: myName.value.trim() || myPhone.value || null,
+    changedAt: Date.now(),
+  }
+  try {
+    await repository.addPatientChangeLog(log)
+    // 写完让「变更历史」弹窗读到新数据：它是缓存优先的，不清就是旧列表
+    await cacheDelete(`patientChangeLogs:${currentPatientId.value}`)
+    return true
+  } catch (err) {
+    console.error(err)
+    return false
+  }
+}
+
+/**
+ * 待补写的变更记录（评审 M2）。
+ *
+ * 问题：`savePatient` 里 `patient.value = p` 在 `appendWheelchairLog` **之前**执行。
+ * 日志写失败后，`patient.value` 已经是新值 —— 用户再点一次保存时 `wheelchairChanged`
+ * 为 false，**永远不会补写这条日志**。断网时改一次重量，这次变更就在历史里永久缺失，
+ * 而该功能的价值恰恰是「让用户信得过这份历史」。提示文案只说「请检查网络」，
+ * 用户检查完网络也不知道该做什么。
+ *
+ * 修法：写失败就把「没记上的那次变更」暂存下来，**下一次保存时自动补写**；
+ * 补写成功后清空。这样用户只要再点一次保存（或再改一次）就补回来了。
+ */
+let pendingWheelchairLog: { oldValue: number; newValue: number } | null = null
+
+/** 补写上次没记上的变更（如果有）。返回 true 表示没有待补项或补写成功 */
+async function flushPendingWheelchairLog(): Promise<boolean> {
+  const pending = pendingWheelchairLog
+  if (!pending) return true
+  const ok = await appendWheelchairLog(pending.oldValue, pending.newValue)
+  if (ok) pendingWheelchairLog = null
+  return ok
+}
+
+// ---------- 轮椅及衣物重量变更历史（需求②） ----------
+
+const showChangeLog = ref(false)
+const changeLogs = ref<PatientChangeLog[]>([])
+const changeLogLoading = ref(false)
+const changeLogError = ref('')
+
+/** 打开变更历史：每次打开都强制读最新（`fresh`），否则刚改完看不到这一条 */
+async function openChangeLog() {
+  showChangeLog.value = true
+  changeLogLoading.value = true
+  changeLogError.value = ''
+  try {
+    const list = await repository.listPatientChangeLogs(currentPatientId.value, { fresh: true })
+    changeLogs.value = list
+  } catch (err) {
+    console.error(err)
+    // 读失败绝不能显示成「暂无变更记录」：那会让用户以为从没改过，反而更不信这份数据
+    changeLogError.value = '变更记录加载失败，请检查网络后重试'
+    changeLogs.value = []
+  } finally {
+    changeLogLoading.value = false
+  }
+}
+
+function changeLogText(log: PatientChangeLog): string {
+  const fmtVal = (v: number | null) => (v == null ? '—' : `${fmt(v)}kg`)
+  return `${fmtVal(log.oldValue)} → ${fmtVal(log.newValue)}`
 }
 
 /** 档案版本冲突：编辑期间别人也保存过 —— 让用户选「重新加载」还是「覆盖保存」 */
@@ -631,12 +735,14 @@ function showHelp() {
   showDialog({
     title: '使用说明',
     message:
-      '1. 先在「设置」建立病人档案（姓名、生日、轮椅重量、回水量），并添加当前干体重。\n' +
-      '2. 在「记录」页用「快速创建」填入上机前体重（含轮椅）快速建记录。\n' +
-      '3. 进入记录详情填写下机后体重、血压、血糖、不良反应。\n' +
+      '1. 先在「设置」建立病人档案（姓名、生日、轮椅及衣物重量、回水量），并添加当前干体重。\n' +
+      '2. 在「记录」页用「快速创建」填入上机前体重（含轮椅及衣物）快速建记录。\n' +
+      '3. 进入记录详情填写下机后体重、血压（含心率）、血糖、不良反应。\n' +
       '4. 完成后点「标记完成」；若因血管条件差等原因没做完，点「中止透析」记录中止时间与原因。\n' +
-      '5. 在报告页导出图片发给医生（报告会显示本次状态与中止原因）。\n' +
-      '6. 轮椅重量、回水量会快照到每次记录；干体重按日期取当时有效值。',
+      '5. 在报告页导出图片发给医生（报告会显示本次状态、中止原因与心率）。\n' +
+      '6. 进行中的记录按「当前档案」的轮椅及衣物重量 / 回水量实时计算：天气变冷加了衣服，' +
+      '改完档案立即生效，不用删记录重录；标记完成或中止时会固化成本次记录的值，历史数字不再变动。\n' +
+      '7. 轮椅及衣物重量的每次改动都会自动留痕，可点档案里的「变更历史」查看。',
   })
 }
 </script>
@@ -661,10 +767,21 @@ function showHelp() {
       <div class="card-title">病人档案</div>
       <van-field v-model="form.name" label="姓名" placeholder="请输入姓名" />
       <van-field v-model="form.birthday" label="生日" placeholder="用于计算年龄" type="date" />
-      <van-field v-model="form.wheelchairWeight" label="轮椅重量" placeholder="kg" type="number" />
+      <van-field
+        v-model="form.wheelchairWeight"
+        label="轮椅及衣物重量"
+        label-width="7em"
+        placeholder="kg"
+        type="number"
+      />
       <van-field v-model="form.rinseBackVolume" label="回水量" placeholder="ml" type="number" />
       <div v-if="patient?.birthday" class="muted" style="margin: 4px 16px">
         当前年龄约 {{ calcAgeStr(patient.birthday) }}
+      </div>
+      <!-- 需求②：让用户能自己查「轮椅及衣物重量是什么时候、被谁改成多少的」 -->
+      <div class="row" style="margin: 8px 16px 0">
+        <span class="muted" style="font-size: 12px">轮椅及衣物重量会随季节衣物变化，改动会自动留痕</span>
+        <van-button size="mini" type="primary" plain @click="openChangeLog">变更历史</van-button>
       </div>
       <div v-if="!canEditConfig" class="muted" style="margin: 4px 16px">
         仅创建者可修改病人配置（你当前是「{{ roleLabel(currentRole ?? '') }}」，修改不会被保存）
@@ -789,6 +906,40 @@ function showHelp() {
       <van-button block plain type="danger" style="margin-top: 10px" @click="onLogout">退出登录</van-button>
     </div>
 
+    <van-popup v-model:show="showChangeLog" round position="bottom" style="max-height: 75%">
+      <div style="padding: 20px">
+        <div class="card-title">轮椅及衣物重量变更记录</div>
+        <div v-if="changeLogLoading" style="padding: 16px 0">
+          <van-loading size="20" vertical>加载中…</van-loading>
+        </div>
+        <div v-else-if="changeLogError" class="muted" style="padding: 16px 0; text-align: center">
+          {{ changeLogError }}
+          <div style="margin-top: 10px">
+            <van-button size="small" type="primary" plain @click="openChangeLog">重试</van-button>
+          </div>
+        </div>
+        <div v-else-if="!changeLogs.length" class="muted" style="padding: 16px 0; text-align: center">
+          暂无变更记录
+        </div>
+        <div v-else style="max-height: 50vh; overflow-y: auto">
+          <div
+            v-for="log in changeLogs"
+            :key="log.id"
+            style="padding: 10px 0; border-top: 1px solid #f2f3f5"
+          >
+            <div class="row">
+              <span class="num">{{ changeLogText(log) }}</span>
+              <span class="muted">{{ formatDateTimeCN(log.changedAt) }}</span>
+            </div>
+            <div class="muted" style="font-size: 12px; margin-top: 2px">
+              变更人：{{ log.operator || '未记录' }}
+            </div>
+          </div>
+        </div>
+        <van-button block style="margin-top: 16px" @click="showChangeLog = false">关闭</van-button>
+      </div>
+    </van-popup>
+
     <van-popup v-model:show="showDwForm" round position="bottom">
       <div style="padding: 20px">
         <div class="card-title">新增干体重</div>
@@ -806,7 +957,13 @@ function showHelp() {
       <div style="padding: 20px">
         <div class="card-title">新建病人</div>
         <van-field v-model="newPatientForm.name" label="姓名" placeholder="请输入姓名" />
-        <van-field v-model="newPatientForm.wheelchairWeight" label="轮椅重量" placeholder="kg" type="number" />
+        <van-field
+          v-model="newPatientForm.wheelchairWeight"
+          label="轮椅及衣物重量"
+          label-width="7em"
+          placeholder="kg"
+          type="number"
+        />
         <van-field v-model="newPatientForm.rinseBackVolume" label="回水量" placeholder="ml" type="number" />
         <div style="display: flex; gap: 12px; margin-top: 16px">
           <van-button block @click="showNewPatient = false">取消</van-button>

@@ -197,7 +197,7 @@ describe('HomeView · 病人档案卡片', () => {
 
     const stats = w.findAll('.pstat-v').map((n) => n.text())
     expect(stats[0]).toBe('60.0kg') // 干体重
-    expect(stats[1]).toBe('20.0kg') // 轮椅重量
+    expect(stats[1]).toBe('20.0kg') // 轮椅及衣物重量
     expect(stats[2]).toBe('300ml') // 回水量
   })
 

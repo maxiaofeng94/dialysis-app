@@ -34,7 +34,7 @@ describe('BaseChart', () => {
     // 第一个参数是组件根节点（真实 DOM 元素）
     expect(echartsStub.init.mock.calls[0][0]).toBe(wrapper.element)
     expect(echartsStub.chart.setOption).toHaveBeenCalledTimes(1)
-    expect(echartsStub.chart.setOption).toHaveBeenCalledWith(option)
+    expect(echartsStub.chart.setOption).toHaveBeenCalledWith(option, { notMerge: true })
 
     wrapper.unmount()
   })
@@ -101,5 +101,53 @@ describe('BaseChart', () => {
 
     wrapper.unmount()
     expect(disconnect).toHaveBeenCalledTimes(1)
+  })
+ /**
+   * 评审 M1：图表结构变化时必须 notMerge 重建，否则旧 series 会残留。
+   *
+   * 真实后果（评审实测）：报告页有 3 条血压、只有第 2 条填了心率 → 删掉第 2 条 →
+   * hasBpPulse 变 false、option 变成 2 条 series + 单轴 → 但 ECharts 的 setOption
+   * 是合并语义，会**保留**第 3 条心率曲线和那根空的 bpm 副轴：
+   * x 轴只有 2 个点、心率却有 3 个点，医生看到的图与明细对不上。
+   */
+  it('结构变化（series 数量/名字或 y 轴数量变了）时用 notMerge 重建，避免残留曲线', async () => {
+    const withPulse = {
+      series: [
+        { name: '高压', data: [130, 120] },
+        { name: '低压', data: [80, 75] },
+        { name: '心率', data: [76, null] },
+      ],
+      yAxis: [{ name: 'mmHg' }, { name: 'bpm' }],
+    }
+    const wrapper = mount(BaseChart, { props: { option: withPulse } })
+    // 首次渲染也是整体替换（没有旧状态可合并）
+    expect(echartsStub.chart.setOption).toHaveBeenLastCalledWith(withPulse, { notMerge: true })
+
+    // 删掉唯一带心率的那条 → 结构从「3 series + 双轴」变成「2 series + 单轴」
+    const noPulse = {
+      series: [
+        { name: '高压', data: [130] },
+        { name: '低压', data: [80] },
+      ],
+      yAxis: { name: 'mmHg' },
+    }
+    await wrapper.setProps({ option: noPulse })
+    // 关键断言：必须 notMerge，否则心率曲线与 bpm 副轴会残留在图上
+    expect(echartsStub.chart.setOption).toHaveBeenLastCalledWith(noPulse, { notMerge: true })
+
+    wrapper.unmount()
+  })
+
+  it('结构没变（只是数据点更新）时走合并更新，保留动画', async () => {
+    const option = { series: [{ name: '高压', data: [130] }], yAxis: { name: 'mmHg' } }
+    const wrapper = mount(BaseChart, { props: { option } })
+    expect(echartsStub.chart.setOption).toHaveBeenLastCalledWith(option, { notMerge: true })
+
+    const updated = { series: [{ name: '高压', data: [130, 125] }], yAxis: { name: 'mmHg' } }
+    await wrapper.setProps({ option: updated })
+    // 同样的 series 名与轴数量 → 合并即可（不必整体重建）
+    expect(echartsStub.chart.setOption).toHaveBeenLastCalledWith(updated, { notMerge: false })
+
+    wrapper.unmount()
   })
 })

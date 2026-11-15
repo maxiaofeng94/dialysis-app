@@ -382,7 +382,7 @@ describe('本地旅程 · 导出 → 清库 → 导入', () => {
     return tables
   }
 
-  it('导出内容含版本号与全部七张表', async () => {
+  it('导出内容含版本号与全部八张表', async () => {
     await seedFullJourney()
 
     const data = JSON.parse(await localRepository.exportAll())
@@ -398,6 +398,7 @@ describe('本地旅程 · 导出 → 清库 → 导入', () => {
         'bloodPressures',
         'dryWeights',
         'exportedAt',
+        'patientChangeLogs',
         'patients',
         'sessions',
         'version',
@@ -696,6 +697,9 @@ describe('本地旅程 · 导入前的整份校验', () => {
       bloodGlucoses: [],
       bloodFlows: [],
       adverseReactions: [],
+      // 旧备份里没有这张表（change_logs 是本轮新增的），导入时按「空」处理，
+      // 再导出必须把它补成空数组 —— 否则备份里缺键、下次导入又少一张表
+      patientChangeLogs: [],
     })
   })
 })

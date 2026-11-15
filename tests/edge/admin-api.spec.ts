@@ -47,7 +47,9 @@ function fixtureTables(): Record<string, Row[]> {
         id: 'p-1',
         name: '病人一',
         birthday: '1950-03-02',
-        wheelchair_weight: 20000,
+        // 单位是 kg（库里 wheelchair_weight 就是 kg）。曾经 fixture 写成 20000，
+        // 掩盖了后台把单位误标成「克」的问题 —— 那样管理员会照着克去填。
+        wheelchair_weight: 13.4,
         rinse_back_volume: 400,
         created_at: ago(30),
         updated_at: ago(5),
@@ -973,7 +975,8 @@ describe('admin-api · patient.list / patient.get', () => {
     expect(p1).toMatchObject({
       name: '病人一',
       birthday: '1950-03-02',
-      wheelchairWeight: 20000,
+      // 单位是 kg（fixture 已从历史的 20000「克」口径改成 13.4kg）
+      wheelchairWeight: 13.4,
       rinseBackVolume: 400,
       memberCount: 4,
       ownerCount: 1,
@@ -1014,7 +1017,8 @@ describe('admin-api · patient.list / patient.get', () => {
       id: 'p-1',
       name: '病人一',
       birthday: '1950-03-02',
-      wheelchairWeight: 20000,
+      // 单位是 kg（同 patient.list 用例）
+      wheelchairWeight: 13.4,
       rinseBackVolume: 400,
     })
     expect(body.data.members).toHaveLength(4)
@@ -1486,15 +1490,16 @@ describe('admin-api · 成员与病人的写操作细节', () => {
 
   it('patient.update：只改传入字段，附带 updated_at，并记录 from/to', async () => {
     const h = await load()
+    // 单位是 kg（库里 wheelchair_weight 就是 kg，后台曾误标成克）：量程 0~100
     const { status, body } = await call(h, 'patient.update', {
       patientId: 'p-1',
       name: '病人一号',
-      wheelchairWeight: 21500,
+      wheelchairWeight: 21.5,
     })
 
     expect(status).toBe(200)
     const patch = body.data.patch
-    expect(patch).toMatchObject({ name: '病人一号', wheelchair_weight: 21500 })
+    expect(patch).toMatchObject({ name: '病人一号', wheelchair_weight: 21.5 })
     expect(patch.birthday).toBeUndefined() // 没传就不动
     expect(patch.updated_at).toBeTruthy()
 
@@ -1502,7 +1507,7 @@ describe('admin-api · 成员与病人的写操作细节', () => {
     expect(update?.filters).toEqual([{ col: 'id', val: 'p-1' }])
     expect(auditInserts(h)[0].payload.detail.changes).toEqual({
       name: { from: '病人一', to: '病人一号' },
-      wheelchairWeight: { from: 20000, to: 21500 },
+      wheelchairWeight: { from: 13.4, to: 21.5 },
     })
   })
 
@@ -1520,7 +1525,9 @@ describe('admin-api · 成员与病人的写操作细节', () => {
   it.each([
     ['姓名空', { name: '  ' }, '病人姓名不能为空'],
     ['姓名过长', { name: 'x'.repeat(31) }, '病人姓名过长'],
-    ['轮椅重量为负', { wheelchairWeight: -1 }, '轮椅重量必须是不小于 0 的数字'],
+    ['轮椅重量为负', { wheelchairWeight: -1 }, '轮椅及衣物重量必须是不小于 0 的数字'],
+    // 单位是 kg：填 13000（误以为是克）会把 App 的实际体重算成负数，必须拦
+    ['轮椅重量超出量程', { wheelchairWeight: 13000 }, '轮椅及衣物重量不能超过 100kg（单位是 kg，不是克）'],
     ['回水量非数字', { rinseBackVolume: 'abc' }, '回水量必须是不小于 0 的数字'],
   ])('patient.update 字段非法（%s）→ 400 且不写库', async (_label, patch, message) => {
     const h = await load()

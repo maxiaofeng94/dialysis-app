@@ -681,7 +681,7 @@ describe('cloudRepository · 乐观锁（多人同时编辑同一条记录）', 
 })
 
 /**
- * 同样的乐观锁也要覆盖「病人档案」：两个人同时改轮椅重量 / 回水量，
+ * 同样的乐观锁也要覆盖「病人档案」：两个人同时改轮椅及衣物重量 / 回水量，
  * 后保存的人不该静默抹掉对方刚改的值。
  */
 describe('cloudRepository · 乐观锁（病人档案）', () => {
@@ -806,6 +806,8 @@ describe('cloudRepository · 子表映射与排序', () => {
       measuredAt: new Date('2024-05-01T08:00:00.000Z').getTime(),
       systolic: 120,
       diastolic: 70,
+      // 心率：库里没有这一列的数据（加列之前写入的老行）一律兜底成 null
+      pulse: null,
       note: null,
     })
     expect(log.orders).toEqual([{ table: 'blood_pressures', col: 'measured_at', ascending: true }])
@@ -1044,6 +1046,9 @@ describe('cloudRepository · 写方法与错误传播', () => {
       measured_at: new Date(1_700_000_100_000).toISOString(),
       systolic: 130,
       diastolic: 80,
+      // 不填心率也要显式写 null（而不是留 undefined / 漏列），保证 upsert 覆盖已有行时
+      // 真的把心率清掉，而不是保留上一次的值
+      pulse: null,
       note: null,
     })
   })
@@ -1436,5 +1441,292 @@ describe('cloudRepository · 本地默认 id（云端不可能存在）', () => 
 
     await expect(cloudRepository.getPatient('11111111-1111-4111-8111-111111111111')).resolves.toBeUndefined()
     expect(fake.callsOn('patients')).toHaveLength(1)
+  })
+})
+
+/**
+ * 心率 pulse 的云端序列化（需求③）。
+ *
+ * 为什么单独一组：原来的写断言用的恰好是 `makeBp()` 的默认值（`pulse: null`），
+ * 于是「恒写 null」这个 bug 能骗过全部 1671 条用例 —— 用户填了 88 bpm 却一列都存不进去。
+ * 判定标准是**必须有非 null 的输入样本**。
+ */
+describe('cloudRepository · 血压心率 pulse 的云端读写', () => {
+  it('保存带心率的血压：payload 里 pulse 是用户填的值（不是 null）', async () => {
+    const { fake } = setupFake({ tables: { blood_pressures: [] } })
+
+    await cloudRepository.saveBloodPressure(
+      makeBp({ id: 'bp-pulse', sessionId: 's1', systolic: 130, diastolic: 80, pulse: 88 }),
+    )
+
+    const call = fake.lastCall('blood_pressures')
+    expect(call?.payload).toMatchObject({ id: 'bp-pulse', systolic: 130, diastolic: 80, pulse: 88 })
+  })
+
+  it('不填心率：显式写 null（upsert 整行才能把旧值清掉，留 undefined 会漏列）', async () => {
+    const { fake } = setupFake({ tables: { blood_pressures: [] } })
+
+    await cloudRepository.saveBloodPressure(makeBp({ id: 'bp-null', pulse: null }))
+
+    const payload = fake.lastCall('blood_pressures')?.payload as Record<string, unknown>
+    expect(payload.pulse).toBeNull()
+    // 关键：必须是「有 pulse 这个键且值为 null」，不是「没有 pulse 这个键」
+    expect('pulse' in payload).toBe(true)
+  })
+
+  it('读回心率：pulse 原样映射成数字', async () => {
+    setupFake({
+      tables: {
+        blood_pressures: [
+          { id: 'bp1', session_id: 's1', measured_at: '2024-05-01T09:00:00Z', systolic: 130, diastolic: 80, pulse: 76, note: null },
+        ],
+      },
+    })
+
+    const [bp] = await cloudRepository.listBloodPressures('s1')
+    expect(bp.pulse).toBe(76)
+  })
+
+  it('加列之前写入的老行（没有 pulse 列）：读出来是 null，不是 undefined / 0', async () => {
+    setupFake({
+      tables: {
+        blood_pressures: [
+          // 老数据的行里根本没有 pulse 这个键
+          { id: 'bp-old', session_id: 's1', measured_at: '2024-05-01T09:00:00Z', systolic: 120, diastolic: 70, note: null },
+        ],
+      },
+    })
+
+    const [bp] = await cloudRepository.listBloodPressures('s1')
+    expect(bp.pulse).toBeNull()
+  })
+
+  it('pulse 为 0 时不能折成 null（0 是非法值但语义上不能与「未记录」混淆）', async () => {
+    setupFake({
+      tables: {
+        blood_pressures: [
+          { id: 'bp0', session_id: 's1', measured_at: '2024-05-01T09:00:00Z', systolic: 120, diastolic: 70, pulse: 0, note: null },
+        ],
+      },
+    })
+
+    const [bp] = await cloudRepository.listBloodPressures('s1')
+    // 0 != null：读接口要如实反映库里的值，量程校验是写入口的职责
+    expect(bp.pulse).toBe(0)
+  })
+})
+
+/**
+ * 病人配置变更记录的云端读写（需求②）。
+ *
+ * 原来这条链路零覆盖：把 `if (error) throw error` 改成 `return []`、
+ * 把 operator_id 写成 null（会被 RLS 静默拒绝）、把 old_value 折成 0，
+ * 全部 1671 条用例照样绿。这里逐条钉住。
+ */
+describe('cloudRepository · 病人配置变更记录', () => {
+  it('读：带出变更人姓名，changed_at 转时间戳', async () => {
+    setupFake({
+      tables: {
+        patient_change_logs: [
+          {
+            id: 'cl1',
+            patient_id: 'p1',
+            field: 'wheelchairWeight',
+            old_value: 13.4,
+            new_value: 14,
+            changed_at: '2024-05-01T09:00:00Z',
+            operator: { name: '张三', phone: '13800000000' },
+          },
+        ],
+      },
+    })
+
+    const list = await cloudRepository.listPatientChangeLogs('p1')
+
+    expect(list).toHaveLength(1)
+    expect(list[0]).toMatchObject({
+      id: 'cl1',
+      patientId: 'p1',
+      field: 'wheelchairWeight',
+      oldValue: 13.4,
+      newValue: 14,
+      operator: '张三',
+      changedAt: new Date('2024-05-01T09:00:00Z').getTime(),
+    })
+  })
+
+  it('读：没填姓名时变更人退回手机号；未关联到用户时是 null', async () => {
+    setupFake({
+      tables: {
+        patient_change_logs: [
+          { id: 'cl1', patient_id: 'p1', field: 'wheelchairWeight', old_value: 1, new_value: 2, changed_at: '2024-05-01T09:00:00Z', operator: { name: null, phone: '13800000000' } },
+          { id: 'cl2', patient_id: 'p1', field: 'wheelchairWeight', old_value: 2, new_value: 3, changed_at: '2024-05-02T09:00:00Z', operator: null },
+        ],
+      },
+    })
+
+    const list = await cloudRepository.listPatientChangeLogs('p1')
+    expect(list.find((l) => l.id === 'cl1')?.operator).toBe('13800000000')
+    expect(list.find((l) => l.id === 'cl2')?.operator).toBeNull()
+  })
+
+  it('读：old_value / new_value 为 null 时保留 null（不能折成 0）', async () => {
+    setupFake({
+      tables: {
+        patient_change_logs: [
+          { id: 'cl1', patient_id: 'p1', field: 'wheelchairWeight', old_value: null, new_value: 13.4, changed_at: '2024-05-01T09:00:00Z' },
+        ],
+      },
+    })
+
+    const [log] = await cloudRepository.listPatientChangeLogs('p1')
+    expect(log.oldValue).toBeNull()
+    expect(log.newValue).toBe(13.4)
+  })
+
+  it('读：按 changed_at 倒序，同一时刻按 id 倒序（顺序稳定，界面不跳）', async () => {
+    setupFake({
+      tables: {
+        patient_change_logs: [
+          { id: 'cl-a', patient_id: 'p1', field: 'wheelchairWeight', old_value: 1, new_value: 2, changed_at: '2024-05-01T09:00:00Z' },
+          { id: 'cl-c', patient_id: 'p1', field: 'wheelchairWeight', old_value: 3, new_value: 4, changed_at: '2024-05-03T09:00:00Z' },
+          { id: 'cl-b', patient_id: 'p1', field: 'wheelchairWeight', old_value: 2, new_value: 3, changed_at: '2024-05-02T09:00:00Z' },
+        ],
+      },
+    })
+
+    const list = await cloudRepository.listPatientChangeLogs('p1')
+    expect(list.map((l) => l.id)).toEqual(['cl-c', 'cl-b', 'cl-a'])
+  })
+
+  it('读：查询失败必须抛错，不能静默成「没有变更记录」（那会让用户以为从没改过）', async () => {
+    setupFake({
+      failOn: (call) => (call.table === 'patient_change_logs' ? { message: 'boom' } : null),
+    })
+
+    await expect(cloudRepository.listPatientChangeLogs('p1')).rejects.toMatchObject({ message: 'boom' })
+  })
+
+  it('读：本地默认 id 直接判空，不发请求', async () => {
+    const { fake } = setupFake({ tables: {} })
+
+    await expect(cloudRepository.listPatientChangeLogs('patient-default')).resolves.toEqual([])
+    expect(fake.calls).toHaveLength(0)
+  })
+
+  it('写：operator_id 必须是当前登录用户（写成 null 会被 RLS 静默拒绝）', async () => {
+    const { fake } = setupFake({ tables: { patient_change_logs: [] } })
+    hoisted.state.user = { id: 'uid-当前登录' }
+
+    await cloudRepository.addPatientChangeLog({
+      id: 'cl-new',
+      patientId: 'p1',
+      field: 'wheelchairWeight',
+      oldValue: 13.4,
+      newValue: 14,
+      operator: '张三',
+      changedAt: new Date('2024-05-01T09:00:00Z').getTime(),
+    })
+
+    const payload = fake.lastCall('patient_change_logs')?.payload as Record<string, unknown>
+    expect(payload.operator_id).toBe('uid-当前登录')
+    expect(payload).toMatchObject({
+      id: 'cl-new',
+      patient_id: 'p1',
+      field: 'wheelchairWeight',
+      old_value: 13.4,
+      new_value: 14,
+      changed_at: '2024-05-01T09:00:00.000Z',
+    })
+    // 领域对象里没有 operator_id 这个字段（显示名走关联查询），别把它写进去
+    expect(payload).not.toHaveProperty('operator')
+  })
+
+  it('写：未登录时 operator_id 为 null（服务端 RLS 会拒，但客户端不能崩）', async () => {
+    const { fake } = setupFake({ tables: { patient_change_logs: [] } })
+    hoisted.state.user = null
+
+    await cloudRepository.addPatientChangeLog({
+      id: 'cl-x',
+      patientId: 'p1',
+      field: 'wheelchairWeight',
+      oldValue: 1,
+      newValue: 2,
+      operator: null,
+      changedAt: Date.now(),
+    })
+
+    const payload = fake.lastCall('patient_change_logs')?.payload as Record<string, unknown>
+    expect(payload.operator_id).toBeNull()
+  })
+
+  it('写：oldValue 为 null 时 payload 里是 null（首次配置，不是「从 0 改的」）', async () => {
+    const { fake } = setupFake({ tables: { patient_change_logs: [] } })
+    hoisted.state.user = { id: 'uid-1' }
+
+    await cloudRepository.addPatientChangeLog({
+      id: 'cl-first',
+      patientId: 'p1',
+      field: 'wheelchairWeight',
+      oldValue: null,
+      newValue: 13.4,
+      operator: null,
+      changedAt: Date.now(),
+    })
+
+    const payload = fake.lastCall('patient_change_logs')?.payload as Record<string, unknown>
+    expect(payload.old_value).toBeNull()
+    expect(payload.new_value).toBe(13.4)
+  })
+
+  it('写：数据库报错必须抛出来（不能静默成「已经记上了」）', async () => {
+    setupFake({
+      tables: { patient_change_logs: [] },
+      failOn: (call) => (call.table === 'patient_change_logs' ? { message: 'rls denied' } : null),
+    })
+    hoisted.state.user = { id: 'uid-1' }
+
+    await expect(
+      cloudRepository.addPatientChangeLog({
+        id: 'cl-err',
+        patientId: 'p1',
+        field: 'wheelchairWeight',
+        oldValue: 1,
+        newValue: 2,
+        operator: null,
+        changedAt: Date.now(),
+      }),
+    ).rejects.toMatchObject({ message: 'rls denied' })
+  })
+
+  it('导出：备份里包含变更记录（迁移/恢复后历史不能凭空消失）', async () => {
+    setupFake({
+      tables: {
+        patients: [{ id: 'p1', name: '张三', birthday: null, wheelchair_weight: 14, rinse_back_volume: 300, created_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-02T00:00:00Z' }],
+        patient_change_logs: [
+          { id: 'cl1', patient_id: 'p1', field: 'wheelchairWeight', old_value: 13.4, new_value: 14, changed_at: '2024-05-01T09:00:00Z', operator: { name: '张三', phone: null } },
+        ],
+      },
+    })
+
+    const data = JSON.parse(await cloudRepository.exportAll())
+
+    expect(data.patientChangeLogs).toHaveLength(1)
+    expect(data.patientChangeLogs[0]).toMatchObject({
+      id: 'cl1',
+      patientId: 'p1',
+      field: 'wheelchairWeight',
+      oldValue: 13.4,
+      newValue: 14,
+      operator: '张三',
+    })
+  })
+
+  it('导出：变更记录表查询失败也要抛错（不能静默产出缺一张表的备份）', async () => {
+    setupFake({
+      failOn: (call) => (call.table === 'patient_change_logs' ? { message: 'boom' } : null),
+    })
+
+    await expect(cloudRepository.exportAll()).rejects.toThrow('导出失败（配置变更记录）：boom')
   })
 })

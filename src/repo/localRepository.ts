@@ -1,6 +1,15 @@
 import { db } from '../db/database'
 import type { Repository } from './repository'
-import type { Patient, DryWeight, DialysisSession, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
+import type {
+  Patient,
+  DryWeight,
+  DialysisSession,
+  BloodPressure,
+  BloodGlucose,
+  BloodFlow,
+  AdverseReaction,
+  PatientChangeLog,
+} from '../types'
 
 /** 兼容旧数据（旧版本无中止相关字段）与外部导入数据 */
 function normalizeSession(s: DialysisSession): DialysisSession {
@@ -13,6 +22,15 @@ function normalizeSession(s: DialysisSession): DialysisSession {
   }
 }
 
+/**
+ * 兼容旧数据：心率是后加的字段，旧备份 / 旧本机数据里没有 `pulse` 这个键。
+ * 不兜底的话，界面会渲染出 `undefined bpm`（模板里读 `bp.pulse != null` 判不出来？能判出来，
+ * 但类型上是 undefined 而声明是 `number | null` —— 交给 normalize 统一成 null 更干净）。
+ */
+function normalizeBp(b: BloodPressure): BloodPressure {
+  return { ...b, pulse: typeof b.pulse === 'number' && Number.isFinite(b.pulse) ? b.pulse : null }
+}
+
 interface BackupData {
   version?: number
   patients?: Patient[]
@@ -22,6 +40,7 @@ interface BackupData {
   bloodGlucoses?: BloodGlucose[]
   bloodFlows?: BloodFlow[]
   adverseReactions?: AdverseReaction[]
+  patientChangeLogs?: PatientChangeLog[]
 }
 
 const BACKUP_TABLES = [
@@ -32,6 +51,7 @@ const BACKUP_TABLES = [
   'bloodGlucoses',
   'bloodFlows',
   'adverseReactions',
+  'patientChangeLogs',
 ] as const
 
 /**
@@ -81,6 +101,15 @@ class LocalRepository implements Repository {
     return null
   }
 
+  async listPatientChangeLogs(patientId: string, _opts?: { fresh?: boolean }) {
+    const list = await db.patientChangeLogs.where('patientId').equals(patientId).toArray()
+    // 倒序：最近一次变更排最前（与云端 changed_at desc 一致）
+    return list.sort((a, b) => b.changedAt - a.changedAt || (a.id < b.id ? 1 : -1))
+  }
+  async addPatientChangeLog(log: PatientChangeLog) {
+    await db.patientChangeLogs.put({ ...log })
+  }
+
   async listDryWeights(patientId: string) {
     const list = await db.dryWeights.where('patientId').equals(patientId).toArray()
     return list.sort((a, b) =>
@@ -122,15 +151,15 @@ class LocalRepository implements Repository {
 
   async listBloodPressures(sessionId: string) {
     const list = await db.bloodPressures.where('sessionId').equals(sessionId).toArray()
-    return list.sort((a, b) => a.measuredAt - b.measuredAt)
+    return list.map(normalizeBp).sort((a, b) => a.measuredAt - b.measuredAt)
   }
   async listBloodPressuresMany(sessionIds: string[]) {
     if (!sessionIds.length) return []
     const list = await db.bloodPressures.where('sessionId').anyOf(sessionIds).toArray()
-    return list.sort((a, b) => a.measuredAt - b.measuredAt)
+    return list.map(normalizeBp).sort((a, b) => a.measuredAt - b.measuredAt)
   }
   async saveBloodPressure(bp: BloodPressure) {
-    await db.bloodPressures.put({ ...bp })
+    await db.bloodPressures.put(normalizeBp({ ...bp }))
   }
   async deleteBloodPressure(id: string) {
     await db.bloodPressures.delete(id)
@@ -186,10 +215,11 @@ class LocalRepository implements Repository {
       patients: await db.patients.toArray(),
       dryWeights: await db.dryWeights.toArray(),
       sessions: (await db.sessions.toArray()).map(normalizeSession),
-      bloodPressures: await db.bloodPressures.toArray(),
+      bloodPressures: (await db.bloodPressures.toArray()).map(normalizeBp),
       bloodGlucoses: await db.bloodGlucoses.toArray(),
       bloodFlows: await db.bloodFlows.toArray(),
       adverseReactions: await db.adverseReactions.toArray(),
+      patientChangeLogs: await db.patientChangeLogs.toArray(),
     }
     return JSON.stringify(data, null, 2)
   }
@@ -207,7 +237,16 @@ class LocalRepository implements Repository {
     // 清空 + 写入放在同一个事务里：中途失败会整体回滚，不会留下「清了一半」的库
     await db.transaction(
       'rw',
-      [db.patients, db.dryWeights, db.sessions, db.bloodPressures, db.bloodGlucoses, db.bloodFlows, db.adverseReactions],
+      [
+        db.patients,
+        db.dryWeights,
+        db.sessions,
+        db.bloodPressures,
+        db.bloodGlucoses,
+        db.bloodFlows,
+        db.adverseReactions,
+        db.patientChangeLogs,
+      ],
       async () => {
         await db.patients.clear()
         await db.dryWeights.clear()
@@ -216,13 +255,15 @@ class LocalRepository implements Repository {
         await db.bloodGlucoses.clear()
         await db.bloodFlows.clear()
         await db.adverseReactions.clear()
+        await db.patientChangeLogs.clear()
         await db.patients.bulkPut(data.patients ?? [])
         await db.dryWeights.bulkPut(data.dryWeights ?? [])
         await db.sessions.bulkPut((data.sessions ?? []).map(normalizeSession))
-        await db.bloodPressures.bulkPut(data.bloodPressures ?? [])
+        await db.bloodPressures.bulkPut((data.bloodPressures ?? []).map(normalizeBp))
         await db.bloodGlucoses.bulkPut(data.bloodGlucoses ?? [])
         await db.bloodFlows.bulkPut(data.bloodFlows ?? [])
         await db.adverseReactions.bulkPut(data.adverseReactions ?? [])
+        await db.patientChangeLogs.bulkPut(data.patientChangeLogs ?? [])
       },
     )
   }

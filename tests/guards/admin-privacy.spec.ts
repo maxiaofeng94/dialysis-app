@@ -41,6 +41,8 @@ function stripComments(src: string): string {
 const MEDICAL_FIELDS = [
   'systolic',
   'diastolic',
+  // 心率：血压记录的第三项指标，同样属于病历明细（后台不该看到）
+  'pulse',
   'preWeightMeasured',
   'postWeightMeasured',
   'pre_weight_measured',

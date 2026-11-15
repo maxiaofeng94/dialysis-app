@@ -1,5 +1,14 @@
 import Dexie, { type Table } from 'dexie'
-import type { Patient, DryWeight, DialysisSession, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
+import type {
+  Patient,
+  DryWeight,
+  DialysisSession,
+  BloodPressure,
+  BloodGlucose,
+  BloodFlow,
+  AdverseReaction,
+  PatientChangeLog,
+} from '../types'
 
 export class DialysisDB extends Dexie {
   patients!: Table<Patient, string>
@@ -9,6 +18,7 @@ export class DialysisDB extends Dexie {
   bloodGlucoses!: Table<BloodGlucose, string>
   bloodFlows!: Table<BloodFlow, string>
   adverseReactions!: Table<AdverseReaction, string>
+  patientChangeLogs!: Table<PatientChangeLog, string>
 
   constructor() {
     super('dialysis-db')
@@ -22,6 +32,20 @@ export class DialysisDB extends Dexie {
       adverseReactions: 'id, sessionId',
     })
 
+    // v3：新增「病人配置变更记录」。
+    // `bloodPressures.pulse`（心率）是**非索引字段**，无需再升版本；旧血压行读出来没有这个键，
+    // 统一由 normalizeBp 兜底成 null。
+    this.version(3).stores({
+      patients: 'id, createdAt',
+      dryWeights: 'id, patientId, [patientId+effectiveDate]',
+      sessions: 'id, patientId, date, [patientId+date], [patientId+createdAt]',
+      bloodPressures: 'id, sessionId',
+      bloodGlucoses: 'id, sessionId',
+      bloodFlows: 'id, sessionId',
+      adverseReactions: 'id, sessionId',
+      patientChangeLogs: 'id, patientId, [patientId+changedAt]',
+    })
+
     // 另一个标签页要求升级数据库版本时，必须主动让路：
     // 旧连接不让位的话，新页面会一直停在 Dexie 的 `blocked` 状态 ——
     // open() 既不 resolve 也不 reject，所有表操作全部 pending，
@@ -31,5 +55,4 @@ export class DialysisDB extends Dexie {
     })
   }
 }
-
 export const db = new DialysisDB()

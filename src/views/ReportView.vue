@@ -12,7 +12,7 @@ import { currentPatientId } from '../stores/patient'
 import { cacheVersion } from '../lib/cloudCache'
 import { useSessionExpiryRedirect } from '../lib/sessionExpiry'
 import { fmt, formatTime, calcAge, formatDateTimeCN } from '../utils/format'
-import { computeSession, getEffectiveDryWeight } from '../utils/calc'
+import { computeSession, getEffectiveDryWeight, resolveEffectiveConfig } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
 import BaseChart from '../components/BaseChart.vue'
 import type { DialysisSession, Patient, DryWeight, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
@@ -67,6 +67,14 @@ async function load() {
       router.replace('/')
       return
     }
+    // 记录不属于当前病人（切换病人后又用返回键回到旧报告）：报告会按**另一个病人**的
+    // 轮椅重量与干体重计算，数字是错的。回首页比显示一份错的报告安全。
+    // （`resolveEffectiveConfig` 里也有同样的归属校验兜底，这里是更早、更明确的拦截。）
+    if (session.value.patientId && pid && session.value.patientId !== pid) {
+      showToast('这条记录属于其他病人，已返回首页')
+      router.replace('/')
+      return
+    }
     patient.value = p ?? null
     dryWeights.value = dw
     bps.value = bp
@@ -87,7 +95,18 @@ async function load() {
 const comp = computed(() => {
   if (!session.value) return null
   const dry = getEffectiveDryWeight(dryWeights.value, session.value.date)
-  return computeSession(session.value, dry)
+  // 传 patient：进行中的记录按当前档案算（与详情页/首页同一口径）
+  return computeSession(session.value, dry, patient.value)
+})
+
+/**
+ * 本次报告使用的轮椅及衣物重量 / 回水量口径。
+ * 进行中的记录跟随当前档案，已完成的用快照 —— 报告上要写清是哪一个，
+ * 否则家属把「已完成的报告」和「进行中的界面」拿来对比时会发现数字不一样。
+ */
+const effectiveConfig = computed(() => {
+  if (!session.value) return null
+  return resolveEffectiveConfig(session.value, patient.value)
 })
 
 /** 致命错误：一条记录都没加载出来（后台刷新失败但已有报告时不算） */
@@ -103,17 +122,47 @@ const reactionText = computed(() => {
     .join('、')
 })
 
-const bpOption = computed(() => ({
-  tooltip: { trigger: 'axis' },
-  legend: { top: 0, left: 'center', itemGap: 14, itemWidth: 16, itemHeight: 10, textStyle: { fontSize: 12 }, data: ['高压', '低压'] },
-  grid: { left: 42, right: 20, top: 48, bottom: 32 },
-  xAxis: { type: 'category', data: bps.value.map((b) => formatTime(b.measuredAt)) },
-  yAxis: { type: 'value', name: 'mmHg' },
-  series: [
-    { name: '高压', type: 'line', smooth: true, color: '#ee0a24', data: bps.value.map((b) => b.systolic) },
-    { name: '低压', type: 'line', smooth: true, color: '#1989fa', data: bps.value.map((b) => b.diastolic) },
-  ],
-}))
+/** 报告页的血压曲线：有心率时启用右侧副轴（心率 60~100 与血压 40~200 不同量级，混用一根轴会把血压压扁） */
+const hasBpPulse = computed(() => bps.value.some((b) => b.pulse != null))
+
+const bpOption = computed(() => {
+  const base: Record<string, unknown> = {
+    tooltip: { trigger: 'axis' },
+    legend: {
+      top: 0,
+      left: 'center',
+      itemGap: 14,
+      itemWidth: 16,
+      itemHeight: 10,
+      textStyle: { fontSize: 12 },
+      data: hasBpPulse.value ? ['高压', '低压', '心率'] : ['高压', '低压'],
+    },
+    grid: { left: 42, right: hasBpPulse.value ? 46 : 20, top: 48, bottom: 32 },
+    xAxis: { type: 'category', data: bps.value.map((b) => formatTime(b.measuredAt)) },
+    yAxis: hasBpPulse.value
+      ? [
+          { type: 'value', name: 'mmHg' },
+          { type: 'value', name: 'bpm', splitLine: { show: false } },
+        ]
+      : { type: 'value', name: 'mmHg' },
+    series: [
+      { name: '高压', type: 'line', smooth: true, color: '#ee0a24', data: bps.value.map((b) => b.systolic) },
+      { name: '低压', type: 'line', smooth: true, color: '#1989fa', data: bps.value.map((b) => b.diastolic) },
+    ],
+  }
+  if (hasBpPulse.value) {
+    ;(base.series as unknown[]).push({
+      name: '心率',
+      type: 'line',
+      smooth: true,
+      color: '#ff976a',
+      yAxisIndex: 1,
+      // 老记录没有心率：ECharts 用 null 表示断点，绝不能填 0（会把曲线拽到地板上）
+      data: bps.value.map((b) => b.pulse),
+    })
+  }
+  return base
+})
 
 const abortSummary = computed(() => abortText(session.value?.abortTags, session.value?.abortReason))
 
@@ -128,11 +177,29 @@ const summaryText = computed(() => {
           abortSummary.value || '未填写'
         }`
       : ''
+  // 心率写进分享文本：家属发给医生的是这段文字 + 报告图片，明细里有就必须带上
+  const bpText = bps.value.length
+    ? `\n血压：${bps.value
+        .map(
+          (b) =>
+            `${formatTime(b.measuredAt)} ${b.systolic}/${b.diastolic}${b.pulse != null ? `（心率 ${b.pulse}）` : ''}`,
+        )
+        .join('；')}`
+    : ''
+  // 轮椅及衣物重量的口径必须跟着一起发出去（评审 L1）。
+  // 面板上写了「进行中，按当前档案计算」，但分享文本是家属直接发给医生的那段字 ——
+  // 只发数字不说口径，医生无法判断这个重量是这次透析当时的、还是后来改过的。
+  const cfg = effectiveConfig.value
+  const wheelchairText = cfg?.fromPatientProfile
+    ? `轮椅及衣物 ${fmt(cfg.wheelchairWeight)}kg（进行中，按当前档案计算）\n`
+    : `轮椅及衣物 ${fmt(cfg?.wheelchairWeight)}kg（本次记录当时的值）\n`
   return (
     `透析报告 ${name} ${date}（${status}）\n` +
     `上机前 ${fmt(c?.preWeightActual)}kg，下机后 ${fmt(c?.postWeightActual)}kg，干体重 ${fmt(c?.effectiveDryWeight)}kg\n` +
     `医生设定脱水 ${fmt(doctorUfL.value)}L，计划脱水 ${fmt(c?.planUf)}L，实际脱水 ${fmt(c?.actualUf)}L，回水 ${c?.rinseBackMl ?? ''}ml\n` +
+    wheelchairText +
     `不良反应：${reactionText.value}` +
+    bpText +
     abort
   )
 })
@@ -293,7 +360,14 @@ async function share() {
         <div class="ruf"><span>计划脱水量</span><b>{{ fmt(comp?.planUf) }} L</b></div>
         <div class="ruf"><span>实际脱水量</span><b>{{ fmt(comp?.actualUf) }} L</b></div>
       </div>
-      <div class="report-meta">干体重 {{ fmt(comp?.effectiveDryWeight) }}kg · 回水 {{ comp?.rinseBackMl ?? '—' }}ml · 机器超滤 {{ fmt(comp?.machineUf) }}L</div>
+      <div class="report-meta">
+        干体重 {{ fmt(comp?.effectiveDryWeight) }}kg · 回水 {{ comp?.rinseBackMl ?? '—' }}ml · 机器超滤 {{ fmt(comp?.machineUf) }}L
+      </div>
+      <!-- 写清轮椅及衣物重量的口径：已完成的报告用当时快照（历史不可变） -->
+      <div class="report-meta" v-if="effectiveConfig">
+        轮椅及衣物 {{ fmt(effectiveConfig.wheelchairWeight) }}kg
+        <template v-if="effectiveConfig.fromPatientProfile">（进行中，按当前档案计算）</template>
+      </div>
 
       <div style="height: 1px; background: #ebedf0; margin: 14px 0"></div>
       <div class="card-title" style="margin-bottom: 6px">血压曲线</div>
@@ -303,6 +377,7 @@ async function share() {
         <div v-for="bp in bps" :key="bp.id" class="kv">
           <span class="k">{{ formatTime(bp.measuredAt) }}</span>
           <span class="v">{{ bp.systolic }} / {{ bp.diastolic }} mmHg
+            <span v-if="bp.pulse != null" class="pulse-inline">· 心率 {{ bp.pulse }} bpm</span>
             <van-tag :type="assessBp(bp.systolic, bp.diastolic).color" style="margin-left: 6px">{{ assessBp(bp.systolic, bp.diastolic).text }}</van-tag>
           </span>
         </div>
@@ -436,5 +511,10 @@ async function share() {
 .report-abort-title {
   font-weight: 700;
   color: #ee0a24;
+}
+/* 心率内联显示：与血压值同一行，用橙色和 mmHg 的数字区分开 */
+.pulse-inline {
+  color: #ff976a;
+  margin-left: 4px;
 }
 </style>

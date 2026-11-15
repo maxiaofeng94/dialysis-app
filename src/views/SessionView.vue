@@ -10,7 +10,7 @@ import { cacheVersion } from '../lib/cloudCache'
 import { useSessionExpiryRedirect } from '../lib/sessionExpiry'
 import { isConflictError, isNotFoundError, isPermissionError } from '../lib/errors'
 import { todayStr, parseNum, fmt, formatTime, combineDateTime, dateStr, formatDateTimeCN, formatDateCN } from '../utils/format'
-import { getEffectiveDryWeight, calcWeights } from '../utils/calc'
+import { getEffectiveDryWeight, calcWeights, resolveEffectiveConfig, snapshotConfigInto } from '../utils/calc'
 import { assessBp, assessGlucose } from '../utils/assess'
 import { uuid } from '../utils/id'
 import type { DialysisSession, Patient, DryWeight, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
@@ -21,7 +21,7 @@ import type { DialysisSession, Patient, DryWeight, BloodPressure, BloodGlucose, 
  * 阈值取「明显不可能」的边界（成人透析常规范围），不做更严的业务校验。
  * 注意：HomeView 里有一份同样的体重阈值，改这里要同步改那边。
  */
-const WEIGHT_MIN = 20 // kg，上机前 / 下机后体重（含轮椅）
+const WEIGHT_MIN = 20 // kg，上机前 / 下机后体重（含轮椅及衣物）
 const WEIGHT_MAX = 200
 /**
  * 医生设定脱水量（ml）。没有量程时填 999999 也能入库，
@@ -33,6 +33,13 @@ const BP_SYSTOLIC_MIN = 40 // mmHg
 const BP_SYSTOLIC_MAX = 300
 const BP_DIASTOLIC_MIN = 20 // mmHg
 const BP_DIASTOLIC_MAX = 200
+/**
+ * 心率（bpm）量程。选填，但填了就要在合理范围内：
+ * 透析患者的静息心率常见 50~120，30 以下或 250 以上几乎肯定是填错了
+ * （或者把高压的百位数手滑填进来），这种数进库后趋势图会彻底变形。
+ */
+const PULSE_MIN = 30
+const PULSE_MAX = 250
 const GLUCOSE_MIN = 0.5 // mmol/L
 const GLUCOSE_MAX = 50
 const FLOW_MIN = 0 // ml/min
@@ -65,7 +72,7 @@ const form = reactive({
 })
 
 const showBp = ref(false)
-const bpForm = reactive({ time: '', systolic: '', diastolic: '' })
+const bpForm = reactive({ time: '', systolic: '', diastolic: '', pulse: '' })
 const editingBpId = ref<string | null>(null)
 const showGlu = ref(false)
 const gluForm = reactive({ time: '', value: '' })
@@ -121,6 +128,20 @@ async function load(opts: { fresh?: boolean } = {}) {
     ])
     session.value = s ?? null
     if (!session.value) {
+      router.replace('/')
+      return
+    }
+    // 记录不属于「当前病人」＝ 用户切了病人后又用返回键回到了旧记录（历史栈不改）。
+    // 此时若继续渲染，进行中的记录会按**另一个病人**的轮椅重量计算（评审实测过：
+    // 记录属于 A、档案是 B，上机前实际算成 55 而不是 66.6）；更糟的是用户点「标记完成」
+    // 会把 B 的重量写进 A 这条记录的冻结快照 —— 展示层的错变成库里的错。
+    // 回首页是唯一安全的选择：那里永远按 currentPatientId 展示，不会错配。
+    if (session.value.patientId && pid && session.value.patientId !== pid) {
+      console.warn('[session] 记录不属于当前病人，已返回首页', {
+        sessionPatientId: session.value.patientId,
+        currentPatientId: pid,
+      })
+      showToast('这条记录属于其他病人，已返回首页')
       router.replace('/')
       return
     }
@@ -213,13 +234,26 @@ let knownReactionIds: string[] = []
 
 const effectiveDry = computed(() => getEffectiveDryWeight(dryWeights.value, form.date || todayStr()))
 
+/**
+ * 本次计算实际使用的轮椅及衣物重量 / 回水量。
+ *
+ * 进行中的记录**实时跟随**当前病人档案（用户改完档案立即生效，不用删记录重录）；
+ * 已完成 / 已中止用记录里的快照（historical 不可变）。
+ * 解析规则统一在 `utils/calc.ts` 的 `resolveEffectiveConfig`，首页 / 报告 / 趋势共用同一份实现。
+ */
+const effectiveConfig = computed(() => {
+  if (!session.value) return null
+  return resolveEffectiveConfig(session.value, patient.value)
+})
+
 const comp = computed(() => {
   if (!session.value) return null
+  const cfg = effectiveConfig.value!
   return calcWeights(
     parseNum(form.preWeight),
     parseNum(form.postWeight),
-    session.value.wheelchairWeightUsed,
-    session.value.rinseBackVolumeUsed,
+    cfg.wheelchairWeight,
+    cfg.rinseMl,
     effectiveDry.value,
   )
 })
@@ -303,7 +337,18 @@ async function mergeRemoteIfUntouched() {
   if (!loaded || !session.value) return
   if (stateSnapshot() !== knownSnapshot) return
   try {
-    const s = await repository.getSession(sessionId) // 命中后台刚写回的新缓存，不用再等一次网络
+    // 需求①：进行中的记录按「当前档案」计算，所以另一端改了轮椅及衣物重量 / 回水量时，
+    // 本页也必须跟着更新 —— 否则 A 手机改完、B 手机开着详情页看到的还是旧的实际体重。
+    // ⚠️ 只更新 `patient` 这个 ref，绝不碰表单：用户可能正在输入（AGENTS.md 明确禁止覆盖输入）。
+    //
+    // 已完成 / 已中止的记录用快照计算，档案怎么变都不影响 → **不必**多发这次请求
+    // （详情页会被 cacheVersion 反复唤醒，白打一趟网络往返在弱网下是实打实的负担）。
+    const needPatient = session.value.status === 'ongoing'
+    const [s, p] = await Promise.all([
+      repository.getSession(sessionId), // 命中后台刚写回的新缓存，不用再等一次网络
+      needPatient ? repository.getPatient(currentPatientId.value) : Promise.resolve(undefined),
+    ])
+    if (p) patient.value = p
     if (!s) return // 另一端删掉了这条：这里不复活它，也不打断用户
     if (s.updatedAt <= knownUpdatedAt) return // 旧的后台刷新结果，不允许把刚保存的值顶回去
     // ⚠️ 上面那次「用户动过没有」的检查是在 await **之前**做的 —— 等网络这段时间用户完全可能
@@ -461,7 +506,14 @@ onBeforeRouteLeave(async () => {
 
 const abortSummary = computed(() => abortText(session.value?.abortTags, session.value?.abortReason))
 
-/** 状态字段快照：写失败时回滚，页面不能显示云端并不存在的状态 */
+/**
+ * 状态字段快照：写失败时回滚，页面不能显示云端并不存在的状态。
+ *
+ * ⚠️ 必须连**快照字段**（wheelchairWeightUsed / rinseBackVolumeUsed）一起回滚：
+ * 标记完成 / 中止时会把当前档案的轮椅及衣物重量 / 回水量固化进去（见 persistStatus），
+ * 若那次写库失败却不回滚，页面就会显示「按新重量算出来的体重 + 状态还是进行中」，
+ * 而库里两样都没变 —— 用户下次再点「标记完成」，就会拿这个错误的快照覆盖掉正确的。
+ */
 function statusSnapshot(s: DialysisSession) {
   return {
     status: s.status,
@@ -469,6 +521,8 @@ function statusSnapshot(s: DialysisSession) {
     abortedAt: s.abortedAt,
     abortTags: s.abortTags,
     abortReason: s.abortReason,
+    wheelchairWeightUsed: s.wheelchairWeightUsed,
+    rinseBackVolumeUsed: s.rinseBackVolumeUsed,
   }
 }
 
@@ -484,6 +538,16 @@ async function persistStatus(status: DialysisSession['status'], tip: string) {
     s.abortedAt = null
     s.abortTags = []
     s.abortReason = null
+  } else if (prev.status === 'ongoing') {
+    // 需求①：进行中的记录一直是「实时跟随当前档案」的，**首次**退出进行中（完成 / 中止）
+    // 的这一刻要把当前档案值固化进快照 —— 那之后 resolveEffectiveConfig 就改走快照，
+    // 历史数字从此固定（给医生看过的报告不会再变）。
+    //
+    // ⚠️ `prev.status === 'ongoing'` 这个前置判断不能省：
+    // 已完成/已中止 → 中止 是一次**编辑**（改中止原因），不是状态转换。
+    // 无条件固化会让 2 个月前中止的那次透析（当时轮椅 13.4kg）被今天的档案值改写，
+    // 上机前实际从 66.6 变 65.0 —— 直接违反「历史报告数字不可变」。
+    snapshotConfigInto(s, patient.value)
   }
   s.status = status
   s.updatedAt = Date.now()
@@ -598,6 +662,10 @@ async function confirmAbort() {
   s.abortedAt = combineDateTime(abortForm.date, abortForm.time)
   s.abortTags = [...abortForm.tags]
   s.abortReason = abortForm.reason.trim() || null
+  // ⚠️ 只在「原本是进行中」时固化快照（同 persistStatus 的理由）：
+  // 已中止的记录有「补充中止原因 / 修改中止信息」入口，那条路径是**编辑**不是状态转换，
+  // 再固化一次就会用今天的档案值改写 2 个月前那次透析的历史数字。
+  if (prev.status === 'ongoing') snapshotConfigInto(s, patient.value)
   s.status = 'aborted'
   s.updatedAt = Date.now()
   statusBusy.value = true
@@ -631,6 +699,7 @@ function openBp() {
   bpForm.time = formatTime(Date.now())
   bpForm.systolic = ''
   bpForm.diastolic = ''
+  bpForm.pulse = ''
   showBp.value = true
 }
 function editBp(bp: BloodPressure) {
@@ -638,6 +707,8 @@ function editBp(bp: BloodPressure) {
   bpForm.time = formatTime(bp.measuredAt)
   bpForm.systolic = String(bp.systolic)
   bpForm.diastolic = String(bp.diastolic)
+  // 老记录没有心率：回填空串（而不是 'null' / 'undefined'）
+  bpForm.pulse = bp.pulse != null ? String(bp.pulse) : ''
   showBp.value = true
 }
 async function saveBp() {
@@ -657,6 +728,14 @@ async function saveBp() {
     )
     return
   }
+  // 心率选填：不填就是 null（不是 0）。填了才校验量程 ——
+  // 空串解析成 null，解析不出数字也当「没填」，不会因为手滑多打一个字就整条血压存不进去。
+  const pulseRaw = parseNum(bpForm.pulse)
+  const pulse = pulseRaw != null ? Math.round(pulseRaw) : null
+  if (pulse != null && !checkRange(pulse, PULSE_MIN, PULSE_MAX)) {
+    showToast(`心率应在 ${PULSE_MIN}~${PULSE_MAX} bpm 之间，请检查输入`)
+    return
+  }
   // id 在 await 之前定下来：即使守卫失效也不会生成第二个 id
   const id = editingBpId.value ?? uuid()
   saving.value = true
@@ -668,6 +747,7 @@ async function saveBp() {
         measuredAt: combineDateTime(form.date, bpForm.time),
         systolic: sys,
         diastolic: dia,
+        pulse,
         note: null,
       }),
     )
@@ -675,7 +755,7 @@ async function saveBp() {
     showBp.value = false
     editingBpId.value = null
     await loadSub()
-    showToast(`已保存：血压 ${sys}/${dia} ${assessBp(sys, dia).text}`)
+    showToast(`已保存：血压 ${sys}/${dia}${pulse != null ? `，心率 ${pulse}` : ''} ${assessBp(sys, dia).text}`)
   } finally {
     saving.value = false
   }
@@ -977,7 +1057,7 @@ async function removeSession() {
 
         <div class="weight-fields">
           <div class="weight-field">
-            <div class="weight-label">上机前称重（含轮椅）</div>
+            <div class="weight-label">上机前称重（含轮椅及衣物）</div>
             <div class="weight-input-wrap">
               <input
                 :value="form.preWeight"
@@ -992,7 +1072,7 @@ async function removeSession() {
             </div>
           </div>
           <div class="weight-field">
-            <div class="weight-label">下机后称重（含轮椅）</div>
+            <div class="weight-label">下机后称重（含轮椅及衣物）</div>
             <div class="weight-input-wrap">
               <input
                 :value="form.postWeight"
@@ -1049,7 +1129,19 @@ async function removeSession() {
           </div>
         </div>
 
-        <div class="uf-meta">当日干体重 {{ fmt(comp?.effectiveDryWeight) }}kg · 回水 {{ comp?.rinseBackMl ?? '—' }}ml · 机器超滤 {{ fmt(comp?.machineUf) }}L</div>
+        <div class="uf-meta">
+          当日干体重 {{ fmt(comp?.effectiveDryWeight) }}kg · 回水 {{ comp?.rinseBackMl ?? '—' }}ml · 机器超滤 {{ fmt(comp?.machineUf) }}L
+        </div>
+        <!-- 需求①：进行中的记录按「当前档案」计算，必须把这个口径写在界面上。
+             否则用户改了档案、看到这里的数变了，会以为历史上所有记录都被改掉了。 -->
+        <div v-if="effectiveConfig?.fromPatientProfile" class="live-hint">
+          进行中：按当前档案计算（轮椅及衣物 {{ fmt(effectiveConfig.wheelchairWeight) }}kg · 回水
+          {{ effectiveConfig.rinseMl }}ml），标记完成或中止后固化为本次记录的值
+        </div>
+        <div v-else-if="session.status !== 'ongoing'" class="live-hint snapshot-hint">
+          本条记录使用当时保存的轮椅及衣物 {{ fmt(effectiveConfig?.wheelchairWeight) }}kg · 回水
+          {{ effectiveConfig?.rinseMl }}ml（不受之后修改档案影响）
+        </div>
         <div v-if="session.status === 'aborted' && comp?.postWeightActual == null" class="abort-hint">
           本次透析中止且未记录下机后体重，补录称重后会自动算出实际脱水量
         </div>
@@ -1066,6 +1158,8 @@ async function removeSession() {
           <div class="row" style="gap: 10px">
             <span class="muted">{{ formatTime(bp.measuredAt) }}</span>
             <span class="num">{{ bp.systolic }} / {{ bp.diastolic }} <span class="muted">mmHg</span></span>
+            <!-- 心率：选填，老记录没有就不显示，不要显示成「心率 —」占位置 -->
+            <span v-if="bp.pulse != null" class="num pulse-val">{{ bp.pulse }} <span class="muted">bpm</span></span>
             <van-tag :type="assessBp(bp.systolic, bp.diastolic).color">{{ assessBp(bp.systolic, bp.diastolic).text }}</van-tag>
           </div>
           <div v-if="!isReadOnly" class="row" style="gap: 10px">
@@ -1159,6 +1253,11 @@ async function removeSession() {
         <van-field v-model="bpForm.time" label="测量时间" type="time" />
         <van-field v-model="bpForm.systolic" label="高压" placeholder="mmHg" type="number" />
         <van-field v-model="bpForm.diastolic" label="低压" placeholder="mmHg" type="number" />
+        <!-- 心率选填（需求③）：不填也能保存，老记录编辑时留空即视为「未记录」 -->
+        <van-field v-model="bpForm.pulse" label="心率" placeholder="bpm（可选）" type="number" />
+        <div class="muted" style="margin: -4px 0 0 16px; font-size: 12px">
+          心率选填，量程 {{ PULSE_MIN }}~{{ PULSE_MAX }} bpm；只记录数值，不做高低判定
+        </div>
         <div style="display: flex; gap: 12px; margin-top: 16px">
           <van-button block :disabled="saving" @click="showBp = false">取消</van-button>
           <van-button block type="primary" :loading="saving" @click="saveBp">保存</van-button>
@@ -1254,6 +1353,24 @@ async function removeSession() {
 /* 只读成员的不良反应标签：保留展示，去掉「可点」的视觉暗示 */
 .chip-readonly {
   cursor: default;
+}
+/* 需求①：进行中按当前档案计算 / 已完成用快照 —— 把口径写在界面上，避免误以为历史被改 */
+.live-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #07c160;
+  background: #e8f7ef;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.live-hint.snapshot-hint {
+  color: #646566;
+  background: #f7f8fa;
+}
+/* 心率：与血压值区分开一点（同号数字，靠浅色标签避免看成一串） */
+.pulse-val {
+  color: #1989fa;
 }
 .readonly-other {
   font-size: 14px;

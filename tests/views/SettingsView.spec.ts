@@ -26,7 +26,7 @@ import { Capacitor } from '@capacitor/core'
 import { Filesystem } from '@capacitor/filesystem'
 import { Share } from '@capacitor/share'
 import type { Patient } from '../../src/types'
-import { makePatient, makeDryWeight } from '../helpers/factories'
+import { makePatient, makeDryWeight, makeChangeLog } from '../helpers/factories'
 
 const mocks = vi.hoisted(() => ({
   uuid: vi.fn(() => 'uuid-fixed-1'),
@@ -50,6 +50,9 @@ vi.mock('../../src/repo', () => ({
     deleteDryWeight: vi.fn(async () => undefined),
     exportAll: vi.fn(async () => '{"patients":[]}'),
     importAll: vi.fn(async () => undefined),
+    // 轮椅及衣物重量的变更留痕（需求②）：保存档案时若该值有变化会追加一条
+    addPatientChangeLog: vi.fn(async () => undefined),
+    listPatientChangeLogs: vi.fn(async () => []),
   },
 }))
 
@@ -244,6 +247,8 @@ beforeEach(() => {
   vi.mocked(repository.deleteDryWeight).mockResolvedValue(undefined)
   vi.mocked(repository.exportAll).mockResolvedValue('{"patients":[]}')
   vi.mocked(repository.importAll).mockResolvedValue(undefined)
+  vi.mocked(repository.addPatientChangeLog).mockResolvedValue(undefined)
+  vi.mocked(repository.listPatientChangeLogs).mockResolvedValue([])
   vi.mocked(listMyPatients).mockReset().mockResolvedValue([])
   vi.mocked(createPatient).mockReset().mockResolvedValue({ ok: true, data: { patient: { id: 'new-patient' } } })
   vi.mocked(getMyProfile).mockReset().mockResolvedValue(null)
@@ -280,7 +285,7 @@ describe('SettingsView · 病人档案回填', () => {
 
     expect(fieldInput(w, '姓名').element.value).toBe('张三')
     expect(fieldInput(w, '生日').element.value).toBe('1950-06-01')
-    expect(fieldInput(w, '轮椅重量').element.value).toBe('20')
+    expect(fieldInput(w, '轮椅及衣物重量').element.value).toBe('20')
     expect(fieldInput(w, '回水量').element.value).toBe('300')
     expect(w.text()).toContain('当前年龄约 74 岁') // 冻结在 2024-06-01
   })
@@ -299,7 +304,7 @@ describe('SettingsView · 病人档案回填', () => {
     const w = await mountSettings({ patient: legacy })
 
     // 组件内部是 String(undefined)="undefined"，但 number 型输入框会把它清洗成空串
-    expect(fieldInput(w, '轮椅重量').element.value).toBe('')
+    expect(fieldInput(w, '轮椅及衣物重量').element.value).toBe('')
     expect(fieldInput(w, '回水量').element.value).toBe('')
 
     await buttonByText(w, '保存档案').trigger('click')
@@ -323,7 +328,7 @@ describe('SettingsView · 病人档案回填', () => {
     })
 
     await fieldInput(w, '姓名').setValue('张三丰')
-    await fieldInput(w, '轮椅重量').setValue('22.5')
+    await fieldInput(w, '轮椅及衣物重量').setValue('22.5')
 
     // 新增干体重会走 load()，此时表单已被用户改过 → 不能回填
     await buttonByText(cardByTitle(w, '干体重历史'), '新增').trigger('click')
@@ -335,7 +340,7 @@ describe('SettingsView · 病人档案回填', () => {
 
     expect(repository.listDryWeights).toHaveBeenCalledTimes(2) // load 确实跑过
     expect(fieldInput(w, '姓名').element.value).toBe('张三丰')
-    expect(fieldInput(w, '轮椅重量').element.value).toBe('22.5')
+    expect(fieldInput(w, '轮椅及衣物重量').element.value).toBe('22.5')
   })
 
   it('表单没被改过时，load 仍会正常回填（避免 M3 的收口把回填整个关掉）', async () => {
@@ -385,7 +390,7 @@ describe('SettingsView · 保存病人档案', () => {
     })
 
     await fieldInput(w, '姓名').setValue('  张三丰  ')
-    await fieldInput(w, '轮椅重量').setValue('22.5')
+    await fieldInput(w, '轮椅及衣物重量').setValue('22.5')
     await fieldInput(w, '回水量').setValue('350')
     await buttonByText(w, '保存档案').trigger('click')
     await flushPromises()
@@ -401,6 +406,15 @@ describe('SettingsView · 保存病人档案', () => {
       createdAt: 1_700_000_000_000,
     })
     expect(saved.updatedAt).toBe(Date.now())
+    // 轮椅及衣物重量从 20 → 22.5：保存成功后要留一条变更记录（需求②），
+    // 日志写成功时提示仍是「已保存」（写失败才有额外提示，见后续用例）
+    expect(repository.addPatientChangeLog).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(repository.addPatientChangeLog).mock.calls[0][0]).toMatchObject({
+      patientId: 'patient-default',
+      field: 'wheelchairWeight',
+      oldValue: 20,
+      newValue: 22.5,
+    })
     expect(mocks.showToast).toHaveBeenCalledWith('已保存')
   })
 
@@ -408,7 +422,7 @@ describe('SettingsView · 保存病人档案', () => {
     const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
 
     await fieldInput(w, '姓名').setValue('   ')
-    await fieldInput(w, '轮椅重量').setValue('')
+    await fieldInput(w, '轮椅及衣物重量').setValue('')
     await fieldInput(w, '回水量').setValue('')
     await buttonByText(w, '保存档案').trigger('click')
     await flushPromises()
@@ -422,7 +436,7 @@ describe('SettingsView · 保存病人档案', () => {
   it('非法输入被拦截成兜底值（number 输入框接受不了字母，解析为 null → 回落默认值）', async () => {
     const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
 
-    await fieldInput(w, '轮椅重量').setValue('abc')
+    await fieldInput(w, '轮椅及衣物重量').setValue('abc')
     await fieldInput(w, '回水量').setValue('一百')
     await buttonByText(w, '保存档案').trigger('click')
     await flushPromises()
@@ -432,18 +446,18 @@ describe('SettingsView · 保存病人档案', () => {
     expect(saved.rinseBackVolume).toBe(300)
   })
 
-  it('轮椅重量为负数 → 拦截并提示，不写库（回归：曾经 -5 会原样入库，首页「实际体重」跟着偏大）', async () => {
+  it('轮椅及衣物重量为负数 → 拦截并提示，不写库（回归：曾经 -5 会原样入库，首页「实际体重」跟着偏大）', async () => {
     const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
 
-    await fieldInput(w, '轮椅重量').setValue('-5')
+    await fieldInput(w, '轮椅及衣物重量').setValue('-5')
     await buttonByText(w, '保存档案').trigger('click')
     await flushPromises()
 
     expect(repository.savePatient).not.toHaveBeenCalled()
-    expect(toastText()).toContain('轮椅重量应在 0~100 之间')
+    expect(toastText()).toContain('轮椅及衣物重量应在 0~100 之间')
   })
 
-  it('回水量 / 轮椅重量超出上限也被拦下，不写库', async () => {
+  it('回水量 / 轮椅及衣物重量超出上限也被拦下，不写库', async () => {
     const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
 
     await fieldInput(w, '回水量').setValue('99999')
@@ -453,11 +467,11 @@ describe('SettingsView · 保存病人档案', () => {
     expect(toastText()).toContain('回水量应在 0~2000 之间')
 
     await fieldInput(w, '回水量').setValue('300')
-    await fieldInput(w, '轮椅重量').setValue('150')
+    await fieldInput(w, '轮椅及衣物重量').setValue('150')
     await buttonByText(w, '保存档案').trigger('click')
     await flushPromises()
     expect(repository.savePatient).not.toHaveBeenCalled()
-    expect(toastText()).toContain('轮椅重量应在 0~100 之间')
+    expect(toastText()).toContain('轮椅及衣物重量应在 0~100 之间')
   })
 })
 
@@ -1159,7 +1173,7 @@ describe('SettingsView · 非创建者的写入收口（H6）', () => {
     expect(btn.classes()).toContain('van-button--disabled')
     expect(w.text()).toContain('仅创建者可修改病人配置')
 
-    await fieldInput(w, '轮椅重量').setValue('99')
+    await fieldInput(w, '轮椅及衣物重量').setValue('99')
     await btn.trigger('click')
     await flushPromises()
 
@@ -1231,7 +1245,7 @@ describe('SettingsView · 版本号', () => {
 })
 
 /**
- * 乐观锁：两个人同时改同一个病人的档案（轮椅重量 / 回水量）。
+ * 乐观锁：两个人同时改同一个病人的档案（轮椅及衣物重量 / 回水量）。
  * 整行覆盖的写法下，后保存的人会把先保存的人刚改的值静默抹掉。
  */
 describe('SettingsView · 乐观锁（多人同时改病人档案）', () => {
@@ -1244,7 +1258,7 @@ describe('SettingsView · 乐观锁（多人同时改病人档案）', () => {
       Object.assign(new Error('冲突'), { name: 'ConflictError' }),
     )
 
-    await fieldInput(w, '轮椅重量').setValue('25')
+    await fieldInput(w, '轮椅及衣物重量').setValue('25')
     await buttonByText(w, '保存档案').trigger('click')
     await flushPromises()
 
@@ -1260,7 +1274,7 @@ describe('SettingsView · 乐观锁（多人同时改病人档案）', () => {
       .mockRejectedValueOnce(Object.assign(new Error('冲突'), { name: 'ConflictError' }))
       .mockResolvedValue('2024-01-10T11:00:00.000000+00:00')
 
-    await fieldInput(w, '轮椅重量').setValue('26')
+    await fieldInput(w, '轮椅及衣物重量').setValue('26')
     await buttonByText(w, '保存档案').trigger('click')
     await flushPromises()
 
@@ -1276,5 +1290,216 @@ describe('SettingsView · 乐观锁（多人同时改病人档案）', () => {
     await flushPromises()
 
     expect(vi.mocked(repository.savePatient).mock.calls[0][1]).toBeNull()
+  })
+})
+
+/**
+ * 轮椅及衣物重量变更记录（需求②）的**运行时行为**。
+ *
+ * 为什么单独一组：`tests/unit/changeLog.spec.ts` 里那几条是「源码级断言」（读 SettingsView.vue
+ * 的文本匹配），能钉住「有没有写这一行、顺序对不对」，但**钉不住运行时行为** ——
+ * 把 `if (wheelchairChanged)` 改成恒真、或把 toast 三分支合并，源码正则都还可能过。
+ * 这里用真实挂载 + mock 调用计数把关。守护的是三个具体缺陷：
+ *   ① 重量没变也写日志 → 用户点十次「保存档案」就多十条假记录，历史失去意义
+ *   ② oldValue 取错时机（在 patient.value 被覆盖之后取）→ 每条都是「X → X」，看不出变化
+ *   ③ 日志写失败被判成「保存失败」→ 档案其实已存，用户反复点击重试
+ */
+describe('SettingsView · 轮椅及衣物重量变更记录（运行时行为）', () => {
+  it('重量没变：不写变更记录（否则反复保存会刷出一堆无意义的历史）', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 20 }) })
+
+    // 什么都不改，直接保存
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    expect(repository.savePatient).toHaveBeenCalledTimes(1)
+    expect(repository.addPatientChangeLog).not.toHaveBeenCalled()
+    expect(mocks.showToast).toHaveBeenCalledWith('已保存')
+  })
+
+  it('重量变了：写一条 old→new，且 oldValue 是保存前的值（不能在覆盖之后取）', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.4 }) })
+
+    await fieldInput(w, '轮椅及衣物重量').setValue('13.5')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    expect(repository.addPatientChangeLog).toHaveBeenCalledTimes(1)
+    const log = vi.mocked(repository.addPatientChangeLog).mock.calls[0][0]
+    expect(log).toMatchObject({
+      patientId: 'patient-default',
+      field: 'wheelchairWeight',
+      // 关键：13.4 是**保存前**的档案值。若在 patient.value = p 之后才取，这里会变成 13.5 → 13.5
+      oldValue: 13.4,
+      newValue: 13.5,
+    })
+    expect(log.changedAt).toBeGreaterThan(0)
+    expect(mocks.showToast).toHaveBeenCalledWith('已保存')
+  })
+
+  it('变更记录写失败：档案仍算保存成功，但提示要明确区分（不能让用户以为档案也没存上）', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.4 }) })
+    vi.mocked(repository.addPatientChangeLog).mockRejectedValueOnce(new Error('offline'))
+
+    await fieldInput(w, '轮椅及衣物重量').setValue('14')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 档案确实写进去了
+    expect(repository.savePatient).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(repository.savePatient).mock.calls[0][0]).toMatchObject({ wheelchairWeight: 14 })
+    // 日志失败被自己吞掉，不会被当成保存失败去重试
+    expect(repository.savePatient).toHaveBeenCalledTimes(1)
+    expect(mocks.showToast).toHaveBeenCalledWith('已保存，但变更记录未能写入（下次保存时会自动补记）')
+    // 绝不能提示成「保存失败」
+    const toasts = mocks.showToast.mock.calls.map((c) => String(c[0]))
+    expect(toasts.some((t) => t.includes('保存失败'))).toBe(false)
+  })
+
+  /**
+   * 评审 M2：**变更记录写失败后必须能补回来**。
+   *
+   * 原实现 `patient.value = p` 在写日志**之前**，所以日志失败后再点保存时
+   * `wheelchairChanged` 为 false → 这条变更永久缺失，提示却只说「请检查网络」，
+   * 用户检查完网络也不知道该做什么。而该功能的价值恰恰是「让用户信得过这份历史」。
+   *
+   * 修法：失败时把这次变更暂存，下次保存自动补写。
+   */
+  describe('评审 M2 · 变更记录写失败后下次保存自动补记', () => {
+    it('第一次写日志失败 → 第二次保存（不改重量）自动补写同一条变更', async () => {
+      const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.4 }) })
+      vi.mocked(repository.addPatientChangeLog).mockRejectedValueOnce(new Error('offline'))
+
+      // 第一次：改重量 + 保存，日志写失败
+      await fieldInput(w, '轮椅及衣物重量').setValue('14')
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+      expect(repository.addPatientChangeLog).toHaveBeenCalledTimes(1)
+      expect(mocks.showToast).toHaveBeenCalledWith('已保存，但变更记录未能写入（下次保存时会自动补记）')
+
+      // 第二次：什么都不改直接再保存 → 必须把上次那条补上
+      mocks.showToast.mockClear()
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+
+      expect(repository.addPatientChangeLog).toHaveBeenCalledTimes(2)
+      const backfilled = vi.mocked(repository.addPatientChangeLog).mock.calls[1][0]
+      // 补写的必须是「13.4 → 14」这条真实变更，不是凭空造的
+      expect(backfilled).toMatchObject({
+        patientId: 'patient-default',
+        field: 'wheelchairWeight',
+        oldValue: 13.4,
+        newValue: 14,
+      })
+      expect(mocks.showToast).toHaveBeenCalledWith('已保存')
+    })
+
+    it('补写成功后不重复：再保存一次不会又写一遍（不会在历史里堆重复条目）', async () => {
+      const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.4 }) })
+      vi.mocked(repository.addPatientChangeLog).mockRejectedValueOnce(new Error('offline'))
+
+      await fieldInput(w, '轮椅及衣物重量').setValue('14')
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+
+      // 第二次保存补写成功
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+      expect(repository.addPatientChangeLog).toHaveBeenCalledTimes(2)
+
+      // 第三次保存：待补项已清空，不该再写
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+      expect(repository.addPatientChangeLog).toHaveBeenCalledTimes(2)
+    })
+
+    it('补写仍然失败：待补项保留，提示明确说「仍未能写入」，下次还能再补', async () => {
+      const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.4 }) })
+      vi.mocked(repository.addPatientChangeLog)
+        .mockRejectedValueOnce(new Error('offline'))
+        .mockRejectedValueOnce(new Error('offline'))
+
+      await fieldInput(w, '轮椅及衣物重量').setValue('14')
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+
+      mocks.showToast.mockClear()
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+      expect(mocks.showToast).toHaveBeenCalledWith('已保存，但变更记录仍未能写入（下次保存时会自动补记）')
+
+      // 网络恢复后的第三次保存要能补上（待补项没被丢弃）
+      mocks.showToast.mockClear()
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+      expect(repository.addPatientChangeLog).toHaveBeenCalledTimes(3)
+      const last = vi.mocked(repository.addPatientChangeLog).mock.calls[2][0]
+      expect(last).toMatchObject({ oldValue: 13.4, newValue: 14 })
+      expect(mocks.showToast).toHaveBeenCalledWith('已保存')
+    })
+
+    it('改重量 + 存在待补项：先补旧的再记新的，历史顺序不乱', async () => {
+      const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.4 }) })
+      vi.mocked(repository.addPatientChangeLog).mockRejectedValueOnce(new Error('offline'))
+
+      // 第一次：13.4 → 14，日志失败，进入待补
+      await fieldInput(w, '轮椅及衣物重量').setValue('14')
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+
+      // 第二次：再改成 15 并保存 → 应先补「13.4 → 14」，再写「14 → 15」
+      await fieldInput(w, '轮椅及衣物重量').setValue('15')
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+
+      expect(repository.addPatientChangeLog).toHaveBeenCalledTimes(3)
+      const calls = vi.mocked(repository.addPatientChangeLog).mock.calls.map((c) => c[0])
+      expect(calls[1]).toMatchObject({ oldValue: 13.4, newValue: 14 }) // 补写的旧变更
+      expect(calls[2]).toMatchObject({ oldValue: 14, newValue: 15 }) // 本次新变更
+    })
+  })
+
+  it('干体重变了但轮椅重量没变：不写变更记录（这个功能只记轮椅及衣物重量）', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 20 }) })
+
+    await fieldInput(w, '回水量').setValue('350')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    expect(repository.savePatient).toHaveBeenCalledTimes(1)
+    expect(repository.addPatientChangeLog).not.toHaveBeenCalled()
+  })
+
+  it('点「变更历史」读到失败：显示错误态 + 重试，绝不显示成「暂无变更记录」', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
+    vi.mocked(repository.listPatientChangeLogs).mockRejectedValueOnce(new Error('offline'))
+
+    await buttonByText(w, '变更历史').trigger('click')
+    await flushPromises()
+
+    const text = w.text()
+    expect(text).toContain('变更记录加载失败')
+    // 关键：不能把「读失败」说成「没有记录」—— 那会让用户以为从没改过重量
+    expect(text).not.toContain('暂无变更记录')
+    expect(buttonByText(w, '重试').exists()).toBe(true)
+    // 读的时候必须绕过缓存，否则刚改完看不到这一条
+    expect(vi.mocked(repository.listPatientChangeLogs).mock.calls[0][1]).toEqual({ fresh: true })
+  })
+
+  it('变更历史按倒序展示 old→new / 时间 / 变更人；老记录没有变更人时显示「未记录」', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
+    vi.mocked(repository.listPatientChangeLogs).mockResolvedValueOnce([
+      makeChangeLog({ id: 'c1', oldValue: 14, newValue: 14.5, operator: '张三', changedAt: 1_700_000_200_000 }),
+      makeChangeLog({ id: 'c2', oldValue: 13.4, newValue: 14, operator: null, changedAt: 1_700_000_100_000 }),
+    ])
+
+    await buttonByText(w, '变更历史').trigger('click')
+    await flushPromises()
+
+    const text = w.text()
+    expect(text).toContain('14.0kg → 14.5kg')
+    expect(text).toContain('13.4kg → 14.0kg')
+    expect(text).toContain('张三')
+    expect(text).toContain('未记录')
   })
 })

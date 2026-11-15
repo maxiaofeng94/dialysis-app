@@ -523,3 +523,239 @@ describe('ReportView · 分享', () => {
     expect(clickSpy).toHaveBeenCalledTimes(1) // 只下载了一次
   })
 })
+
+/**
+ * 需求③（报告页）：血压增加心率。
+ *
+ * 守的缺陷：
+ * - 心率 60~100 与血压 40~200 不同量级，混用一根轴会把血压曲线压扁成一条直线；
+ * - 老记录没有心率，若用 0 补点，心率曲线会贴地，医生会以为患者心动过缓到 0；
+ * - 明细里没有心率却显示「心率 — bpm」是噪声，报告是给医生看的。
+ */
+describe('ReportView · 血压心率（需求③）', () => {
+  /** 取 BaseChart 收到的 option（echarts.init 在这份测试里被打桩，setOption 是唯一出口） */
+  function chartOption(): Record<string, unknown> {
+    const instance = echartsStub.init.mock.results.at(-1)?.value as { setOption: ReturnType<typeof vi.fn> } | undefined
+    if (!instance) throw new Error('echarts 从未初始化：图表没渲染')
+    const last = instance.setOption.mock.calls.at(-1)
+    if (!last) throw new Error('setOption 从未被调用')
+    return last[0] as Record<string, unknown>
+  }
+
+  const bpsWithPulse = [
+    makeBp({ id: 'bp1', measuredAt: new Date('2024-01-10T08:00:00').getTime(), systolic: 130, diastolic: 80, pulse: 78 }),
+    makeBp({ id: 'bp2', measuredAt: new Date('2024-01-10T09:00:00').getTime(), systolic: 150, diastolic: 95, pulse: 92 }),
+  ]
+
+  it('有心率时 legend 出现「心率」，yAxis 变成两根轴的数组', async () => {
+    const w = await mountReport(defaultData({ bps: bpsWithPulse }))
+
+    expect(w.findComponent(BaseChart).exists()).toBe(true)
+    const option = chartOption()
+
+    expect((option.legend as { data: string[] }).data).toEqual(['高压', '低压', '心率'])
+    expect(Array.isArray(option.yAxis)).toBe(true)
+    const yAxis = option.yAxis as { name: string }[]
+    expect(yAxis.map((y) => y.name)).toEqual(['mmHg', 'bpm'])
+    // 副轴不画横向网格线：两条轴的网格会叠成一片，血压曲线更难读
+    expect((yAxis[1] as { splitLine?: { show: boolean } }).splitLine?.show).toBe(false)
+  })
+
+  it('心率序列挂在副轴上（yAxisIndex: 1），否则 60~100 会被 mmHg 的量级压平', async () => {
+    await mountReport(defaultData({ bps: bpsWithPulse }))
+
+    const series = chartOption().series as { name: string; yAxisIndex?: number }[]
+    expect(series.map((s) => s.name)).toEqual(['高压', '低压', '心率'])
+    expect(series[2].yAxisIndex).toBe(1)
+    expect(series[0].yAxisIndex ?? 0).toBe(0)
+    expect(series[1].yAxisIndex ?? 0).toBe(0)
+  })
+
+  it('没有心率的历史数据：只画两条线，yAxis 是单对象而不是数组', async () => {
+    await mountReport(
+      defaultData({
+        bps: [
+          makeBp({ id: 'bp1', measuredAt: new Date('2024-01-10T08:00:00').getTime(), pulse: null }),
+          makeBp({ id: 'bp2', measuredAt: new Date('2024-01-10T09:00:00').getTime(), pulse: null }),
+        ],
+      }),
+    )
+
+    const option = chartOption()
+    expect(Array.isArray(option.yAxis)).toBe(false)
+    expect((option.yAxis as { name: string }).name).toBe('mmHg')
+    expect((option.legend as { data: string[] }).data).toEqual(['高压', '低压'])
+    expect((option.series as unknown[]).map((s) => (s as { name: string }).name)).toEqual(['高压', '低压'])
+    // 网格右侧不留副轴的位置，图更宽
+    expect((option.grid as { right: number }).right).toBe(20)
+  })
+
+  it('部分有部分没有心率：仍启用双轴，缺失点是 null（断点）而不是 0', async () => {
+    await mountReport(
+      defaultData({
+        bps: [
+          makeBp({ id: 'bp1', measuredAt: new Date('2024-01-10T08:00:00').getTime(), pulse: 78 }),
+          makeBp({ id: 'bp2', measuredAt: new Date('2024-01-10T09:00:00').getTime(), pulse: null }),
+          makeBp({ id: 'bp3', measuredAt: new Date('2024-01-10T10:00:00').getTime(), pulse: 90 }),
+        ],
+      }),
+    )
+
+    const option = chartOption()
+    expect(Array.isArray(option.yAxis)).toBe(true)
+    const pulseSeries = (option.series as { name: string; data: (number | null)[] }[]).find((s) => s.name === '心率')!
+    // 断点必须是 null：填 0 会把曲线拽到地板上，看起来像心率掉到 0
+    expect(pulseSeries.data).toEqual([78, null, 90])
+    expect(pulseSeries.data[1]).not.toBe(0)
+  })
+
+  it('明细里有心率时显示「心率 N bpm」，没有时不显示占位', async () => {
+    const w = await mountReport(
+      defaultData({
+        bps: [
+          makeBp({ id: 'bp1', measuredAt: new Date('2024-01-10T08:00:00').getTime(), pulse: 78 }),
+          makeBp({ id: 'bp2', measuredAt: new Date('2024-01-10T09:00:00').getTime(), pulse: null }),
+        ],
+      }),
+    )
+
+    const kvs = w.findAll('.kv').filter((k) => k.find('.k').text().includes(':'))
+    expect(kvs[0].find('.pulse-inline').text()).toBe('· 心率 78 bpm')
+    // 老记录：不渲染占位（不是「心率 — bpm」）
+    expect(kvs[1].find('.pulse-inline').exists()).toBe(false)
+    expect(kvs[1].text()).not.toContain('bpm')
+  })
+
+  it('报告写明轮椅及衣物重量的口径：已完成的用快照，进行中的标注「按当前档案计算」', async () => {
+    const completed = await mountReport(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          date: '2024-01-10',
+          status: 'completed',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          wheelchairWeightUsed: 13.4,
+        }),
+        patient: makePatient({ wheelchairWeight: 10 }),
+      }),
+    )
+    const metas = completed.findAll('.report-meta').map((m) => m.text())
+    const wheelchairMeta = metas.find((t) => t.includes('轮椅及衣物'))
+    expect(wheelchairMeta).toContain('13.4kg') // 快照，不是档案的 10
+    expect(wheelchairMeta).not.toContain('按当前档案计算')
+  })
+
+  it('进行中的报告：轮椅及衣物跟着当前档案，并标注「（进行中，按当前档案计算）」', async () => {
+    const w = await mountReport(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          date: '2024-01-10',
+          status: 'ongoing',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          wheelchairWeightUsed: 13.4,
+        }),
+        patient: makePatient({ wheelchairWeight: 10 }),
+      }),
+    )
+
+    // 上机前实际按当前档案算：80 - 10 = 70.0
+    expect(w.findAll('.rval')[0].text()).toBe('70.0kg')
+    const wheelchairMeta = w.findAll('.report-meta').map((m) => m.text()).find((t) => t.includes('轮椅及衣物'))
+    expect(wheelchairMeta).toContain('10.0kg')
+    expect(wheelchairMeta).toContain('按当前档案计算')
+  })
+
+  it('分享文本带上心率和轮椅及衣物重量（家属发给医生的那段文字）', async () => {
+    const shareSpy = vi.fn(async () => undefined)
+    Object.defineProperty(navigator, 'share', { value: shareSpy, configurable: true })
+    Object.defineProperty(navigator, 'canShare', { value: () => true, configurable: true })
+    const w = await mountReport(defaultData({ bps: bpsWithPulse }))
+
+    await w.find('.van-nav-bar .van-icon-share-o').trigger('click')
+    await flushPromises()
+
+    const text = (shareSpy.mock.calls[0][0] as { text: string }).text
+    expect(text).toContain('血压：08:00 130/80（心率 78）；09:00 150/95（心率 92）')
+    expect(text).toContain('轮椅及衣物')
+  })
+
+  it('分享文本里没有心率的血压不写「（心率 …）」（不能凭空补 0）', async () => {
+    const shareSpy = vi.fn(async () => undefined)
+    Object.defineProperty(navigator, 'share', { value: shareSpy, configurable: true })
+    Object.defineProperty(navigator, 'canShare', { value: () => true, configurable: true })
+    const w = await mountReport(
+      defaultData({
+        bps: [makeBp({ id: 'bp1', measuredAt: new Date('2024-01-10T08:00:00').getTime(), pulse: null })],
+      }),
+    )
+
+    await w.find('.van-nav-bar .van-icon-share-o').trigger('click')
+    await flushPromises()
+
+    const text = (shareSpy.mock.calls[0][0] as { text: string }).text
+    expect(text).toContain('08:00 130/80')
+    expect(text).not.toContain('心率')
+  })
+
+  /**
+   * 评审 L1：分享文本也要写清「轮椅及衣物重量」的口径。
+   *
+   * 面板上已经写了「进行中，按当前档案计算」/「本次记录当时的值」，但分享文本是
+   * 家属直接发给医生的那段字 —— 只发数字不说口径，医生无法判断这个重量是这次透析
+   * 当时的、还是后来改档案改过的，进而无法复核实际体重。
+   */
+  it('分享文本标明口径：已完成的记录写「本次记录当时的值」', async () => {
+    const shareSpy = vi.fn(async () => undefined)
+    Object.defineProperty(navigator, 'share', { value: shareSpy, configurable: true })
+    Object.defineProperty(navigator, 'canShare', { value: () => true, configurable: true })
+    const w = await mountReport(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'completed',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          wheelchairWeightUsed: 13.4,
+        }),
+        patient: makePatient({ wheelchairWeight: 10 }),
+      }),
+    )
+
+    await w.find('.van-nav-bar .van-icon-share-o').trigger('click')
+    await flushPromises()
+
+    const text = (shareSpy.mock.calls[0][0] as { text: string }).text
+    // 快照值 13.4，不是档案的 10
+    expect(text).toContain('轮椅及衣物 13.4kg')
+    expect(text).toContain('本次记录当时的值')
+    expect(text).not.toContain('按当前档案计算')
+  })
+
+  it('分享文本标明口径：进行中的记录写「进行中，按当前档案计算」', async () => {
+    const shareSpy = vi.fn(async () => undefined)
+    Object.defineProperty(navigator, 'share', { value: shareSpy, configurable: true })
+    Object.defineProperty(navigator, 'canShare', { value: () => true, configurable: true })
+    const w = await mountReport(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'ongoing',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          wheelchairWeightUsed: 13.4,
+        }),
+        patient: makePatient({ wheelchairWeight: 10 }),
+      }),
+    )
+
+    await w.find('.van-nav-bar .van-icon-share-o').trigger('click')
+    await flushPromises()
+
+    const text = (shareSpy.mock.calls[0][0] as { text: string }).text
+    expect(text).toContain('轮椅及衣物 10.0kg')
+    expect(text).toContain('按当前档案计算')
+  })
+})

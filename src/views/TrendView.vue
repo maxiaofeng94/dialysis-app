@@ -7,12 +7,13 @@ import { useSessionExpiryRedirect } from '../lib/sessionExpiry'
 import { formatTime } from '../utils/format'
 import { computeSession, getEffectiveDryWeight } from '../utils/calc'
 import BaseChart from '../components/BaseChart.vue'
-import type { DryWeight, DialysisSession } from '../types'
+import type { DryWeight, DialysisSession, Patient } from '../types'
 
 const active = ref(0)
+const patient = ref<Patient | null>(null)
 const dryWeights = ref<DryWeight[]>([])
 const sessions = ref<DialysisSession[]>([])
-const bpTrend = ref<{ time: number; date: string; systolic: number; diastolic: number }[]>([])
+const bpTrend = ref<{ time: number; date: string; systolic: number; diastolic: number; pulse: number | null }[]>([])
 const gluTrend = ref<{ time: number; date: string; value: number }[]>([])
 
 /** 首次加载（本机还没有缓存）时的骨架占位 */
@@ -37,7 +38,14 @@ watch(cacheVersion, () => {
 async function load() {
   const pid = currentPatientId.value
   try {
-    const [dw, ss] = await Promise.all([repository.listDryWeights(pid), repository.listSessions(pid)])
+    // patient 必须有：进行中的记录按「当前档案」的轮椅及衣物重量 / 回水量计算（需求①），
+    // 不加载档案的话趋势页的体重曲线会退化成按快照算的旧值，和详情页对不上。
+    const [p, dw, ss] = await Promise.all([
+      repository.getPatient(pid),
+      repository.listDryWeights(pid),
+      repository.listSessions(pid),
+    ])
+    patient.value = p ?? null
     dryWeights.value = dw
     sessions.value = ss
     loadError.value = false
@@ -76,6 +84,7 @@ async function loadBpTrend() {
       date: dateOf.get(bp.sessionId) ?? '',
       systolic: bp.systolic,
       diastolic: bp.diastolic,
+      pulse: bp.pulse ?? null,
     }))
     all.sort((a, b) => a.time - b.time)
     bpTrend.value = all
@@ -139,8 +148,8 @@ function withUnit(unit: string) {
 const weightOption = computed(() => {
   const recent = [...sessions.value].sort((a, b) => a.date.localeCompare(b.date)).slice(-30)
   const dates = recent.map((s) => s.date.slice(5))
-  const pre = recent.map((s) => computeSession(s, getEffectiveDryWeight(dryWeights.value, s.date)).preWeightActual)
-  const post = recent.map((s) => computeSession(s, getEffectiveDryWeight(dryWeights.value, s.date)).postWeightActual)
+  const pre = recent.map((s) => computeSession(s, getEffectiveDryWeight(dryWeights.value, s.date), patient.value).preWeightActual)
+  const post = recent.map((s) => computeSession(s, getEffectiveDryWeight(dryWeights.value, s.date), patient.value).postWeightActual)
   const dry = recent.map((s) => getEffectiveDryWeight(dryWeights.value, s.date))
   return {
     tooltip: { trigger: 'axis', valueFormatter: withUnit('kg') },
@@ -156,17 +165,59 @@ const weightOption = computed(() => {
   }
 })
 
-const bpOption = computed(() => ({
-  tooltip: { trigger: 'axis', valueFormatter: withUnit('mmHg') },
-  legend: { top: 0, left: 'center', itemGap: 14, itemWidth: 16, itemHeight: 10, textStyle: { fontSize: 12 }, data: ['高压', '低压'] },
-  grid: { left: 42, right: 20, top: 48, bottom: 66 },
-  xAxis: { type: 'category', data: bpTrend.value.map((b) => `${b.date.slice(5)} ${formatTime(b.time)}`), axisLabel: { rotate: 30 } },
-  yAxis: autoValueAxis(bpTrend.value.flatMap((b) => [b.systolic, b.diastolic]), { name: 'mmHg', flatSpan: 20, windowSpan: 40, interval: 10 }),
-  series: [
-    { name: '高压', type: 'line', smooth: true, color: '#ee0a24', data: bpTrend.value.map((b) => b.systolic) },
-    { name: '低压', type: 'line', smooth: true, color: '#1989fa', data: bpTrend.value.map((b) => b.diastolic) },
-  ],
-}))
+/** 有任意一条血压带心率时才画心率曲线（老数据全没心率时不该多出一根空轴） */
+const hasBpPulse = computed(() => bpTrend.value.some((b) => b.pulse != null))
+/** 有实测心率的点才参与副轴自适应，避免被一堆 null 干扰 */
+const pulseValues = computed(() => bpTrend.value.map((b) => b.pulse))
+
+const bpOption = computed(() => {
+  const dual = hasBpPulse.value
+  return {
+    // 双轴时两根轴的量纲不同（mmHg / bpm），不能统一用 withUnit —— 按 series 名分别加单位
+    tooltip: dual
+      ? {
+          trigger: 'axis',
+          valueFormatter: (v: unknown, params?: { seriesName?: string }) =>
+            typeof v === 'number' ? `${v} ${params?.seriesName === '心率' ? 'bpm' : 'mmHg'}` : '—',
+        }
+      : { trigger: 'axis', valueFormatter: withUnit('mmHg') },
+    legend: {
+      top: 0,
+      left: 'center',
+      itemGap: 14,
+      itemWidth: 16,
+      itemHeight: 10,
+      textStyle: { fontSize: 12 },
+      data: dual ? ['高压', '低压', '心率'] : ['高压', '低压'],
+    },
+    grid: { left: 42, right: dual ? 46 : 20, top: 48, bottom: 66 },
+    xAxis: { type: 'category', data: bpTrend.value.map((b) => `${b.date.slice(5)} ${formatTime(b.time)}`), axisLabel: { rotate: 30 } },
+    // 心率与血压量级差太大（60~100 vs 40~200），混一根轴会把血压曲线压成一条直线 → 用右侧副轴
+    yAxis: dual
+      ? [
+          autoValueAxis(bpTrend.value.flatMap((b) => [b.systolic, b.diastolic]), { name: 'mmHg', flatSpan: 20, windowSpan: 40, interval: 10 }),
+          autoValueAxis(pulseValues.value, { name: 'bpm', flatSpan: 20, windowSpan: 40, interval: 10 }),
+        ]
+      : autoValueAxis(bpTrend.value.flatMap((b) => [b.systolic, b.diastolic]), { name: 'mmHg', flatSpan: 20, windowSpan: 40, interval: 10 }),
+    series: [
+      { name: '高压', type: 'line', smooth: true, color: '#ee0a24', data: bpTrend.value.map((b) => b.systolic) },
+      { name: '低压', type: 'line', smooth: true, color: '#1989fa', data: bpTrend.value.map((b) => b.diastolic) },
+      ...(dual
+        ? [
+            {
+              name: '心率',
+              type: 'line',
+              smooth: true,
+              color: '#ff976a',
+              yAxisIndex: 1,
+              // null = 该次没记心率 → ECharts 画断点（填 0 会把曲线拽到地板）
+              data: bpTrend.value.map((b) => b.pulse),
+            },
+          ]
+        : []),
+    ],
+  }
+})
 
 const gluOption = computed(() => ({
   tooltip: { trigger: 'axis', valueFormatter: withUnit('mmol/L') },

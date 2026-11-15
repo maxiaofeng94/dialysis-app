@@ -1,16 +1,39 @@
-import type { Patient, DryWeight, DialysisSession, BloodPressure, BloodGlucose, BloodFlow, AdverseReaction } from '../types'
+import type {
+  Patient,
+  DryWeight,
+  DialysisSession,
+  BloodPressure,
+  BloodGlucose,
+  BloodFlow,
+  AdverseReaction,
+  PatientChangeLog,
+} from '../types'
 
 export interface Repository {
   /** 读病人档案；`opts.fresh` 含义同 `getSession`（乐观锁冲突后重新加载要用） */
   getPatient(id: string, opts?: { fresh?: boolean }): Promise<Patient | undefined>
   /**
-   * 保存病人档案（轮椅重量 / 回水量 / 姓名 / 生日，**整行覆盖**）。
+   * 保存病人档案（轮椅及衣物重量 / 回水量 / 姓名 / 生日，**整行覆盖**）。
    *
    * 乐观锁的用法与 `saveSession` 完全一致：`expectedUpdatedAt` 传
    * `Patient.updatedAtIso`，只有库里的版本没变时才写入，否则抛 `ConflictError`。
-   * 两人同时改档案时，后保存的人不会静默抹掉对方刚改的轮椅重量。
+   * 两人同时改档案时，后保存的人不会静默抹掉对方刚改的轮椅及衣物重量。
    */
   savePatient(patient: Patient, expectedUpdatedAt?: string | null): Promise<string | null>
+
+  /**
+   * 读病人档案的变更记录（目前只有「轮椅及衣物重量」），按变更时间**倒序**。
+   *
+   * 只追加、不修改不删除（云端不建 update / delete 策略），所以这份历史本身就是审计依据。
+   */
+  listPatientChangeLogs(patientId: string, opts?: { fresh?: boolean }): Promise<PatientChangeLog[]>
+  /**
+   * 追加一条病人配置变更记录。
+   *
+   * 不参与乐观锁：它只是往日志表里追加一行，不同调用方各写各的行，天然不会互相覆盖。
+   * 调用方必须保证 `operator_id` 是当前登录用户（云端 RLS 会拦伪造）。
+   */
+  addPatientChangeLog(log: PatientChangeLog): Promise<void>
 
   listDryWeights(patientId: string): Promise<DryWeight[]>
   saveDryWeight(dryWeight: DryWeight): Promise<void>

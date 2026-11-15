@@ -33,6 +33,9 @@ const NOT_VERSIONED: Record<string, string> = {
   deleteBloodGlucose: '按 id 删除',
   saveBloodFlow: '同血压',
   deleteBloodFlow: '按 id 删除',
+  addPatientChangeLog:
+    '变更记录是**只追加**的日志表（数据库层不建 update/delete 策略）：每行一个新 uuid，' +
+    '不同调用方各写各的行，天然不会互相覆盖；篡改风险由「没有写策略」杜绝，不需要版本比对',
   importAll: '整库导入，调用前已有「会覆盖本机云端数据」的二次确认',
 }
 
@@ -64,10 +67,13 @@ describe('乐观锁覆盖守卫', () => {
   /**
    * 关键的一条：新增写方法时这里会红 —— 逼着人去想「这个要不要乐观锁」，
    * 而不是像上次那样漏掉。归类后把方法名加到上面两个清单之一即可。
+   *
+   * 前缀清单里 `add` 是新加的：`addPatientChangeLog` 这种「只追加」的写法同样是写操作，
+   * 漏掉这个前缀等于给它开了后门（守卫根本看不见它）。
    */
   it('接口里的写方法都被显式归类（新增写方法必须想清楚要不要乐观锁）', () => {
     const declared = [...src.matchAll(/^ {2}(\w+)\(/gm)].map((m) => m[1])
-    const writes = declared.filter((m) => /^(save|replace|delete|import)/.test(m))
+    const writes = declared.filter((m) => /^(save|replace|delete|import|add|update|upsert|set)/.test(m))
     const classified = [...VERSIONED, ...Object.keys(NOT_VERSIONED)]
 
     expect(writes.filter((m) => !classified.includes(m))).toEqual([])

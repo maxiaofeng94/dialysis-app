@@ -61,6 +61,7 @@ create table if not exists public.blood_pressures (
   measured_at timestamptz not null,
   systolic int not null,
   diastolic int not null,
+  pulse int,                                           -- 心率（bpm），选填；老数据为 null
   note text
 );
 
@@ -89,6 +90,19 @@ create table if not exists public.adverse_reactions (
   recorded_at timestamptz not null default now()
 );
 
+-- 病人配置变更记录（App 端「轮椅及衣物重量」的变更历史）
+-- 只追加、不修改不删除：数据库层不建 update / delete 策略。
+-- 不复用 admin_audit_logs：那张表只给管理员读，App 端用户看不到，等于没有留痕。
+create table if not exists public.patient_change_logs (
+  id          uuid primary key default gen_random_uuid(),
+  patient_id  uuid not null references public.patients(id) on delete cascade,
+  field       text not null,                     -- 目前只有 wheelchairWeight，结构上留扩展
+  old_value   numeric,
+  new_value   numeric,
+  operator_id uuid references public.users(id) on delete set null,
+  changed_at  timestamptz not null default now()
+);
+
 -- ---------- 3. 成员表 ----------
 
 create table if not exists public.patient_members (
@@ -106,6 +120,8 @@ alter table public.sessions add column if not exists doctor_uf numeric;
 alter table public.sessions add column if not exists aborted_at timestamptz;
 alter table public.sessions add column if not exists abort_tags text[] not null default '{}';
 alter table public.sessions add column if not exists abort_reason text;
+-- 心率（bpm）：对已建过旧版 schema 的库补列；老数据为 null（界面显示「未记录」）
+alter table public.blood_pressures add column if not exists pulse int;
 
 -- operator_id 改为引用 public.users（原先指向 auth.users，PostgREST 无法关联出姓名）
 alter table public.sessions drop constraint if exists sessions_operator_id_fkey;
@@ -122,6 +138,7 @@ create index if not exists idx_bp_session on public.blood_pressures(session_id);
 create index if not exists idx_bg_session on public.blood_glucoses(session_id);
 create index if not exists idx_bf_session on public.blood_flows(session_id);
 create index if not exists idx_ar_session on public.adverse_reactions(session_id);
+create index if not exists idx_pcl_patient on public.patient_change_logs(patient_id, changed_at desc);
 create index if not exists idx_members_patient on public.patient_members(patient_id);
 create index if not exists idx_members_user on public.patient_members(user_id);
 
@@ -294,6 +311,16 @@ create policy ar_update on public.adverse_reactions for update using (
 );
 create policy ar_delete on public.adverse_reactions for delete using (
   exists (select 1 from public.sessions s where s.id = session_id and public.is_member(s.patient_id, array['owner','caregiver']))
+);
+
+-- 病人配置变更记录：成员可读；owner 可追加（且只能记成自己）。**不建 update / delete 策略** → 日志不可篡改。
+alter table public.patient_change_logs enable row level security;
+drop policy if exists pcl_select on public.patient_change_logs;
+drop policy if exists pcl_insert on public.patient_change_logs;
+create policy pcl_select on public.patient_change_logs for select using (public.is_member(patient_id));
+create policy pcl_insert on public.patient_change_logs for insert with check (
+  public.is_member(patient_id, array['owner'])
+  and operator_id = auth.uid()
 );
 
 -- 成员表：成员可看成员列表；owner 可增删改

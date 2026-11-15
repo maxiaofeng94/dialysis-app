@@ -54,13 +54,30 @@ async function savePatient() {
     ElMessage.warning('病人姓名不能为空')
     return
   }
+  // 评审 M3：输入框不再用 :max 静默钳制，范围校验放到这里显式做 ——
+  // 超范围要**报错并说明原因**，不能悄悄改成一个看起来合法的值。
+  const wheelchair = Number(form.wheelchairWeight)
+  const rinse = Number(form.rinseBackVolume)
+  if (!Number.isFinite(wheelchair) || wheelchair < 0 || wheelchair > 100) {
+    // 老数据误按「克」填过（如 13000/20000）会命中这里：提示要说清单位，管理员才知道怎么改
+    ElMessage.error(
+      wheelchair > 100
+        ? `轮椅及衣物重量 ${wheelchair} 超出范围（单位是 kg，应在 0~100 之间；若填的是克请除以 1000）`
+        : '轮椅及衣物重量应在 0~100 kg 之间',
+    )
+    return
+  }
+  if (!Number.isFinite(rinse) || rinse < 0 || rinse > 5000) {
+    ElMessage.error('回水量应在 0~5000 ml 之间')
+    return
+  }
   busy.value = true
   try {
     await api.updatePatient(patientId.value, {
       name: form.name.trim(),
       birthday: form.birthday || '',
-      wheelchairWeight: Number(form.wheelchairWeight) || 0,
-      rinseBackVolume: Number(form.rinseBackVolume) || 0,
+      wheelchairWeight: wheelchair,
+      rinseBackVolume: rinse,
     })
     ElMessage.success('病人配置已保存')
     await load()
@@ -205,11 +222,18 @@ async function doDeletePatient() {
         <el-form-item label="出生日期">
           <el-date-picker v-model="form.birthday" type="date" value-format="YYYY-MM-DD" placeholder="可不填" style="width: 100%" />
         </el-form-item>
-        <el-form-item label="轮椅重量(g)">
-          <el-input-number v-model="form.wheelchairWeight" :min="0" :max="100000" :step="500" style="width: 100%" />
+        <el-form-item label="轮椅及衣物重量">
+          <!-- 单位是 kg（库里 wheelchair_weight 就是 kg）。这里曾误标成「(g)」，
+               管理员会照着克去填（如 13000），档案一经保存把 App 的实际体重算成负数。
+               ⚠️ 这里刻意**不设 :max**（评审 M3）：`el-input-number` 的 max 会**静默钳制**
+               绑定的值 —— 老数据里若存着克单位的 20000，一进页面就被改成 100 并显示 100，
+               管理员改个姓名保存，就把这条脏数据「合法化」成了 100kg，全程没有任何提示。
+               改成：照实显示真实值，超出范围由 savePatient 显式拦下并说明原因。 -->
+          <el-input-number v-model="form.wheelchairWeight" :min="0" :step="0.1" :precision="1" style="width: 100%" />
         </el-form-item>
         <el-form-item label="回水量(ml)">
-          <el-input-number v-model="form.rinseBackVolume" :min="0" :max="5000" :step="50" style="width: 100%" />
+          <!-- 同理不设 :max，超范围在保存时显式报错（回水量填成 300000 会让机器脱水量离谱） -->
+          <el-input-number v-model="form.rinseBackVolume" :min="0" :step="50" style="width: 100%" />
         </el-form-item>
         <el-form-item>
           <el-button type="primary" :loading="busy" @click="savePatient">保存配置</el-button>

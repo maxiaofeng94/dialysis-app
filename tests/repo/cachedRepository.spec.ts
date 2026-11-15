@@ -11,12 +11,15 @@
  */
 import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest'
 import { watch } from 'vue'
-import { makePatient, makeDryWeight, makeSession, makeBp, makeBg, makeBf, makeReaction } from '../helpers/factories'
+import { makePatient, makeDryWeight, makeSession, makeBp, makeBg, makeBf, makeReaction, makeChangeLog } from '../helpers/factories'
 
 /** 云端仓储桩：所有方法都可在用例里改实现 / 断言调用 */
 const cloud = vi.hoisted(() => ({
   getPatient: vi.fn(),
   savePatient: vi.fn(),
+  // 需求②：病人配置变更记录（patient_change_logs）—— 只加方法，不改动已有桩的行为
+  listPatientChangeLogs: vi.fn(),
+  addPatientChangeLog: vi.fn(),
   listDryWeights: vi.fn(),
   saveDryWeight: vi.fn(),
   deleteDryWeight: vi.fn(),
@@ -93,6 +96,8 @@ function resetCloudMocks() {
   for (const fn of Object.values(cloud)) (fn as Mock).mockReset()
   cloud.getPatient.mockResolvedValue(undefined)
   cloud.savePatient.mockResolvedValue(undefined)
+  cloud.listPatientChangeLogs.mockResolvedValue([])
+  cloud.addPatientChangeLog.mockResolvedValue(undefined)
   cloud.listDryWeights.mockResolvedValue([])
   cloud.saveDryWeight.mockResolvedValue(undefined)
   cloud.deleteDryWeight.mockResolvedValue(undefined)
@@ -720,7 +725,7 @@ describe('cachedRepository · 写操作：先落云端再更新缓存', () => {
     // 第二个参数是乐观锁版本号（这里没传 = 不做版本检查）
     expect(cloud.savePatient).toHaveBeenCalledWith(p, undefined)
     expect((await cacheGet<typeof p>('patient:p1'))?.value).toEqual(p)
-    // 列表页显示的还是旧轮椅重量的话，用户会以为没保存上
+    // 列表页显示的还是旧轮椅及衣物重量的话，用户会以为没保存上
     const list = (await cacheGet<{ patient: { wheelchairWeight: number } }[]>('myPatients:u1'))!.value
     expect(list[0].patient.wheelchairWeight).toBe(21)
   })
@@ -929,5 +934,225 @@ describe('cachedRepository · 导入导出直接透传', () => {
 
     expect(await cachedCloudRepository.exportAll()).toBe('{"version":1}')
     expect(await cacheKeysByPrefix('')).toEqual([])
+  })
+})
+
+/**
+ * 需求②：病人配置变更记录的缓存层。
+ *
+ * 守的缺陷（真实场景）：用户在设置页把「轮椅及衣物重量」13.4 改成 13.5，
+ * 保存成功、日志也写进库了，紧接着点「变更历史」—— 如果命中旧缓存，
+ * 列表里**刚改完的这条不出现**，用户会以为「变更记录没生成」，
+ * 而这个功能存在的意义就是让他信得过这份历史。
+ */
+describe('cachedRepository · 病人配置变更记录', () => {
+  it('首次读取没有缓存时请求云端，并把结果写进 patientChangeLogs:<pid>', async () => {
+    const list = [makeChangeLog({ id: 'l1', patientId: 'p1', changedAt: 2000 })]
+    cloud.listPatientChangeLogs.mockResolvedValue(list)
+
+    const got = await cachedCloudRepository.listPatientChangeLogs('p1')
+
+    expect(got).toEqual(list)
+    expect(cloud.listPatientChangeLogs).toHaveBeenCalledWith('p1')
+    expect((await cacheGet<typeof list>('patientChangeLogs:p1'))?.value).toEqual(list)
+  })
+
+  it('云端无记录时缓存空数组（下次命中缓存，不会反复空跑网络）', async () => {
+    expect(await cachedCloudRepository.listPatientChangeLogs('p1')).toEqual([])
+    expect((await cacheGet<unknown[]>('patientChangeLogs:p1'))?.value).toEqual([])
+
+    expect(await cachedCloudRepository.listPatientChangeLogs('p1')).toEqual([])
+    expect(cloud.listPatientChangeLogs).toHaveBeenCalledTimes(1)
+  })
+
+  it('fresh: true 时绕过旧缓存直接读云端（「重新加载」必须看到最新历史）', async () => {
+    await cacheSet('patientChangeLogs:p1', [makeChangeLog({ id: 'stale', patientId: 'p1' })])
+    cloud.listPatientChangeLogs.mockResolvedValue([makeChangeLog({ id: 'fresh', patientId: 'p1' })])
+
+    const got = await cachedCloudRepository.listPatientChangeLogs('p1', { fresh: true })
+
+    expect(got.map((l) => l.id)).toEqual(['fresh'])
+    expect(cloud.listPatientChangeLogs).toHaveBeenCalledTimes(1)
+  })
+
+  it('读失败时抛错，不静默返回空数组（空列表会被界面当成「从未改过」）', async () => {
+    cloud.listPatientChangeLogs.mockRejectedValue(new Error('查询失败（patient_change_logs）'))
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await expect(cachedCloudRepository.listPatientChangeLogs('p1')).rejects.toThrow('查询失败')
+    expect(await cacheGet('patientChangeLogs:p1')).toBeNull()
+    errSpy.mockRestore()
+  })
+
+  it('按病人隔离：不同病人的 key 互不干扰', async () => {
+    cloud.listPatientChangeLogs.mockImplementation(async (pid: string) => [
+      makeChangeLog({ id: `l-${pid}`, patientId: pid }),
+    ])
+
+    await cachedCloudRepository.listPatientChangeLogs('p1')
+    await cachedCloudRepository.listPatientChangeLogs('p2')
+
+    expect((await cacheGet<{ id: string }[]>('patientChangeLogs:p1'))!.value.map((l) => l.id)).toEqual(['l-p1'])
+    expect((await cacheGet<{ id: string }[]>('patientChangeLogs:p2'))!.value.map((l) => l.id)).toEqual(['l-p2'])
+  })
+
+  it('addPatientChangeLog 先落云端，成功后再动缓存', async () => {
+    const log = makeChangeLog({ id: 'l1', patientId: 'p1' })
+
+    await cachedCloudRepository.addPatientChangeLog(log)
+
+    expect(cloud.addPatientChangeLog).toHaveBeenCalledWith(log)
+  })
+
+  it('云端写失败时抛错，且不往缓存里塞一条「不存在」的记录', async () => {
+    await cacheSet('patientChangeLogs:p1', [makeChangeLog({ id: 'old', patientId: 'p1' })])
+    cloud.addPatientChangeLog.mockRejectedValue(new Error('写入被 RLS 拦截'))
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await expect(
+      cachedCloudRepository.addPatientChangeLog(makeChangeLog({ id: 'new', patientId: 'p1' })),
+    ).rejects.toThrow('写入被 RLS 拦截')
+
+    expect((await cacheGet<{ id: string }[]>('patientChangeLogs:p1'))!.value.map((l) => l.id)).toEqual(['old'])
+    errSpy.mockRestore()
+  })
+
+  /**
+   * 这条是本需求的核心：追加成功后**立刻**能读到新条目，不用等刷新。
+   * 之前设置页保存完马上弹「变更历史」，看到的还是旧列表。
+   *
+   * 评审 L2 后实现改成「写成功就删掉这个 key」，让下一次读走云端 —— 于是这里
+   * 断言的是「不会读到旧列表」，而不是「缓存里被 unshift 了一条」。两种实现都能
+   * 让用户立刻看到新条目，但删 key 的方式能保证 `operator` 等字段与云端同源。
+   */
+  it('追加成功后不会读到旧列表（缓存 key 已失效，下一次读走云端拿最新）', async () => {
+    const existing = [
+      makeChangeLog({ id: 'l-newer', patientId: 'p1', changedAt: 3000 }),
+      makeChangeLog({ id: 'l-older', patientId: 'p1', changedAt: 1000 }),
+    ]
+    await cacheSet('patientChangeLogs:p1', existing)
+    const added = makeChangeLog({ id: 'l-just-now', patientId: 'p1', changedAt: 5000 })
+
+    await cachedCloudRepository.addPatientChangeLog(added)
+
+    // 缓存 key 已被删除（不是被就地改写成含新条目的列表）
+    expect(await cacheGet('patientChangeLogs:p1')).toBeNull()
+    // 下一次读必须打到云端，拿回的就是含新条目的最新列表
+    cloud.listPatientChangeLogs.mockResolvedValue([added, ...existing])
+    const got = await cachedCloudRepository.listPatientChangeLogs('p1')
+    expect(got.map((l) => l.id)).toEqual(['l-just-now', 'l-newer', 'l-older'])
+    expect(cloud.listPatientChangeLogs).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * 评审 L2：**缓存里的变更记录必须与云端同源**。
+   *
+   * 旧实现把客户端上报的 log 直接 unshift 进缓存，而两边的 `operator` 来源不同：
+   * 客户端上报的是「本页已知的我的姓名」，云端读回来的是 `users(name, phone)` join。
+   * 用户改了姓名之后，缓存里这条显示旧名、重新进页面显示新名 —— 同一条记录两副面孔，
+   * 正好毁掉这份历史存在的意义（让用户信得过）。
+   */
+  it('追加后不在缓存里塞客户端上报的 operator（避免与云端 join 出来的姓名不一致）', async () => {
+    await cacheSet('patientChangeLogs:p1', [makeChangeLog({ id: 'old', patientId: 'p1' })])
+    // 客户端上报的名字是旧的（用户还没改名）
+    const added = makeChangeLog({ id: 'l1', patientId: 'p1', operator: '旧名字' })
+
+    await cachedCloudRepository.addPatientChangeLog(added)
+
+    // 缓存被删掉，而不是留下一条 operator='旧名字' 的记录
+    expect(await cacheGet('patientChangeLogs:p1')).toBeNull()
+
+    // 云端读回来的是 join 后的新名字
+    cloud.listPatientChangeLogs.mockResolvedValue([makeChangeLog({ id: 'l1', patientId: 'p1', operator: '新名字' })])
+    const got = await cachedCloudRepository.listPatientChangeLogs('p1')
+    expect(got[0].operator).toBe('新名字')
+  })
+
+  it('缓存里没有列表时也不无中生有（只落云端，等下次读再建缓存）', async () => {
+    await cachedCloudRepository.addPatientChangeLog(makeChangeLog({ id: 'l1', patientId: 'p1' }))
+
+    expect(await cacheGet('patientChangeLogs:p1')).toBeNull()
+    expect(cloud.addPatientChangeLog).toHaveBeenCalledTimes(1)
+  })
+
+  it('同一 id 重复追加不会在缓存里出现两条', async () => {
+    const log = makeChangeLog({ id: 'l1', patientId: 'p1', changedAt: 4000 })
+    await cacheSet('patientChangeLogs:p1', [log])
+
+    await cachedCloudRepository.addPatientChangeLog({ ...log, newValue: 14 })
+
+    // 缓存 key 被删，云端是覆盖语义（同 id 不会产生第二行）→ 读回来只有一条
+    expect(await cacheGet('patientChangeLogs:p1')).toBeNull()
+    cloud.listPatientChangeLogs.mockResolvedValue([{ ...log, newValue: 14 }])
+    const got = await cachedCloudRepository.listPatientChangeLogs('p1')
+    expect(got).toHaveLength(1)
+    expect(got[0].newValue).toBe(14)
+    expect(got[0].id).toBe('l1')
+  })
+
+  it('追加只影响该病人的缓存 key，别的病人的历史不被改动', async () => {
+    await cacheSet('patientChangeLogs:p2', [makeChangeLog({ id: 'other', patientId: 'p2' })])
+    await cacheSet('patientChangeLogs:p1', [makeChangeLog({ id: 'mine', patientId: 'p1', changedAt: 1000 })])
+
+    await cachedCloudRepository.addPatientChangeLog(
+      makeChangeLog({ id: 'new', patientId: 'p1', changedAt: 2000 }),
+    )
+
+    // p2 的缓存纹丝不动
+    expect((await cacheGet<{ id: string }[]>('patientChangeLogs:p2'))!.value.map((l) => l.id)).toEqual(['other'])
+    // p1 的 key 被删（下次读走云端），而不是被就地改写成 ['new','mine']
+    expect(await cacheGet('patientChangeLogs:p1')).toBeNull()
+  })
+})
+
+/**
+ * 需求③在缓存层的往返：血压的 `pulse`（心率）必须原样进缓存、原样出来。
+ * 缓存是 JSON 序列化的，null 与 undefined 的区别会在这里被放大：
+ * 若读写任一侧把它折成 0，界面会显示「心率 0 bpm」（人体不可能的值）。
+ */
+describe('cachedRepository · 血压心率（pulse）的缓存往返', () => {
+  it('带心率保存后，列表缓存里 pulse 是数字（不是 undefined）', async () => {
+    await cacheSet('bps:s1', [makeBp({ id: 'bp-old', sessionId: 's1', measuredAt: 100, pulse: null })])
+    const bp = makeBp({ id: 'bp1', sessionId: 's1', measuredAt: 200, pulse: 88 })
+
+    await cachedCloudRepository.saveBloodPressure(bp)
+
+    const list = (await cacheGet<typeof bp[]>('bps:s1'))!.value
+    expect(list.map((b) => b.id)).toEqual(['bp-old', 'bp1'])
+    expect(list[1].pulse).toBe(88)
+  })
+
+  it('pulse 为 null 的血压读回来仍是 null，不会被折成 0', async () => {
+    const bp = makeBp({ id: 'bp1', sessionId: 's1', pulse: null })
+    cloud.listBloodPressures.mockResolvedValue([bp])
+
+    const got = await cachedCloudRepository.listBloodPressures('s1')
+
+    expect(got[0].pulse).toBeNull()
+    const cached = (await cacheGet<typeof got>('bps:s1'))!.value
+    expect(cached[0].pulse).toBeNull()
+    expect(cached[0].pulse).not.toBe(0)
+  })
+
+  it('命中缓存时带心率的血压照样读得到 pulse（不会在缓存层丢失新字段）', async () => {
+    await cacheSet('bps:s1', [makeBp({ id: 'bp1', sessionId: 's1', pulse: 75 })])
+
+    const got = await cachedCloudRepository.listBloodPressures('s1')
+
+    expect(got[0].pulse).toBe(75)
+    expect(cloud.listBloodPressures).not.toHaveBeenCalled() // 新鲜缓存不请求云端
+  })
+
+  it('批量读取（趋势页）时 pulse 一起回填到各自 session 的缓存', async () => {
+    cloud.listBloodPressuresMany.mockResolvedValue([
+      makeBp({ id: 'bp1', sessionId: 's1', pulse: 70 }),
+      makeBp({ id: 'bp2', sessionId: 's2', pulse: null }),
+    ])
+
+    const list = await cachedCloudRepository.listBloodPressuresMany(['s1', 's2'])
+
+    expect(list.map((b) => b.pulse)).toEqual([70, null])
+    expect((await cacheGet<{ pulse: number | null }[]>('bps:s1'))!.value[0].pulse).toBe(70)
+    expect((await cacheGet<{ pulse: number | null }[]>('bps:s2'))!.value[0].pulse).toBeNull()
   })
 })

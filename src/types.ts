@@ -61,6 +61,12 @@ export interface BloodPressure {
   measuredAt: number
   systolic: number
   diastolic: number
+  /**
+   * 心率（bpm）。**选填**：老数据与老备份都没有这个字段，读取时统一兜底成 null。
+   * 不做「偏高 / 偏低」判定 —— 透析患者心率受用药影响大，打红绿标签容易误导，
+   * 只如实记录数值（血压才做评估，因为它是核心监测指标）。
+   */
+  pulse: number | null
   note: string | null
 }
 
@@ -87,4 +93,27 @@ export interface AdverseReaction {
   detail: string | null
   severity: ReactionSeverity | null
   recordedAt: number
+}
+
+/** 病人配置里允许留痕的字段（目前只有「轮椅及衣物重量」） */
+export type PatientChangeField = 'wheelchairWeight'
+
+/**
+ * 病人配置变更记录。
+ *
+ * 为什么单独建表而不是复用后台的 `admin_audit_logs`：那张表只记「管理员在后台改了什么」，
+ * 而且 RLS 只给管理员读 —— App 端用户看不到，等于没有留痕。
+ *
+ * 语义：**只追加、不可改不可删**（数据库层不建 update/delete 策略），
+ * 所以「谁在什么时候把轮椅及衣物重量从多少改成了多少」永远查得到。
+ */
+export interface PatientChangeLog {
+  id: string
+  patientId: string
+  field: PatientChangeField
+  oldValue: number | null
+  newValue: number | null
+  /** 变更人显示名（变更当时读取的姓名，与记录人同一个口径；本地单机模式为 null） */
+  operator: string | null
+  changedAt: number
 }

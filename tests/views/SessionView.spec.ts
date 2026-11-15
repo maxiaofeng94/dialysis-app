@@ -31,6 +31,7 @@ import {
   makeBf,
   makeReaction,
   resetIdSeq,
+  TEST_PATIENT_ID,
 } from '../helpers/factories'
 
 const mocks = vi.hoisted(() => ({
@@ -1688,5 +1689,653 @@ describe('SessionView · 加载失败可重试 + L3 删除入口位置', () => {
     expect(w.find('.van-nav-bar .van-icon-description').exists()).toBe(true)
     expect(w.find('.van-nav-bar .van-icon-delete-o').exists()).toBe(false)
     expect(w.findAll('button').some((b) => b.text().includes('删除本条记录'))).toBe(true)
+  })
+})
+
+/**
+ * 需求①（组件侧）：进行中的记录按「当前病人档案」的轮椅及衣物重量 / 回水量实时计算，
+ * 标记完成 / 中止时把档案值固化进快照。
+ *
+ * 守的缺陷（用户真实场景）：天气转冷加了衣服，家属在设置里把 13.4 改成 13.5；
+ * 之后打开那条进行中的记录 —— 实际体重还是按 13.4 算的，用户只能把整条记录删掉重录。
+ */
+describe('SessionView · 进行中按当前档案计算（需求①）', () => {
+  /** 默认数据：上机 80.0 / 档案轮椅 20.0 → 上机前实际 60.0 */
+  it('进行中：档案里的轮椅重量不同，上机前实际立刻不同（不用删记录重录）', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({ id: 'session-1', status: 'ongoing', preWeightMeasured: 80, postWeightMeasured: 77 }),
+        patient: makePatient({ wheelchairWeight: 10 }),
+      }),
+    )
+
+    // 80 - 10 = 70.0（若还用创建时的快照 20，会是 60.0）
+    expect(w.findAll('.flow-val')[0].text()).toBe('70.0kg')
+    expect(w.findAll('.flow-val')[1].text()).toBe('67.0kg')
+  })
+
+  it('进行中：界面明确写出「按当前档案计算」的口径（否则用户以为历史都被改了）', async () => {
+    const w = await mountSession(defaultData({ patient: makePatient({ wheelchairWeight: 13.4, rinseBackVolume: 500 }) }))
+
+    const hint = w.find('.live-hint')
+    expect(hint.exists()).toBe(true)
+    expect(hint.text()).toContain('进行中：按当前档案计算')
+    expect(hint.text()).toContain('13.4kg')
+    expect(hint.text()).toContain('500ml')
+    expect(hint.classes()).not.toContain('snapshot-hint')
+  })
+
+  it('已完成的记录：改档案后数字不变，并说明「不受之后修改档案影响」', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'completed',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          wheelchairWeightUsed: 13.4,
+          rinseBackVolumeUsed: 300,
+        }),
+        patient: makePatient({ wheelchairWeight: 10, rinseBackVolume: 800 }),
+      }),
+    )
+
+    expect(w.findAll('.flow-val')[0].text()).toBe('66.6kg') // 80 - 13.4（快照），不是 70.0
+    const hint = w.find('.live-hint')
+    expect(hint.classes()).toContain('snapshot-hint')
+    expect(hint.text()).toContain('不受之后修改档案影响')
+    expect(hint.text()).toContain('13.4kg')
+  })
+
+  // ⚠️ 档案读不到（离线且本机没缓存 / 还没建档案）时绝不能把重量当 0：
+  // 实际体重会凭空多出「一辆轮椅」（80 → 80.0 而不是 66.6），报告数字全错。
+  it('档案读不到时回退记录里的快照，不把轮椅当成 0kg', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'ongoing',
+          preWeightMeasured: 80,
+          wheelchairWeightUsed: 13.4,
+          rinseBackVolumeUsed: 300,
+        }),
+        patient: null,
+      }),
+    )
+
+    expect(w.findAll('.flow-val')[0].text()).toBe('66.6kg') // 80 - 13.4
+    // 拿不到档案时不显示「按当前档案计算」，避免误导
+    expect(w.find('.live-hint').exists()).toBe(false)
+  })
+
+  it('已中止的记录同样用快照，不跟着档案走', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'aborted',
+          preWeightMeasured: 80,
+          wheelchairWeightUsed: 13.4,
+        }),
+        patient: makePatient({ wheelchairWeight: 10 }),
+      }),
+    )
+
+    expect(w.findAll('.flow-val')[0].text()).toBe('66.6kg') // 不是 70.0
+    expect(w.find('.live-hint').classes()).toContain('snapshot-hint')
+  })
+
+  /**
+   * 标记完成那一刻必须把**当前档案值**固化进快照。
+   * 不固化的话，快照会停在一个用户根本没确认过的旧值上；
+   * 而展示层在「进行中」时读档案，完成后才读快照 —— 两边不一致会让数字莫名跳变。
+   */
+  it('改档案后标记完成：落库的 wheelchairWeightUsed / rinseBackVolumeUsed 是新档案值', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'ongoing',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          wheelchairWeightUsed: 13.4,
+          rinseBackVolumeUsed: 300,
+        }),
+        patient: makePatient({ wheelchairWeight: 10, rinseBackVolume: 500 }),
+      }),
+    )
+    vi.mocked(repository.saveSession).mockClear()
+
+    await buttonByText(w.find('.status-actions'), '标记完成').trigger('click')
+    await flushPromises()
+
+    const saved = vi.mocked(repository.saveSession).mock.calls[0][0]
+    expect(saved.status).toBe('completed')
+    expect(saved.wheelchairWeightUsed).toBe(10) // 固化的是新档案值，不是创建时的 13.4
+    expect(saved.rinseBackVolumeUsed).toBe(500)
+  })
+
+  it('改档案后中止透析：快照同样固化为新档案值', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'ongoing',
+          preWeightMeasured: 80,
+          wheelchairWeightUsed: 13.4,
+          rinseBackVolumeUsed: 300,
+        }),
+        patient: makePatient({ wheelchairWeight: 10, rinseBackVolume: 500 }),
+      }),
+    )
+    vi.mocked(repository.saveSession).mockClear()
+
+    await buttonByText(w.find('.status-actions'), '中止透析').trigger('click')
+    await flushPromises()
+    const popup = popupByText(w, '常用原因（可多选）')
+    await buttonByText(popup, '确认中止').trigger('click')
+    await flushPromises()
+
+    const saved = vi.mocked(repository.saveSession).mock.calls[0][0]
+    expect(saved.status).toBe('aborted')
+    expect(saved.wheelchairWeightUsed).toBe(10)
+    expect(saved.rinseBackVolumeUsed).toBe(500)
+  })
+
+  it('标记完成后，之后再改档案不影响这条记录（界面文案切换为「使用当时保存的」）', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'ongoing',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          wheelchairWeightUsed: 13.4,
+          rinseBackVolumeUsed: 300,
+        }),
+        patient: makePatient({ wheelchairWeight: 10, rinseBackVolume: 500 }),
+      }),
+    )
+    expect(w.findAll('.flow-val')[0].text()).toBe('70.0kg')
+
+    await buttonByText(w.find('.status-actions'), '标记完成').trigger('click')
+    await flushPromises()
+
+    // 完成后仍按固化后的 10kg 算（70.0），但文案已切成「不受之后修改档案影响」
+    expect(w.findAll('.flow-val')[0].text()).toBe('70.0kg')
+    expect(w.find('.live-hint').classes()).toContain('snapshot-hint')
+    expect(w.find('.live-hint').text()).toContain('10.0kg')
+  })
+
+  // 状态写库失败必须把快照字段一起回滚：否则页面显示「按新重量算的体重 + 状态还是进行中」，
+  // 而库里两样都没变 —— 用户下次再点「标记完成」会拿错误的快照覆盖正确的。
+  //
+  // ⚠️ 这条用例必须断言到**回滚后的 session 对象本身**：只断言「界面数字」和「重试时的 payload」
+  // 是不够的（评审实测过）—— 回滚成进行中后展示层又走「按当前档案计算」，
+  // 数字与重试 payload 都会被实时档案重新算一遍，恰好都正确，于是**假绿**。
+  it('状态保存失败：快照字段一起回滚（页面不能显示库里并不存在的快照）', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'ongoing',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          wheelchairWeightUsed: 13.4,
+          rinseBackVolumeUsed: 300,
+        }),
+        patient: makePatient({ wheelchairWeight: 10, rinseBackVolume: 500 }),
+      }),
+    )
+    vi.mocked(repository.saveSession).mockRejectedValueOnce(new Error('offline'))
+
+    await buttonByText(w.find('.status-actions'), '标记完成').trigger('click')
+    await flushPromises()
+
+    expect(w.find('.status-badge').text()).toBe('进行中')
+    // 回滚成进行中 → 又走「按当前档案计算」（10kg → 70.0）
+    expect(w.findAll('.flow-val')[0].text()).toBe('70.0kg')
+
+    // 关键断言：被 saveSession 收到的那个对象，回滚后要变回原始快照值。
+    // 若 statusSnapshot 漏了这两个字段，它们会停在档案值（10 / 500），这条就会红。
+    const attempted = vi.mocked(repository.saveSession).mock.calls[0][0]
+    expect({
+      wheelchairWeightUsed: attempted.wheelchairWeightUsed,
+      rinseBackVolumeUsed: attempted.rinseBackVolumeUsed,
+    }).toEqual({ wheelchairWeightUsed: 13.4, rinseBackVolumeUsed: 300 })
+    // 再进行第二次时也必须带原始快照（说明内部对象确实回滚了，不是被实时档案碰巧算对）
+    vi.mocked(repository.saveSession).mockClear()
+    await buttonByText(w.find('.status-actions'), '标记完成').trigger('click')
+    await flushPromises()
+    expect(vi.mocked(repository.saveSession).mock.calls[0][0].wheelchairWeightUsed).toBe(10)
+  })
+
+  /**
+   * 需求①的另一半：**另一端改了档案，本机开着详情页也要跟着变**。
+   *
+   * 原来的用例只覆盖了「挂载时读一次 patient」，没有覆盖 `mergeRemoteIfUntouched` 里
+   * 那条 `if (p) patient.value = p` —— 把它改成 `if (false && p)`，全部 173 条用例照样绿。
+   * 后果正是注释里写的那个场景：A 手机改完重量，B 手机开着详情页看到的还是旧的实际体重。
+   */
+  it('另一端改档案后，本机详情页跟着更新实际体重（进行中）', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'ongoing',
+          preWeightMeasured: 80,
+          postWeightMeasured: null,
+          wheelchairWeightUsed: 20,
+          updatedAt: 1_000,
+        }),
+        patient: makePatient({ wheelchairWeight: 20 }),
+      }),
+    )
+    // 挂载时：80 − 20 = 60
+    expect(w.findAll('.flow-val')[0].text()).toBe('60.0kg')
+
+    // 另一端把档案改成 13.4，并触发一次缓存刷新（cacheVersion 变化 → mergeRemoteIfUntouched）
+    vi.mocked(repository.getPatient).mockResolvedValue(makePatient({ wheelchairWeight: 13.4 }))
+    cacheVersion.value += 1
+    await flushPromises()
+
+    // 80 − 13.4 = 66.6，说明本页读到了新档案
+    expect(w.findAll('.flow-val')[0].text()).toBe('66.6kg')
+    expect(w.find('.live-hint').text()).toContain('13.4kg')
+  })
+
+  it('已完成的记录：另一端改档案后本页数字不变，且不多发一次 getPatient', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'completed',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          wheelchairWeightUsed: 20,
+          updatedAt: 1_000,
+        }),
+        patient: makePatient({ wheelchairWeight: 20 }),
+      }),
+    )
+    expect(w.findAll('.flow-val')[0].text()).toBe('60.0kg')
+    const callsBefore = vi.mocked(repository.getPatient).mock.calls.length
+
+    vi.mocked(repository.getPatient).mockResolvedValue(makePatient({ wheelchairWeight: 13.4 }))
+    cacheVersion.value += 1
+    await flushPromises()
+
+    // 已完成的用快照，档案怎么改都不动
+    expect(w.findAll('.flow-val')[0].text()).toBe('60.0kg')
+    // 也不该为了一次无关的刷新多发一趟档案请求（已完成用不到档案）
+    expect(vi.mocked(repository.getPatient).mock.calls.length).toBe(callsBefore)
+  })
+
+  it('回水量跟着档案变：机器超滤（= 计划脱水 + 回水/1000）跟着变', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'ongoing',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          wheelchairWeightUsed: 20,
+          rinseBackVolumeUsed: 300,
+        }),
+        patient: makePatient({ wheelchairWeight: 20, rinseBackVolume: 500 }),
+      }),
+    )
+
+    // 机器超滤 = 计划脱水（60.0 - 60.0 = 0）+ 回水 0.5 = 0.5（回水跟着档案走，不算快照的 0.3）
+    expect(w.find('.uf-meta').text()).toContain('回水 500ml')
+    expect(w.find('.uf-meta').text()).toContain('机器超滤 0.5L')
+  })
+})
+
+/**
+ * 需求③：血压增加心率（pulse，可空）。
+ *
+ * 守的缺陷：心率是选填项。若「不填」被存成 0，趋势图会出现一条贴地的假曲线，
+ * 医生会以为患者心率 0；若越界值（300 / 10）能入库，图会被拉变形。
+ */
+describe('SessionView · 血压心率（需求③）', () => {
+  async function openBpPopup(w: VueWrapper): Promise<DOMWrapper<Node>> {
+    await buttonByText(cardByTitle(w, '血压'), '记录').trigger('click')
+    await flushPromises()
+    return popupByText(w, '记录血压')
+  }
+
+  it('不填心率：存成 null（不是 0），提示里也不出现「心率」', async () => {
+    const w = await mountSession()
+    const popup = await openBpPopup(w)
+
+    await fieldInput(popup, '高压').setValue('135')
+    await fieldInput(popup, '低压').setValue('85')
+    await buttonByText(popup, '保存').trigger('click')
+    await flushPromises()
+
+    const bp = vi.mocked(repository.saveBloodPressure).mock.calls[0][0]
+    expect(bp.pulse).toBeNull()
+    expect(bp.pulse).not.toBe(0)
+    expect(mocks.showToast).toHaveBeenCalledWith('已保存：血压 135/85 正常')
+  })
+
+  it('填了心率：存成整数，并在提示里带上心率', async () => {
+    const w = await mountSession()
+    const popup = await openBpPopup(w)
+
+    await fieldInput(popup, '高压').setValue('135')
+    await fieldInput(popup, '低压').setValue('85')
+    await fieldInput(popup, '心率').setValue('88')
+    await buttonByText(popup, '保存').trigger('click')
+    await flushPromises()
+
+    const bp = vi.mocked(repository.saveBloodPressure).mock.calls[0][0]
+    expect(bp.pulse).toBe(88)
+    expect(mocks.showToast).toHaveBeenCalledWith('已保存：血压 135/85，心率 88 正常')
+  })
+
+  it('心率是小数时四舍五入成整数（与高压低压口径一致）', async () => {
+    const w = await mountSession()
+    const popup = await openBpPopup(w)
+
+    await fieldInput(popup, '高压').setValue('135')
+    await fieldInput(popup, '低压').setValue('85')
+    await fieldInput(popup, '心率').setValue('88.6')
+    await buttonByText(popup, '保存').trigger('click')
+    await flushPromises()
+
+    expect(vi.mocked(repository.saveBloodPressure).mock.calls[0][0].pulse).toBe(89)
+  })
+
+  // 量程 30~250：300 几乎肯定是「把高压的百位数手滑填进来」，10 是濒死值，
+  // 这类数进库后趋势图会彻底变形，医生无从判断。
+  it.each([
+    ['300', '过高'],
+    ['251', '刚过上限'],
+    ['10', '过低'],
+    ['29', '刚低于下限'],
+  ])('心率 %s（%s）越界：拦下不写库并提示', async (value) => {
+    const w = await mountSession()
+    const popup = await openBpPopup(w)
+
+    await fieldInput(popup, '高压').setValue('135')
+    await fieldInput(popup, '低压').setValue('85')
+    await fieldInput(popup, '心率').setValue(value)
+    await buttonByText(popup, '保存').trigger('click')
+    await flushPromises()
+
+    expect(repository.saveBloodPressure).not.toHaveBeenCalled()
+    expect(mocks.showToast).toHaveBeenCalledWith('心率应在 30~250 bpm 之间，请检查输入')
+    // 弹窗不关：内容还在，用户可以直接改
+    expect(popupByText(w, '记录血压').isVisible()).toBe(true)
+  })
+
+  it.each(['30', '250', '88'])('心率 %s 在量程边界内：照常保存', async (value) => {
+    const w = await mountSession()
+    const popup = await openBpPopup(w)
+
+    await fieldInput(popup, '高压').setValue('135')
+    await fieldInput(popup, '低压').setValue('85')
+    await fieldInput(popup, '心率').setValue(value)
+    await buttonByText(popup, '保存').trigger('click')
+    await flushPromises()
+
+    expect(vi.mocked(repository.saveBloodPressure).mock.calls[0][0].pulse).toBe(Number(value))
+  })
+
+  it('填了无法解析的心率（如单个字母）：当作没填，不影响整条血压保存', async () => {
+    const w = await mountSession()
+    const popup = await openBpPopup(w)
+
+    await fieldInput(popup, '高压').setValue('135')
+    await fieldInput(popup, '低压').setValue('85')
+    await fieldInput(popup, '心率').setValue('abc')
+    await buttonByText(popup, '保存').trigger('click')
+    await flushPromises()
+
+    // 不能因为手滑多打一个字就整条血压存不进去
+    expect(repository.saveBloodPressure).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(repository.saveBloodPressure).mock.calls[0][0].pulse).toBeNull()
+  })
+
+  it('编辑老记录（pulse = null）：心率输入框回填空串，不显示 "null"/"undefined"', async () => {
+    const w = await mountSession(defaultData({ bps: [makeBp({ id: 'bp1', sessionId: 'session-1', pulse: null })] }))
+
+    await cardByTitle(w, '血压').find('.van-icon-edit').trigger('click')
+    await flushPromises()
+
+    const popup = popupByText(w, '编辑血压')
+    const pulseInput = fieldInput(popup, '心率')
+    expect(pulseInput.element.value).toBe('')
+    expect(pulseInput.element.value).not.toBe('null')
+    expect(pulseInput.element.value).not.toBe('undefined')
+  })
+
+  it('编辑有心率的记录：心率输入框回填该值，保存时沿用', async () => {
+    const w = await mountSession(defaultData({ bps: [makeBp({ id: 'bp1', sessionId: 'session-1', pulse: 72 })] }))
+
+    await cardByTitle(w, '血压').find('.van-icon-edit').trigger('click')
+    await flushPromises()
+    const popup = popupByText(w, '编辑血压')
+    expect(fieldInput(popup, '心率').element.value).toBe('72')
+
+    await buttonByText(popup, '保存').trigger('click')
+    await flushPromises()
+
+    const bp = vi.mocked(repository.saveBloodPressure).mock.calls[0][0]
+    expect(bp.id).toBe('bp1')
+    expect(bp.pulse).toBe(72)
+  })
+
+  it('编辑时把心率清空：保存成 null（不是沿用旧值）', async () => {
+    const w = await mountSession(defaultData({ bps: [makeBp({ id: 'bp1', sessionId: 'session-1', pulse: 72 })] }))
+
+    await cardByTitle(w, '血压').find('.van-icon-edit').trigger('click')
+    await flushPromises()
+    const popup = popupByText(w, '编辑血压')
+    await fieldInput(popup, '心率').setValue('')
+    await buttonByText(popup, '保存').trigger('click')
+    await flushPromises()
+
+    expect(vi.mocked(repository.saveBloodPressure).mock.calls[0][0].pulse).toBeNull()
+  })
+
+  it('详情列表：有心率时显示 bpm，没有心率时不显示「心率 —」占位', async () => {
+    const w = await mountSession(
+      defaultData({
+        bps: [
+          makeBp({ id: 'bp1', measuredAt: new Date('2024-01-10T08:00:00').getTime(), pulse: 88 }),
+          makeBp({
+            id: 'bp2',
+            measuredAt: new Date('2024-01-10T09:00:00').getTime(),
+            systolic: 150,
+            diastolic: 95,
+            pulse: null,
+          }),
+        ],
+      }),
+    )
+
+    const card = cardByTitle(w, '血压')
+    const rows = recordRows(card)
+    expect(rows[0].find('.pulse-val').text()).toContain('88')
+    expect(rows[0].text()).toContain('bpm')
+    // 老记录没有心率：不渲染占位（否则会显示成「心率 — bpm」）
+    expect(rows[1].find('.pulse-val').exists()).toBe(false)
+    expect(rows[1].text()).not.toContain('bpm')
+    expect(rows[1].text()).not.toContain('心率')
+  })
+
+  it('关掉弹窗再打开：心率输入框已清空（不会把上一条的心率带过来）', async () => {
+    const w = await mountSession()
+    const popup = await openBpPopup(w)
+
+    await fieldInput(popup, '心率').setValue('99')
+    await buttonByText(popup, '取消').trigger('click')
+    await flushPromises()
+
+    await buttonByText(cardByTitle(w, '血压'), '记录').trigger('click')
+    await flushPromises()
+
+    expect(fieldInput(popupByText(w, '记录血压'), '心率').element.value).toBe('')
+  })
+
+  it('新增成功后重新打开：心率输入框也是空的（保存不残留）', async () => {
+    const w = await mountSession()
+    const popup = await openBpPopup(w)
+
+    await fieldInput(popup, '高压').setValue('135')
+    await fieldInput(popup, '低压').setValue('85')
+    await fieldInput(popup, '心率').setValue('99')
+    await buttonByText(popup, '保存').trigger('click')
+    await flushPromises()
+
+    await buttonByText(cardByTitle(w, '血压'), '记录').trigger('click')
+    await flushPromises()
+
+    expect(fieldInput(popupByText(w, '记录血压'), '心率').element.value).toBe('')
+  })
+})
+
+/**
+ * 评审 S1：**已中止的记录补录中止原因，绝不能改写冻结快照**。
+ *
+ * 这是本轮改动引入的真缺陷（评审实测复现）：`confirmAbort` 曾无条件
+ * `snapshotConfigInto(s, patient.value)`，而「已中止」的记录在界面上有
+ * 「补充中止原因 / 修改中止信息」入口 —— 那条路径是**编辑**，不是状态转换。
+ *
+ * 真实后果：2 个月前中止的一次透析（当时轮椅及衣物 13.4kg），今天档案改成 15kg，
+ * 家属点开补录中止原因并确认 → 该记录的 `wheelchairWeightUsed` 被永久改成 15，
+ * 上机前实际从 66.6 变成 65.0 —— 直接违反「历史报告数字不可变」。
+ *
+ * 现有 117 条用例里只有「ongoing → aborted」，没有「aborted → aborted（编辑）」，
+ * 所以把 `prev.status === 'ongoing'` 判断删掉，整套用例照样全绿。
+ */
+describe('SessionView · 已中止记录补录原因不得改写历史（评审 S1）', () => {
+  it('已中止 → 补录中止原因：快照保持原值，历史数字不变', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'aborted',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          // 当时（2 个月前）的冻结快照
+          wheelchairWeightUsed: 13.4,
+          rinseBackVolumeUsed: 300,
+          abortedAt: new Date('2024-01-10T10:00:00').getTime(),
+          abortTags: [],
+          abortReason: null,
+        }),
+        // 今天档案已经改成 15kg / 500ml
+        patient: makePatient({ wheelchairWeight: 15, rinseBackVolume: 500 }),
+      }),
+    )
+
+    // 编辑前：按快照 80 − 13.4 = 66.6
+    expect(w.findAll('.flow-val')[0].text()).toBe('66.6kg')
+    vi.mocked(repository.saveSession).mockClear()
+
+    // 已中止记录的「补充中止原因」按钮在 .abort-box 里（不在 .status-actions）
+    await buttonByText(w.find('.abort-box'), '补充中止原因').trigger('click')
+    await flushPromises()
+    const popup = popupByText(w, '常用原因（可多选）')
+    await popup.findAll('.chip').find((c) => c.text() === '低血压')!.trigger('click')
+    await buttonByText(popup, '确认中止').trigger('click')
+    await flushPromises()
+
+    const saved = vi.mocked(repository.saveSession).mock.calls[0][0]
+    // 核心断言：快照绝不能被今天的档案值覆盖
+    expect(saved.wheelchairWeightUsed).toBe(13.4)
+    expect(saved.rinseBackVolumeUsed).toBe(300)
+    // 但中止信息本身要照常写入
+    expect(saved.status).toBe('aborted')
+    expect(saved.abortTags).toEqual(['hypotension'])
+    // 界面上历史数字也没变
+    expect(w.findAll('.flow-val')[0].text()).toBe('66.6kg')
+  })
+
+  it('已完成 → 改中止信息：同样不改写快照（不是进行中就不该再固化）', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'completed',
+          preWeightMeasured: 80,
+          postWeightMeasured: 77,
+          wheelchairWeightUsed: 13.4,
+          rinseBackVolumeUsed: 300,
+        }),
+        patient: makePatient({ wheelchairWeight: 15, rinseBackVolume: 500 }),
+      }),
+    )
+    vi.mocked(repository.saveSession).mockClear()
+
+    // 已完成的记录点「标记中止」→ 这是一次状态变更（completed → aborted），
+    // 但源状态不是 ongoing，所以同样不该用今天的档案改写历史快照
+    await buttonByText(w.find('.status-actions'), '标记中止').trigger('click')
+    await flushPromises()
+    const popup = popupByText(w, '常用原因（可多选）')
+    await buttonByText(popup, '确认中止').trigger('click')
+    await flushPromises()
+
+    const saved = vi.mocked(repository.saveSession).mock.calls[0][0]
+    expect(saved.wheelchairWeightUsed).toBe(13.4)
+    expect(saved.rinseBackVolumeUsed).toBe(300)
+  })
+})
+
+/**
+ * 评审 S2：**跨病人不得串用档案**。
+ *
+ * `currentPatientId` 是全局的，而记录的 `patientId` 来自路由参数，两者原本没有任何校验。
+ * 可达路径（不是手工改 URL）：
+ *   ① 首页打开病人 P1 的记录 A → `/session/A`
+ *   ② 底部「设置」→ 切换病人到 P2（只 setCurrentPatientId，不改历史栈）
+ *   ③ 按返回键回到 `/session/A`，本页重新挂载，此时 currentPatientId 已是 P2
+ *   ④ 界面按 P2 的轮椅重量算出错误体重；若点「标记完成」，
+ *      P2 的值会被固化进 P1 这条记录的冻结快照（不可逆）
+ *
+ * 修法：① `resolveEffectiveConfig` / `snapshotConfigInto` 内做归属校验（不匹配回退快照）；
+ * ② `load()` 发现归属不符直接回首页（更早、更明确的拦截）。
+ */
+describe('SessionView · 跨病人归属校验（评审 S2）', () => {
+  it('记录属于别的病人：直接回首页，不按当前病人的档案渲染', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const w = await mountSession(
+      defaultData({
+        // 记录属于 patient-A
+        session: makeSession({
+          id: 'session-1',
+          patientId: 'patient-A',
+          status: 'ongoing',
+          preWeightMeasured: 80,
+          wheelchairWeightUsed: 13.4,
+        }),
+        // 但当前病人是另一个（patient-B，轮椅 25kg）
+        patient: makePatient({ id: 'patient-B', wheelchairWeight: 25 }),
+      }),
+    )
+
+    // 这里用的是真实 router（onBeforeRouteLeave 需要真路由记录），所以断言路由已回首页
+    expect(router.currentRoute.value.path).toBe('/')
+    expect(mocks.showToast).toHaveBeenCalledWith(expect.stringContaining('其他病人'))
+    // 绝不能出现按 25kg 算出来的 55.0
+    expect(w.text()).not.toContain('55.0kg')
+  })
+
+  it('记录属于当前病人：正常渲染，不误判成跨病人', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({ id: 'session-1', patientId: TEST_PATIENT_ID, status: 'ongoing', preWeightMeasured: 80 }),
+        patient: makePatient({ id: TEST_PATIENT_ID, wheelchairWeight: 13.4 }),
+      }),
+    )
+
+    expect(router.currentRoute.value.path).toBe('/session/session-1')
+    // 80 − 13.4 = 66.6（进行中跟随档案）
+    expect(w.findAll('.flow-val')[0].text()).toBe('66.6kg')
   })
 })

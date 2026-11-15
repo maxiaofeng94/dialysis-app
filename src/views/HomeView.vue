@@ -33,7 +33,7 @@ const error = ref('')
 const creating = ref(false)
 
 /**
- * 体重量程（M6，kg，含轮椅）。
+ * 体重量程（M6，kg，含轮椅及衣物）。
  * 填 0 / 5 也能建记录，列表随即显示「-72L」级别的荒谬脱水量，家属根本看不出哪条是真的。
  * 超范围一律不写库、只提示。注意：SessionView 里有一份同样的阈值，改这里要同步改那边。
  */
@@ -126,7 +126,6 @@ const quickPreview = computed(() => {
   const plan = dry != null ? Math.round((pre - dry) * 10) / 10 : null
   return { pre, plan }
 })
-
 /** 缺日期的脏数据统一落到这个分组，不要让它把整页渲染搞崩 */
 const UNKNOWN_MONTH = '日期未知'
 
@@ -149,9 +148,16 @@ const grouped = computed(() => {
   return entries
 })
 
+/**
+ * 列表里每条记录的推导值。
+ *
+ * ⚠️ 必须传 `patient`：进行中的记录会**实时跟随**当前档案里的轮椅及衣物重量 / 回水量
+ * （用户改完档案不用删记录重录），已完成 / 已中止仍用记录里的快照。
+ * 以前这里只传 session，改完档案首页的旧记录数字不变，用户以为没生效。
+ */
 function summary(s: DialysisSession) {
   const dry = getEffectiveDryWeight(dryWeights.value, s.date)
-  return computeSession(s, dry)
+  return computeSession(s, dry, patient.value)
 }
 
 // 只允许数字和一个小数点，并把半角/全角（中文输入法）逗号都转成小数点。
@@ -203,7 +209,7 @@ async function onQuickCreate() {
   if (quickWeight.value.trim() === '') {
     await showConfirmDialog({
       title: '提示',
-      message: '请先填写上机前体重（含轮椅），才能立即创建记录',
+      message: '请先填写上机前体重（含轮椅及衣物），才能立即创建记录',
       showCancelButton: false,
       confirmButtonText: '知道了',
       confirmButtonColor: '#07c160',
@@ -287,7 +293,7 @@ async function guardedCreate(run: () => Promise<void>): Promise<void> {
         </div>
         <div class="pstat">
           <div class="pstat-v">{{ fmt(patient.wheelchairWeight) }}<small>kg</small></div>
-          <div class="pstat-l">轮椅重量</div>
+          <div class="pstat-l">轮椅及衣物重量</div>
         </div>
         <div class="pstat">
           <div class="pstat-v">{{ patient.rinseBackVolume }}<small>ml</small></div>
@@ -299,7 +305,7 @@ async function guardedCreate(run: () => Promise<void>): Promise<void> {
     <!-- 快速创建（只读成员没有创建入口，整块隐藏，避免填了半天发现点不了） -->
     <div v-if="!loading && !loadFailed && !isReadOnly" class="quick-card">
       <div class="quick-title">快速创建</div>
-      <div class="quick-label">上机前体重（含轮椅）</div>
+      <div class="quick-label">上机前体重（含轮椅及衣物）</div>
       <div class="quick-input-wrap">
         <input
           :value="quickWeight"
@@ -565,9 +571,13 @@ async function guardedCreate(run: () => Promise<void>): Promise<void> {
   margin-left: 2px;
 }
 .pstat-l {
-  font-size: 12px;
+  /* 「轮椅及衣物重量」比原来的「轮椅重量」长一倍：三列布局下窄屏会顶到相邻列，
+     稍微收字号并允许换行，避免和右边「回水量」挤在一起 */
+  font-size: 11px;
+  line-height: 1.3;
   color: #969799;
   margin-top: 4px;
+  word-break: break-all;
 }
 .new-dialog-body {
   text-align: center;

@@ -242,6 +242,7 @@ const TO_ROW: Array<{ fn: string; table: string }> = [
   { fn: 'bgToRow', table: 'blood_glucoses' },
   { fn: 'bloodFlowToRow', table: 'blood_flows' },
   { fn: 'reactionToRow', table: 'adverse_reactions' },
+  { fn: 'changeLogToRow', table: 'patient_change_logs' },
 ]
 
 /** xxxFromRow → src/types.ts 的接口（读库方向：键集合必须与领域对象一致） */
@@ -253,6 +254,7 @@ const FROM_ROW: Array<{ fn: string; type: string }> = [
   { fn: 'bgFromRow', type: 'BloodGlucose' },
   { fn: 'bloodFlowFromRow', type: 'BloodFlow' },
   { fn: 'reactionFromRow', type: 'AdverseReaction' },
+  { fn: 'changeLogFromRow', type: 'PatientChangeLog' },
 ]
 
 const repositoryMethods: string[] = (() => {
@@ -268,13 +270,16 @@ describe('静态守卫 · 数据库结构与代码映射一致性', () => {
   describe('解析器自检（解析跟不上时必须报错，而不是静默通过）', () => {
     it('schema.sql 解析出了预期的表与列', () => {
       const names = [...schemaTables.keys()].sort()
-      for (const t of ['users', 'patients', 'dry_weights', 'sessions', 'blood_pressures', 'blood_glucoses', 'blood_flows', 'adverse_reactions', 'patient_members', 'admins', 'rate_limits']) {
+      for (const t of ['users', 'patients', 'dry_weights', 'sessions', 'blood_pressures', 'blood_glucoses', 'blood_flows', 'adverse_reactions', 'patient_change_logs', 'patient_members', 'admins', 'rate_limits']) {
         expect(names, `schema.sql 没解析到表 ${t}（解析正则要跟着改）`).toContain(t)
       }
       // 抽样校验列解析没被约束行干扰
       expect([...schemaTables.get('sessions')!.columns]).toEqual(
         expect.arrayContaining(['id', 'patient_id', 'date', 'pre_weight_measured', 'operator_id', 'doctor_uf', 'abort_tags']),
       )
+      // 心率是后加的列（alter table add column），解析器必须能把它合并进来
+      expect(schemaTables.get('blood_pressures')!.columns.has('pulse')).toBe(true)
+      expect(schemaTables.get('patient_change_logs')!.columns.has('old_value')).toBe(true)
       expect(schemaTables.get('rate_limits')!.columns.has('window_start')).toBe(true)
       // 约束行不能被当成列名
       expect(schemaTables.get('patient_members')!.columns.has('unique')).toBe(false)
@@ -380,9 +385,10 @@ describe('静态守卫 · 数据库结构与代码映射一致性', () => {
   })
 
   describe('缓存 key 前缀与 AGENTS.md 的约定一致', () => {
-    /** AGENTS.md 里点名的 8 个前缀 */
+    /** AGENTS.md 里点名的 8 个前缀 + 新增的病人配置变更记录 */
     const EXPECTED_PREFIXES: Record<string, string> = {
       patient: 'patient:',
+      patientChangeLogs: 'patientChangeLogs:',
       dryWeights: 'dryWeights:',
       session: 'session:',
       sessions: 'sessions:',
@@ -392,7 +398,7 @@ describe('静态守卫 · 数据库结构与代码映射一致性', () => {
       ars: 'ars:',
     }
 
-    it('cachedRepository 的 K 表就是这 8 个前缀', () => {
+    it('cachedRepository 的 K 表就是这些前缀', () => {
       const body = blockAfter(cachedSrc, /const\s+K\s*=\s*\{/)
       expect(body, 'cachedRepository.ts 里找不到缓存 key 表 K').not.toBeNull()
 

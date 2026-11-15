@@ -11,13 +11,15 @@
  *   这也正是「切换只影响展示、不写库」的验证点。
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { mount, flushPromises, type VueWrapper, type DOMWrapper } from '@vue/test-utils'
 import { defineComponent, h } from 'vue'
 import Vant from 'vant'
 import TrendView from '../../src/views/TrendView.vue'
 import { repository } from '../../src/repo'
 import { cacheVersion } from '../../src/lib/cloudCache'
-import { makeDryWeight, makeSession, makeBp, makeBg } from '../helpers/factories'
+import { makeDryWeight, makeSession, makeBp, makeBg, makePatient } from '../helpers/factories'
 
 vi.mock('echarts', () => ({
   init: vi.fn(() => ({ setOption: vi.fn(), resize: vi.fn(), dispose: vi.fn() })),
@@ -25,6 +27,8 @@ vi.mock('echarts', () => ({
 
 vi.mock('../../src/repo', () => ({
   repository: {
+    // 趋势页要读病人档案：进行中的记录按「当前档案」的轮椅及衣物重量 / 回水量计算
+    getPatient: vi.fn(),
     listDryWeights: vi.fn(),
     listSessions: vi.fn(),
     // 趋势页只用批量接口：一次请求取回最近 30 条记录的血压 / 血糖
@@ -55,6 +59,8 @@ const BaseChartStub = defineComponent({
 let wrapper: VueWrapper | null = null
 
 interface TrendData {
+  /** 病人档案：进行中的记录按它的轮椅及衣物重量计算（不传就用 factories 默认的 20kg） */
+  patient?: ReturnType<typeof makePatient> | null
   dryWeights?: ReturnType<typeof makeDryWeight>[]
   sessions?: ReturnType<typeof makeSession>[]
   bpsBySession?: Record<string, ReturnType<typeof makeBp>[]>
@@ -62,6 +68,10 @@ interface TrendData {
 }
 
 function stubTrendData(data: TrendData = {}) {
+  // 默认给一份 20kg 的档案：用例里的 session 也按 20kg 建，两者一致时不改变原有断言
+  vi.mocked(repository.getPatient).mockResolvedValue(
+    data.patient === null ? undefined : (data.patient ?? makePatient({ wheelchairWeight: 20, rinseBackVolume: 300 })),
+  )
   vi.mocked(repository.listDryWeights).mockResolvedValue(data.dryWeights ?? [])
   vi.mocked(repository.listSessions).mockResolvedValue(data.sessions ?? [])
   // 批量接口按传入的 session 顺序把各条记录的数据拍平，并补上 sessionId 归属
@@ -102,6 +112,11 @@ function buttonByText(scope: VueWrapper | DOMWrapper<Node>, text: string): DOMWr
   const btn = scope.findAll('button').find((b) => b.text().includes(text))
   if (!btn) throw new Error(`未找到文案包含「${text}」的按钮`)
   return btn as DOMWrapper<HTMLButtonElement>
+}
+
+/** 去掉 JS / 行注释：源码级断言必须剥注释，否则把调用写进注释里也能骗过守卫 */
+function stripComments(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
 }
 
 beforeEach(() => {
@@ -404,5 +419,130 @@ describe('TrendView · 加载失败与「无数据」要分开（M9）', () => {
     // 单条接口一次都不该被调用
     expect(repository.listBloodPressures).not.toHaveBeenCalled()
     expect(repository.listBloodGlucoses).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * 需求①：趋势页的体重曲线同样要「进行中按当前档案、已完成用快照」。
+ * ⚠️ 这一组的存在理由：`stubTrendData` 的默认档案是 20kg，而 `makeSession` 的默认快照也是
+ * `wheelchairWeightUsed: 20` —— 两者相等时，**传不传 patient 根本看不出来**。
+ * 这里必须刻意让两者不等，否则就是假绿（评审指出过这一点）。
+ */
+describe('TrendView · 体重曲线按记录状态取轮椅及衣物重量（需求①）', () => {
+  it('进行中的记录用当前档案：档案 25kg vs 快照 20kg，曲线取 25', async () => {
+    const w = await mountTrend({
+      patient: makePatient({ wheelchairWeight: 25, rinseBackVolume: 300 }),
+      sessions: [
+        makeSession({ id: 's1', date: '2024-01-05', preWeightMeasured: 85, status: 'ongoing', wheelchairWeightUsed: 20 }),
+      ],
+    })
+
+    const opt = optionBySeries(w, '上机前')
+    // 85 − 25（当前档案）= 60；若错误地用了快照 20 会得到 65
+    expect(opt.series.find((s: { name: string }) => s.name === '上机前').data).toEqual([60])
+  })
+
+  it('已完成的记录用快照：档案改成 25kg 也不影响（历史不可变）', async () => {
+    const w = await mountTrend({
+      patient: makePatient({ wheelchairWeight: 25, rinseBackVolume: 300 }),
+      sessions: [
+        makeSession({ id: 's1', date: '2024-01-05', preWeightMeasured: 85, status: 'completed', wheelchairWeightUsed: 20 }),
+      ],
+    })
+
+    const opt = optionBySeries(w, '上机前')
+    // 85 − 20（当时的快照）= 65，绝不能跟着档案变成 60
+    expect(opt.series.find((s: { name: string }) => s.name === '上机前').data).toEqual([65])
+  })
+
+  it('档案读不到（离线且无缓存）：回退快照，不能算成 0（否则体重凭空多一辆轮椅）', async () => {
+    const w = await mountTrend({
+      patient: null,
+      sessions: [
+        makeSession({ id: 's1', date: '2024-01-05', preWeightMeasured: 85, status: 'ongoing', wheelchairWeightUsed: 20 }),
+      ],
+    })
+
+    const opt = optionBySeries(w, '上机前')
+    expect(opt.series.find((s: { name: string }) => s.name === '上机前').data).toEqual([65])
+  })
+})
+
+/**
+ * 需求③：趋势页血压图的心率副轴。
+ *
+ * 原来零覆盖 —— 把 `pulse: bp.pulse ?? null` 改成 `pulse: null`、
+ * 把 `hasBpPulse` 改成 `computed(() => false)`，19 条用例全部通过。
+ */
+describe('TrendView · 血压图心率副轴（需求③）', () => {
+  const sess = makeSession({ id: 's1', date: '2024-01-05' })
+
+  it('有心率：legend 出现「心率」，yAxis 变成双轴（mmHg / bpm）', async () => {
+    const w = await mountTrend({
+      sessions: [sess],
+      bpsBySession: { s1: [makeBp({ id: 'bp1', sessionId: 's1', systolic: 130, diastolic: 80, pulse: 76 })] },
+    })
+
+    await switchTab(w, '血压')
+    const opt = optionBySeries(w, '心率')
+
+    expect(opt.legend.data).toEqual(['高压', '低压', '心率'])
+    expect(Array.isArray(opt.yAxis)).toBe(true)
+    expect(opt.yAxis).toHaveLength(2)
+    expect(opt.yAxis[0].name).toBe('mmHg')
+    expect(opt.yAxis[1].name).toBe('bpm')
+    // 心率必须走副轴，否则和血压挤一根轴会把血压压平
+    const pulseSeries = opt.series.find((s: { name: string }) => s.name === '心率')
+    expect(pulseSeries.yAxisIndex).toBe(1)
+    expect(pulseSeries.data).toEqual([76])
+    // 副轴不画网格线（否则两层网格叠在一起很脏）。autoValueAxis 不额外返回 splitLine，
+    // 这里显式钉住约定：如果将来给副轴加了网格线，这条会红。
+    expect(opt.yAxis[1].splitLine ?? { show: false }).toEqual({ show: false })
+  })
+
+  it('没有心率（历史数据）：只画两条线，yAxis 保持单轴（不能多出一根空轴）', async () => {
+    const w = await mountTrend({
+      sessions: [sess],
+      bpsBySession: { s1: [makeBp({ id: 'bp1', sessionId: 's1', pulse: null })] },
+    })
+
+    await switchTab(w, '血压')
+    const opt = optionBySeries(w, '高压')
+
+    expect(opt.legend.data).toEqual(['高压', '低压'])
+    expect(Array.isArray(opt.yAxis)).toBe(false)
+    expect(opt.yAxis.name).toBe('mmHg')
+    expect(opt.series.map((s: { name: string }) => s.name)).toEqual(['高压', '低压'])
+    // 没有副轴时右侧留白要收回去，否则图表右边会空一大块
+    expect(opt.grid.right).toBe(20)
+  })
+
+  it('部分点有心率：没记心率的点必须是 null 断点（不能填 0 把曲线拽到地板）', async () => {
+    const w = await mountTrend({
+      sessions: [sess],
+      bpsBySession: {
+        s1: [
+          makeBp({ id: 'bp1', sessionId: 's1', measuredAt: 1_700_000_100_000, pulse: 76 }),
+          makeBp({ id: 'bp2', sessionId: 's1', measuredAt: 1_700_000_200_000, pulse: null }),
+          makeBp({ id: 'bp3', sessionId: 's1', measuredAt: 1_700_000_300_000, pulse: 82 }),
+        ],
+      },
+    })
+
+    await switchTab(w, '血压')
+    const opt = optionBySeries(w, '心率')
+    const pulseSeries = opt.series.find((s: { name: string }) => s.name === '心率')
+
+    expect(pulseSeries.data).toEqual([76, null, 82])
+  })
+
+  it('双轴时 tooltip 按系列名分别加单位（mmHg / bpm 不能混成一种）', async () => {
+    // ⚠️ 这里只能做**源码级断言**：BaseChartStub 用 JSON.stringify 把 option 打进 DOM，
+    // 函数类型的 valueFormatter 序列化时会整个丢掉，拿不到它的返回值。
+    // （报告页那组用例能拿到组件实例，所以只在那边测具体拼接结果。）
+    const src = stripComments(readFileSync(resolve(process.cwd(), 'src/views/TrendView.vue'), 'utf8'))
+    expect(src).toMatch(/valueFormatter/)
+    expect(src).toMatch(/seriesName === '心率'/)
+    expect(src).toMatch(/bpm/)
   })
 })

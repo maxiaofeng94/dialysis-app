@@ -30,6 +30,8 @@ const hoisted = vi.hoisted(() => {
       saveBloodGlucose: fn('saveBloodGlucose'),
       saveBloodFlow: fn('saveBloodFlow'),
       replaceAdverseReactions: fn('replaceAdverseReactions'),
+      // 病人配置变更记录也要一起搬到云端：漏了这段，迁移后「变更历史」会凭空变空
+      addPatientChangeLog: fn('addPatientChangeLog'),
     },
   }
 })
@@ -146,7 +148,7 @@ describe('migrate · 成功路径', () => {
     return { res, savedSessions, newSessionIds: savedSessions.map((s) => s.id as string) }
   }
 
-  it('按本机档案创建云端病人：姓名 / 轮椅重量 / 回水量透传', async () => {
+  it('按本机档案创建云端病人：姓名 / 轮椅及衣物重量 / 回水量透传', async () => {
     await runFullMigration()
 
     expect(hoisted.createPatient).toHaveBeenCalledTimes(1)
@@ -362,5 +364,65 @@ describe('migrate · 边界数据', () => {
     expect(dump).not.toContain('local-other')
     expect(dump).not.toContain('local-d-other')
     expect(dump).not.toContain('other-patient')
+  })
+})
+
+/**
+ * 病人配置变更记录的迁移（需求②）。
+ *
+ * 原来这段零覆盖：把 migrate.ts 里搬变更记录的那几行整段删掉，21 条用例全过。
+ * 后果是「单机→云端迁移后，变更历史凭空变空」—— 而代码注释恰恰写着要防止这件事。
+ */
+describe('migrate · 病人配置变更记录', () => {
+  it('本机的变更记录会一起迁移到云端，且 id / patientId 都重新映射', async () => {
+    await seedLocal()
+    await localRepository.addPatientChangeLog({
+      id: 'local-cl1',
+      patientId: DEFAULT_PATIENT_ID,
+      field: 'wheelchairWeight',
+      oldValue: 13.4,
+      newValue: 14,
+      operator: null,
+      changedAt: 1_700_000_000_000,
+    })
+
+    const res = await migrateLocalToCloud()
+
+    expect(res.ok).toBe(true)
+    expect(hoisted.repository.addPatientChangeLog).toHaveBeenCalledTimes(1)
+
+    const saved = hoisted.repository.addPatientChangeLog.mock.calls[0][0] as Record<string, any>
+    expect(saved).toMatchObject({ field: 'wheelchairWeight', oldValue: 13.4, newValue: 14 })
+    // 本地 id 不是 uuid，必须换新；patientId 必须指向云端新建的病人
+    expect(isUuid(saved.id)).toBe(true)
+    expect(saved.id).not.toBe('local-cl1')
+    expect(saved.patientId).toBe('cloud-p1')
+    expect(saved.patientId).not.toBe(DEFAULT_PATIENT_ID)
+  })
+
+  it('迁移后本地变更记录一条不少（迁移只读本地）', async () => {
+    await seedLocal()
+    await localRepository.addPatientChangeLog({
+      id: 'local-cl1',
+      patientId: DEFAULT_PATIENT_ID,
+      field: 'wheelchairWeight',
+      oldValue: null,
+      newValue: 13.4,
+      operator: null,
+      changedAt: 1_700_000_000_000,
+    })
+
+    await migrateLocalToCloud()
+
+    const local = await localRepository.listPatientChangeLogs(DEFAULT_PATIENT_ID)
+    expect(local).toHaveLength(1)
+  })
+
+  it('本机没有变更记录时不写（不会凭空造一条空记录）', async () => {
+    await seedLocal()
+
+    await migrateLocalToCloud()
+
+    expect(hoisted.repository.addPatientChangeLog).not.toHaveBeenCalled()
   })
 })

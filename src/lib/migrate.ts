@@ -64,5 +64,13 @@ async function runMigration(): Promise<{ ok: boolean; message: string; patientId
     )
   }
 
+  // 病人配置变更记录：一起搬到云端，否则迁移后「变更历史」会凭空变空。
+  // 单机模式没有变更人账号（operator 为 null），operator_id 由仓储填当前登录用户 ——
+  // 语义上变成「这次迁移是本人做的」，对只读的历史记录来说是可接受的取舍。
+  const changeLogs = await localRepository.listPatientChangeLogs(DEFAULT_PATIENT_ID)
+  for (const log of changeLogs) {
+    await repository.addPatientChangeLog({ ...log, id: uuid(), patientId: newPatientId })
+  }
+
   return { ok: true, message: `已迁移 ${sessions.length} 条透析记录到云端`, patientId: newPatientId }
 }

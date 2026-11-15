@@ -36,6 +36,7 @@ import type {
 
 const K = {
   patient: (id: string) => `patient:${id}`,
+  patientChangeLogs: (pid: string) => `patientChangeLogs:${pid}`,
   dryWeights: (pid: string) => `dryWeights:${pid}`,
   session: (id: string) => `session:${id}`,
   sessions: (pid: string) => `sessions:${pid}`,
@@ -230,10 +231,30 @@ export const cachedCloudRepository: Repository = {
     // 保存成功后把新版本号写回对象与缓存，否则下一次保存会拿旧版本去比 → 自己跟自己冲突
     if (iso) patient.updatedAtIso = iso
     await cacheSet(K.patient(patient.id), patient)
-    // 顺手更新「我的病人」列表里的那份副本：列表页显示的还是改动前的轮椅重量 / 回水量，
+    // 顺手更新「我的病人」列表里的那份副本：列表页显示的还是改动前的轮椅及衣物重量 / 回水量，
     // 用户会以为没保存上
     await updateMyPatientsCache(patient)
     return iso
+  },
+
+  // ---------- 病人配置变更记录 ----------
+  async listPatientChangeLogs(patientId, opts) {
+    // fresh：刚追加完要看到自己这一条时不能读陈旧缓存
+    if (opts?.fresh) await cacheDelete([K.patientChangeLogs(patientId)])
+    return cacheFirst(K.patientChangeLogs(patientId), () => cloudRepository.listPatientChangeLogs(patientId))
+  },
+  async addPatientChangeLog(log) {
+    await cloudRepository.addPatientChangeLog(log)
+    // 追加成功后必须让这个 key 失效，**不要**自己往缓存里 unshift 这一条（评审 L2）。
+    //
+    // 曾经的做法是把客户端上报的 log 直接插到缓存最前面。问题在于两边字段来源不同：
+    // 客户端上报的 `operator` 是「本页已知的我的姓名」，而云端读回来的是
+    // `users(name, phone)` join 的结果。用户改了姓名之后，缓存里这条显示旧名、
+    // 重新进页面（读到云端）显示新名 —— 同一条记录两副面孔，正好毁掉这份历史的可信度。
+    // 删掉 key 让下一次读走云端，两边就永远同源。
+    // （设置页写完后本来就会调 `listPatientChangeLogs(..., { fresh: true })`，
+    //   它自己会再删一次 key，所以这里删掉不会多一次往返。）
+    await cacheDelete([K.patientChangeLogs(log.patientId)])
   },
 
   // ---------- 干体重 ----------

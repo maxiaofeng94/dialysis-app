@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mount, flushPromises, type VueWrapper } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import { createRouter, createMemoryHistory, type RouteRecordRaw, type Router } from 'vue-router'
-import ElementPlus, { ElDialog, ElMessage, ElMessageBox, ElPagination } from 'element-plus'
+import ElementPlus, { ElDialog, ElInputNumber, ElMessage, ElMessageBox, ElPagination } from 'element-plus'
 
 // ---------------------------------------------------------------- 替身
 
@@ -235,7 +235,7 @@ function patientRow(over: Record<string, unknown> = {}) {
     id: 'p-1',
     name: '病人一',
     birthday: '1950-03-02',
-    wheelchairWeight: 20000,
+    wheelchairWeight: 20,
     rinseBackVolume: 400,
     createdAt: AT,
     updatedAt: AT,
@@ -296,7 +296,8 @@ const PATIENT_DETAIL = {
     id: 'p-1',
     name: '病人一',
     birthday: '1950-03-02',
-    wheelchairWeight: 20000,
+    // kg 口径，且带一位小数：输入框已改成 step 0.1 / precision 1，这里钉住「小数不被抹掉」
+    wheelchairWeight: 20.5,
     rinseBackVolume: 400,
     createdAt: AT,
     updatedAt: AT,
@@ -962,7 +963,10 @@ describe('后台页面 · PatientDetailView', () => {
     expect(api.updatePatient).toHaveBeenCalledWith('p-1', {
       name: '病人一',
       birthday: '1950-03-02',
-      wheelchairWeight: 20000,
+      // 轮椅及衣物重量的单位是 kg（库里 wheelchair_weight 就是 kg）。
+      // 输入框曾误标成「(g)」、上限 100000、步进 500；现在是 min 0 / max 100 / step 0.1 / precision 1，
+      // 保存时原样按 kg 提交 —— 用 20.5 钉住「一位小数不会被抹成整数」
+      wheelchairWeight: 20.5,
       rinseBackVolume: 400,
     })
   })
@@ -977,6 +981,75 @@ describe('后台页面 · PatientDetailView', () => {
 
     expect(wrapper.text()).toContain('成员（0）')
     expect(wrapper.text()).toContain('该病人还没有任何成员（无人能看到它）')
+  })
+
+  /**
+   * 评审 M3：**`el-input-number` 的 `:max` 会静默钳制绑定的值**。
+   *
+   * 真实后果：历史上有病人档案按「克」填过（如 13000 / 20000）。管理员打开详情页时，
+   * 输入框把 `form.wheelchairWeight` 从 20000 直接改成 100 并显示成 100 ——
+   * 此时管理员只想改个姓名、点保存，这条脏数据就被「合法化」成 100kg 写回库里，
+   * 全程没有任何提示。App 端会按 100kg 算实际体重（上机 80 − 100 = 负数）。
+   *
+   * 修法：输入框不再设 `:max`，照实显示真实值；超范围在保存时**显式报错并说明单位**。
+   */
+  describe('评审 M3 · 轮椅及衣物重量超范围不得被静默钳制', () => {
+    it('老数据是克单位（13000）：页面照实显示 13000，不悄悄改成 100', async () => {
+      vi.mocked(api.patient).mockResolvedValue({
+        ...PATIENT_DETAIL,
+        patient: { ...PATIENT_DETAIL.patient, wheelchairWeight: 13000 },
+      } as never)
+
+      const { wrapper } = await mountView(PatientDetailView, '/patients/p-1')
+
+      // 直接读 el-input-number 的 modelValue：DOM 上会被 precision 格式化成 "13000.0"，
+      // 但真正决定「保存时提交什么」的是组件模型
+      const numbers = wrapper.findAllComponents(ElInputNumber)
+      const wheelchairInput = numbers.find((c) => c.props('modelValue') === 13000)
+      expect(wheelchairInput).toBeTruthy()
+      // 绝不能被钳制（旧实现 :max="100" 会把模型值直接改成 100）
+      expect(numbers.some((c) => c.props('modelValue') === 100)).toBe(false)
+    })
+
+    it('老数据超范围时点保存：拦下并报错（说明单位是 kg），不写库', async () => {
+      vi.mocked(api.patient).mockResolvedValue({
+        ...PATIENT_DETAIL,
+        patient: { ...PATIENT_DETAIL.patient, wheelchairWeight: 20000 },
+      } as never)
+      const error = vi.spyOn(ElMessage, 'error').mockImplementation(() => ({}) as never)
+
+      const { wrapper } = await mountView(PatientDetailView, '/patients/p-1')
+      await buttonByText(wrapper, '保存配置').trigger('click')
+      await flushPromises()
+
+      // 绝不能把 20000 悄悄写成 100
+      expect(api.updatePatient).not.toHaveBeenCalled()
+      expect(error).toHaveBeenCalled()
+      expect(String(error.mock.calls[0][0])).toContain('kg')
+    })
+
+    it('回水量超范围同样拦下（填成 300000 会让机器脱水量离谱）', async () => {
+      vi.mocked(api.patient).mockResolvedValue({
+        ...PATIENT_DETAIL,
+        patient: { ...PATIENT_DETAIL.patient, rinseBackVolume: 300000 },
+      } as never)
+      const error = vi.spyOn(ElMessage, 'error').mockImplementation(() => ({}) as never)
+
+      const { wrapper } = await mountView(PatientDetailView, '/patients/p-1')
+      await buttonByText(wrapper, '保存配置').trigger('click')
+      await flushPromises()
+
+      expect(api.updatePatient).not.toHaveBeenCalled()
+      expect(error).toHaveBeenCalled()
+    })
+
+    it('范围内的值照常保存（不能把正常路径一起拦掉）', async () => {
+      const { wrapper } = await mountView(PatientDetailView, '/patients/p-1')
+      await buttonByText(wrapper, '保存配置').trigger('click')
+      await flushPromises()
+
+      expect(api.updatePatient).toHaveBeenCalledWith('p-1', expect.objectContaining({ wheelchairWeight: 20.5 }))
+    })
   })
 
   it('接口报错（病人不存在）→ 错误提示且所有 v-if=detail 的卡片都不渲染', async () => {

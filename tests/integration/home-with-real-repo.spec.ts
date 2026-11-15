@@ -346,7 +346,7 @@ describe('首页 × 真实本地仓储 · 计算口径与仓储一致', () => {
     await seedData()
     const w = await mountHome()
 
-    // 把轮椅重量从 20 改成 25（模拟设置页改了档案）
+    // 把轮椅及衣物重量从 20 改成 25（模拟设置页改了档案）
     await localRepository.savePatient({ ...PATIENT, wheelchairWeight: 25, rinseBackVolume: 400 })
     w.unmount()
     const again = await mountHome()

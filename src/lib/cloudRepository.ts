@@ -10,6 +10,7 @@ import type {
   BloodGlucose,
   BloodFlow,
   AdverseReaction,
+  PatientChangeLog,
 } from '../types'
 
 // 说明：前端领域对象为 camelCase，数据库列为 snake_case，此处做双向映射。
@@ -47,6 +48,8 @@ function chunk<T>(list: T[], size: number): T[][] {
 
 // 透析记录查询：带出记录人姓名（sessions.operator_id → users，RLS 允许同病人成员互看）
 const SESSION_SELECT = '*, operator:users(name, phone)'
+// 变更记录查询：同样带出变更人姓名
+const CHANGE_LOG_SELECT = '*, operator:users(name, phone)'
 
 // ---------- 行 → 领域对象 ----------
 
@@ -108,6 +111,8 @@ function bpFromRow(r: any): BloodPressure {
     measuredAt: new Date(r.measured_at).getTime(),
     systolic: r.systolic,
     diastolic: r.diastolic,
+    // 心率：老数据（加列之前写入的）没有这个字段，统一兜底成 null（界面显示「未记录」）
+    pulse: r.pulse != null ? Number(r.pulse) : null,
     note: r.note,
   }
 }
@@ -140,6 +145,19 @@ function reactionFromRow(r: any): AdverseReaction {
     detail: r.detail,
     severity: r.severity,
     recordedAt: new Date(r.recorded_at).getTime(),
+  }
+}
+
+function changeLogFromRow(r: any): PatientChangeLog {
+  return {
+    id: r.id,
+    patientId: r.patient_id,
+    field: r.field,
+    oldValue: r.old_value != null ? Number(r.old_value) : null,
+    newValue: r.new_value != null ? Number(r.new_value) : null,
+    // 变更人显示名：优先姓名，没填姓名时退回手机号（与记录人同一口径）
+    operator: r.operator?.name || r.operator?.phone || null,
+    changedAt: new Date(r.changed_at).getTime(),
   }
 }
 
@@ -194,6 +212,7 @@ function bpToRow(b: BloodPressure) {
     measured_at: new Date(b.measuredAt).toISOString(),
     systolic: b.systolic,
     diastolic: b.diastolic,
+    pulse: b.pulse ?? null,
     note: b.note,
   }
 }
@@ -226,6 +245,18 @@ function bloodFlowToRow(f: BloodFlow) {
     measured_at: new Date(f.measuredAt).toISOString(),
     value: f.value,
     note: f.note,
+  }
+}
+
+function changeLogToRow(l: PatientChangeLog, operatorId: string | null) {
+  return {
+    id: l.id,
+    patient_id: l.patientId,
+    field: l.field,
+    old_value: l.oldValue,
+    new_value: l.newValue,
+    operator_id: operatorId,
+    changed_at: new Date(l.changedAt).toISOString(),
   }
 }
 
@@ -302,6 +333,38 @@ class CloudRepository implements Repository {
     }
 
     return (data[0] as { updated_at: string }).updated_at ?? nextIso
+  }
+
+  /**
+   * 读病人配置变更记录（倒序）。
+   *
+   * 必须带 `if (error) throw error`：读失败绝不能静默成「没有变更记录」——
+   * 那会让用户以为从没改过重量，反而更不信任这份数据。
+   */
+  async listPatientChangeLogs(patientId: string) {
+    if (!isQueryableId(patientId)) return []
+    const { data, error } = await this.client()
+      .from('patient_change_logs')
+      .select(CHANGE_LOG_SELECT)
+      .eq('patient_id', patientId)
+      // 二级排序键 id：同一毫秒写入的多条记录顺序才稳定（不然界面会「跳来跳去」）
+      .order('changed_at', { ascending: false })
+      .order('id', { ascending: false })
+    if (error) throw error
+    return (data ?? []).map(changeLogFromRow)
+  }
+
+  /**
+   * 追加一条变更记录。
+   *
+   * `operator_id` 必须写当前登录用户：`pcl_insert` 策略带
+   * `with check (... and operator_id = auth.uid())`，写成别人（哪怕是「保留原变更人」）
+   * 都会被 RLS 静默拒绝。读登录态的理由同 saveSession（别用 getUser()）。
+   */
+  async addPatientChangeLog(log: PatientChangeLog) {
+    const uid = (await readPersistedUser())?.id ?? null
+    const { error } = await this.client().from('patient_change_logs').insert(changeLogToRow(log, uid))
+    if (error) throw error
   }
 
   async listDryWeights(patientId: string) {
@@ -573,7 +636,7 @@ class CloudRepository implements Repository {
 
   async exportAll() {
     const client = this.client()
-    const [patients, dryWeights, sessions, bps, bgs, bfs, reactions] = await Promise.all([
+    const [patients, dryWeights, sessions, bps, bgs, bfs, reactions, changeLogs] = await Promise.all([
       client.from('patients').select('*'),
       client.from('dry_weights').select('*'),
       client.from('sessions').select(SESSION_SELECT),
@@ -581,6 +644,7 @@ class CloudRepository implements Repository {
       client.from('blood_glucoses').select('*'),
       client.from('blood_flows').select('*'),
       client.from('adverse_reactions').select('*'),
+      client.from('patient_change_logs').select(CHANGE_LOG_SELECT),
     ])
     // 必须逐个检查：任何一张表查询失败都会让导出静默变成「空备份」，
     // 用户拿着一个空文件以为备份好了 —— 等真需要恢复时才发现什么都没存下。
@@ -592,6 +656,7 @@ class CloudRepository implements Repository {
       ['血糖', bgs],
       ['血流量', bfs],
       ['不良反应', reactions],
+      ['配置变更记录', changeLogs],
     ]
     for (const [label, res] of parts) {
       if (res.error) throw new Error(`导出失败（${label}）：${res.error.message}`)
@@ -608,6 +673,7 @@ class CloudRepository implements Repository {
         bloodGlucoses: (bgs.data ?? []).map(bgFromRow),
         bloodFlows: (bfs.data ?? []).map(bloodFlowFromRow),
         adverseReactions: (reactions.data ?? []).map(reactionFromRow),
+        patientChangeLogs: (changeLogs.data ?? []).map(changeLogFromRow),
       },
       null,
       2,

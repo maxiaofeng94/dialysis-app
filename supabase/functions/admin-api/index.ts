@@ -954,12 +954,16 @@ async function patientUpdate(payload: any): Promise<HandlerResult> {
     changes.birthday = { from: patient.birthday ?? null, to: birthday || null }
   }
   for (const [key, column, label] of [
-    ['wheelchairWeight', 'wheelchair_weight', '轮椅重量'],
+    ['wheelchairWeight', 'wheelchair_weight', '轮椅及衣物重量'],
     ['rinseBackVolume', 'rinse_back_volume', '回水量'],
   ] as const) {
     if (payload?.[key] === undefined) continue
     const value = Number(payload[key])
     if (!Number.isFinite(value) || value < 0) fail(`${label}必须是不小于 0 的数字`, 400)
+    // 与 App 端同一个量程口径（SettingsView 的 WHEELCHAIR_MAX）：后台不受前端校验约束，
+    // 这里必须自己拦 —— 否则管理员填 13000（误以为单位是克）会让 App 的实际体重变成负数
+    if (key === 'wheelchairWeight' && value > 100) fail(`${label}不能超过 100kg（单位是 kg，不是克）`, 400)
+    if (key === 'rinseBackVolume' && value > 2000) fail(`${label}不能超过 2000ml`, 400)
     patch[column] = value
     changes[key] = { from: Number(patient[column] ?? 0), to: value }
   }
