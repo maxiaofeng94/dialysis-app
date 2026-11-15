@@ -9,10 +9,12 @@
 #   ① 深度评审门禁   —— 本次改动必须通过评审（见 AGENTS.md 第 3.5 步）
 #   ② 类型检查
 #   ③ 全部测试
+#   ④ 生产库结构同步   —— schema.sql 里声明的表/列，生产库必须都有
 #
 # 临时跳过（例如紧急修文档）：
-#   SKIP_TESTS=1 git push     # 跳过全部三项
+#   SKIP_TESTS=1 git push     # 跳过全部四项
 #   SKIP_REVIEW=1 git push    # 只跳过评审门禁
+#   SKIP_SCHEMA_CHECK=1 git push  # 只跳过生产库结构检查（网络不通时用）
 # ============================================================
 
 if [ "${SKIP_TESTS}" = "1" ]; then
@@ -51,4 +53,24 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-echo "[pre-push] ✅ 通过（评审门禁 + 类型检查 + 全部测试）"
+echo "[pre-push] ④ 生产库结构同步（schema.sql 里的表/列，生产库是否都有）…"
+# 为什么加这一步：第十一轮用户反馈「变更历史没有记录却提示加载失败」，
+# 根因是生产库从没执行过 schema.sql —— 而前三步（评审/类型/测试）全都发现不了：
+# 测试跑在本地 jsdom，CI 只构建产物，没有任何一环会问「库和代码匹配吗」。
+# 这一步用 anon key 只读探测，不写库。
+# 网络不通 / 无权限判定时只警告不阻断（不能因为断网就推不了代码）。
+if [ "${SKIP_SCHEMA_CHECK}" = "1" ]; then
+  echo "[pre-push]    ⏭  已跳过（SKIP_SCHEMA_CHECK=1）"
+else
+  node scripts/check-prod-schema.mjs
+  if [ $? -ne 0 ]; then
+    echo ""
+    echo "[pre-push] ❌ 生产库结构未同步，推送已中止。"
+    echo "           改了 supabase/schema.sql 就必须应用（幂等，不清数据）："
+    echo "             node scripts/apply-schema.mjs <prod-ref> <PROD_PAT>"
+    echo "           只是网络不通、结构其实没问题：SKIP_SCHEMA_CHECK=1 git push"
+    exit 1
+  fi
+fi
+
+echo "[pre-push] ✅ 通过（评审门禁 + 类型检查 + 全部测试 + 生产库结构）"

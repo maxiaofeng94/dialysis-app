@@ -9,7 +9,14 @@ import { Filesystem, Directory, Encoding } from '@capacitor/filesystem'
 import { Share } from '@capacitor/share'
 import { repository } from '../repo'
 import { cacheDelete } from '../lib/cloudCache'
-import { isConflictError, isNotFoundError, isPermissionError } from '../lib/errors'
+import {
+  errorCode,
+  isConflictError,
+  isNotFoundError,
+  isPermissionError,
+  isRlsDeniedError,
+  isSchemaMissingError,
+} from '../lib/errors'
 import { DEFAULT_RINSE_BACK_ML } from '../constants'
 import {
   currentPatientId,
@@ -858,8 +865,21 @@ async function openChangeLog() {
       showChangeLog.value = false // 同上：别把错误提示落到别人页面上
       return
     }
-    // 读失败绝不能显示成「暂无变更记录」：那会让用户以为从没改过，反而更不信这份数据
-    changeLogError.value = '变更记录加载失败，请检查网络后重试'
+    // 读失败绝不能显示成「暂无变更记录」：那会让用户以为从没改过，反而更不信这份数据。
+    //
+    // ⚠️ 第十一轮（用户截图反馈「没有记录却提示加载失败」）：
+    // 根因是**生产库没执行 schema.sql**（patient_change_logs 表不存在，实测 404 PGRST205），
+    // 而这里把所有异常都归一成「请检查网络后重试」—— 用户换网络、点重试一万次也不会好，
+    // 排查的人也只会往网络方向查。所以按错误码分开说，仍然不显示成「暂无记录」。
+    changeLogError.value = isSchemaMissingError(err)
+      ? '变更记录功能尚未在服务器启用，请联系管理员（缺少数据库表）'
+      : isRlsDeniedError(err)
+        ? '没有权限查看变更记录，请联系创建者'
+        : '变更记录加载失败，请检查网络后重试'
+    if (import.meta.env.DEV) {
+      // 开发/测试环境把错误码打出来，避免下次又靠猜
+      console.warn('[changeLog] 加载失败，错误码 =', errorCode(err))
+    }
     changeLogs.value = []
   } finally {
     // ⚠️ 中级-1（第五轮独立评审坐实）：这里原来写成 `if (currentPatientId.value === pid)`，
@@ -1196,21 +1216,27 @@ function showHelp() {
       <div class="card-title">病人档案</div>
       <van-field v-model="form.name" label="姓名" placeholder="请输入姓名" />
       <van-field v-model="form.birthday" label="生日" placeholder="用于计算年龄" type="date" />
+      <!--
+        需求②：变更历史入口。
+        ⚠️ 第十一轮（用户截图反馈）：原来是单独一行 .row（提示文字 + 按钮），
+        flex 的 space-between 把按钮挤到只剩约 3 个字宽，「变更历史」被折成两行。
+        改用 van-field 的 #button 插槽 —— 按钮就在输入框右侧，不占额外一行，
+        提示文字移进弹窗（弹窗标题下方一行灰字）。
+      -->
       <van-field
         v-model="form.wheelchairWeight"
         label="轮椅及衣物重量"
-        label-width="7em"
+        label-width="8em"
         placeholder="kg"
         type="number"
-      />
+      >
+        <template #button>
+          <van-button size="small" type="primary" plain @click="openChangeLog">变更历史</van-button>
+        </template>
+      </van-field>
       <van-field v-model="form.rinseBackVolume" label="回水量" placeholder="ml" type="number" />
       <div v-if="patient?.birthday" class="muted" style="margin: 4px 16px">
         当前年龄约 {{ calcAgeStr(patient.birthday) }}
-      </div>
-      <!-- 需求②：让用户能自己查「轮椅及衣物重量是什么时候、被谁改成多少的」 -->
-      <div class="row" style="margin: 8px 16px 0">
-        <span class="muted" style="font-size: 12px">轮椅及衣物重量会随季节衣物变化，改动会自动留痕</span>
-        <van-button size="mini" type="primary" plain @click="openChangeLog">变更历史</van-button>
       </div>
       <div v-if="!canEditConfig" class="muted" style="margin: 4px 16px">
         仅创建者可修改病人配置（你当前是「{{ roleLabel(currentRole ?? '') }}」，修改不会被保存）
@@ -1355,6 +1381,10 @@ function showHelp() {
     <van-popup v-model:show="showChangeLog" round position="bottom" style="max-height: 75%">
       <div style="padding: 20px">
         <div class="card-title">轮椅及衣物重量变更记录</div>
+        <!-- 问题 4（用户拍板）：原表格行左侧的提示文字移到这里，弹窗标题下方一行灰字 -->
+        <div class="muted" style="font-size: 12px; margin: -4px 0 8px">
+          轮椅及衣物重量会随季节衣物变化，改动会自动留痕
+        </div>
         <div v-if="changeLogLoading" style="padding: 16px 0">
           <van-loading size="20" vertical>加载中…</van-loading>
         </div>

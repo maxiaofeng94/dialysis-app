@@ -1,0 +1,36 @@
+fix: 修设置页布局与变更历史错误提示，并补上「生产库结构未同步」的机械防线
+
+用户反馈三个问题（附生产环境截图）：
+
+1. 布局：变更历史按钮被挤成两行、标签紧贴数值、血压弹窗心率提示被按钮遮挡
+2. 变更历史按钮移到「轮椅及衣物重量」表单行右侧，提示文字移进弹窗
+3. 没有变更记录时提示「加载失败」
+
+问题 3 的根因不是代码：**生产库从没执行过 schema.sql**。
+用生产库 anon key 只读探测确认（2026-11-15）：
+  patient_change_logs   → 404 PGRST205 表不存在
+  blood_pressures.pulse → 400 42703 列不存在
+而 schema.sql 第 96/124 行都写了，是库里没有。所以心率保存会报错、变更历史必然读失败。
+
+为什么发布前没发现：测试跑本地 jsdom 不连库、CI 只构建产物、10 轮评审只看代码。
+整条链路没有一环会问「库结构和代码匹配吗」。这是流程漏洞，不是意外。
+
+本次改动：
+
+- SettingsView：按钮改用 van-field 的 #button 插槽（不占额外一行）、
+  label-width 7em→8em（标签与数值间距 0→12px）、
+  变更历史按错误码分文案（缺表/无权限/网络三类），不再一律说「检查网络」
+- SessionView：血压弹窗心率提示去掉负上边距，实测不再被保存按钮遮挡
+- errors.ts：新增 errorCode / isSchemaMissingError / isRlsDeniedError
+- scripts/check-prod-schema.mjs：解析 schema.sql 的 13 张表 / 89 个列，
+  用 anon key 只读探测生产库，缺任何一个就报出来（不写库、不需要 PAT）
+- pre-push 加第 ④ 步：结构未同步就中止推送（可用 SKIP_SCHEMA_CHECK=1 跳过网络问题）
+- package.json：加 check:schema / apply:schema
+- .gitignore：加 .dsh-im/（IM 附件落盘目录，之前会污染 git status）
+
+测试：新增 5 条 schema 解析守卫用例 + 4 条布局/错误分类用例。
+变异验证 4 项全部 RED（去掉缺表分支 / 按钮挪出插槽 / 删说明行 / 解析器漏 add column）。
+53 files / 1828 tests 全绿。
+
+⚠️ 生产库 schema 仍需应用（本机 PROD_PAT 已失效 401）：
+  node scripts/apply-schema.mjs vbamprkcwrpsazkyknjq <新PROD_PAT>

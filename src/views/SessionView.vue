@@ -1268,7 +1268,12 @@ async function removeSession() {
         <van-field v-model="bpForm.diastolic" label="低压" placeholder="mmHg" type="number" />
         <!-- 心率选填（需求③）：不填也能保存，老记录编辑时留空即视为「未记录」 -->
         <van-field v-model="bpForm.pulse" label="心率" placeholder="bpm（可选）" type="number" />
-        <div class="muted" style="margin: -4px 0 0 16px; font-size: 12px">
+        <!--
+          ⚠️ 第十一轮（用户截图反馈）：原来用 margin: -4px 0 0 16px 的负上边距，
+          把提示文字顶上去了 —— 它和 van-field 的下边框重叠，而且整段被「取消/保存」
+          按钮切掉下半截。改成正常的下边距 + 额外留白，让提示完整可见。
+        -->
+        <div class="muted" style="margin: 2px 16px 4px; font-size: 12px; line-height: 1.5">
           心率选填，量程 {{ PULSE_MIN }}~{{ PULSE_MAX }} bpm；只记录数值，不做高低判定
         </div>
         <div style="display: flex; gap: 12px; margin-top: 16px">

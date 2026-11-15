@@ -23,7 +23,9 @@
     "review:start": "node scripts/review-gate.mjs start",
     "review:pass": "node scripts/review-gate.mjs pass",
     "review:check": "node scripts/review-gate.mjs check",
-    "review:status": "node scripts/review-gate.mjs status"
+    "review:status": "node scripts/review-gate.mjs status",
+    "check:schema": "node scripts/check-prod-schema.mjs",
+    "apply:schema": "node scripts/apply-schema.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^6.2.1",

@@ -1543,6 +1543,80 @@ describe('SettingsView · 轮椅及衣物重量变更记录（运行时行为）
     expect(vi.mocked(repository.listPatientChangeLogs).mock.calls[0][1]).toEqual({ fresh: true })
   })
 
+  /**
+   * 第十一轮（用户截图反馈「没有记录却提示加载失败」）：
+   * 生产库没执行 schema.sql → `patient_change_logs` 表不存在（实测 404 PGRST205）。
+   * 原来的 catch 把所有异常归一成「请检查网络后重试」—— 用户换网络、点重试一万次也不会好，
+   * 排查的人也只会往网络方向查。现在按错误码分开说。
+   */
+  it('变更历史读失败是「服务端缺表」时：提示联系管理员，不能说成网络问题', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
+    const schemaErr = Object.assign(new Error('Could not find the table'), { code: 'PGRST205' })
+    vi.mocked(repository.listPatientChangeLogs).mockRejectedValueOnce(schemaErr)
+
+    await buttonByText(w, '变更历史').trigger('click')
+    await flushPromises()
+
+    const text = w.text()
+    expect(text).toContain('尚未在服务器启用')
+    // 不能误导成网络问题：换网络、重试都不会好
+    expect(text).not.toContain('请检查网络后重试')
+    // 仍然不能说成「没有记录」
+    expect(text).not.toContain('暂无变更记录')
+  })
+
+  it('变更历史读失败是 RLS 拒绝时：提示没有权限', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
+    const rlsErr = Object.assign(new Error('permission denied'), { code: '42501' })
+    vi.mocked(repository.listPatientChangeLogs).mockRejectedValueOnce(rlsErr)
+
+    await buttonByText(w, '变更历史').trigger('click')
+    await flushPromises()
+
+    const text = w.text()
+    expect(text).toContain('没有权限查看变更记录')
+    expect(text).not.toContain('暂无变更记录')
+  })
+
+  /**
+   * 问题 2（用户截图反馈 + 拍板）：变更历史按钮必须在轮椅及衣物重量那一行的右侧，
+   * 不能单独占一行 —— 原来用 `.row` 的 flex space-between，把按钮挤到约 3 字宽、
+   * 「变更历史」被折成两行。
+   */
+  it('变更历史按钮在轮椅及衣物重量那一行内（不单独占一行）', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
+
+    // 找到 label 为「轮椅及衣物重量」的那个 van-field（van-cell）
+    const cells = [...w.element.querySelectorAll('.van-cell')]
+    const wcCell = cells.find((c) => c.textContent?.includes('轮椅及衣物重量'))
+    expect(wcCell, '找不到轮椅及衣物重量那一行').toBeTruthy()
+
+    // 按钮必须在这个 cell 内部（#button 插槽渲染在 .van-field__button 里）
+    const btn = wcCell!.querySelector('.van-field__button button')
+    expect(btn, '变更历史按钮不在该行的 #button 插槽里（又变成单独一行了）').toBeTruthy()
+    expect(btn!.textContent).toContain('变更历史')
+
+    // 旧的单独一行（.row 包着提示文字）必须已删除
+    const oldRow = [...w.element.querySelectorAll('.row')].find((r) =>
+      r.textContent?.includes('会随季节衣物变化'),
+    )
+    expect(oldRow, '旧的那一行提示文字还在（应该已移进弹窗）').toBeFalsy()
+  })
+
+  /** 问题 4（用户拍板）：提示文字移到弹窗标题下方一行灰字 */
+  it('变更历史弹窗标题下方有「会随季节衣物变化」的说明', async () => {
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
+    vi.mocked(repository.listPatientChangeLogs).mockResolvedValueOnce([])
+
+    await buttonByText(w, '变更历史').trigger('click')
+    await flushPromises()
+
+    const popup = w.element.querySelector('.van-popup')
+    expect(popup, '弹窗没渲染').toBeTruthy()
+    expect(popup!.textContent).toContain('会随季节衣物变化')
+    // 没有记录时仍要说「暂无」，而不是加载失败
+    expect(popup!.textContent).toContain('暂无变更记录')
+  })
   it('变更历史按倒序展示 old→new / 时间 / 变更人；老记录没有变更人时显示「未记录」', async () => {
     const w = await mountSettings({ patient: makePatient({ id: 'patient-default' }) })
     vi.mocked(repository.listPatientChangeLogs).mockResolvedValueOnce([

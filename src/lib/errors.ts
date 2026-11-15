@@ -55,3 +55,39 @@ export function isNotFoundError(err: unknown): boolean {
 export function isPermissionError(err: unknown): boolean {
   return err instanceof Error && err.name === 'PermissionError'
 }
+
+/**
+ * PostgREST / PostgreSQL 的「结构不存在」错误码。
+ *
+ * 为什么需要它：曾经所有读失败都被归一成「加载失败，请检查网络后重试」，
+ * 于是「生产库没执行 schema.sql」这种**服务端缺表**的问题，在用户界面上
+ * 和「手机断网」长得一模一样，只能靠猜。
+ *
+ * 实测（生产库 vbamprkcwrpsazkyknjq，2026-11-15）：
+ * - 缺表：`404 {"code":"PGRST205","message":"Could not find the table 'public.patient_change_logs'"}`
+ * - 缺列：`400 {"code":"42703","message":"column blood_pressures.pulse does not exist"}`
+ *
+ * `PGRST205` 是 PostgREST 自己的「schema cache 里找不到这张表」，
+ * `42P01` 是 PostgreSQL 的 `undefined_table`（直接跑 SQL 时报这个）。
+ */
+const SCHEMA_MISSING_CODES = ['PGRST205', '42P01', '42703'] as const
+
+/** 从 supabase-js 抛出的错误对象里取 PostgREST / PG 错误码 */
+export function errorCode(err: unknown): string | null {
+  if (typeof err !== 'object' || err === null) return null
+  const code = (err as { code?: unknown }).code
+  return typeof code === 'string' ? code : null
+}
+
+/** 服务端缺少表/列（生产库没执行 schema.sql）—— 重试多少次都不会好 */
+export function isSchemaMissingError(err: unknown): boolean {
+  const code = errorCode(err)
+  return code !== null && (SCHEMA_MISSING_CODES as readonly string[]).includes(code)
+}
+
+/** RLS 拒绝（没有权限读/写） */
+export function isRlsDeniedError(err: unknown): boolean {
+  const code = errorCode(err)
+  // 42501 = insufficient_privilege（PG）；PGRST301 = JWT 无效/过期
+  return code === '42501' || code === 'PGRST301'
+}
