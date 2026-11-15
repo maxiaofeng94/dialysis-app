@@ -110,6 +110,16 @@ const newPatientForm = reactive({ name: '', wheelchairWeight: '', rinseBackVolum
 
 /** 首次加载（本机还没有缓存）时的骨架占位 */
 const loading = ref(true)
+/**
+ * 「档案正在重新加载」的独立标记（不控制骨架屏）。
+ *
+ * ⚠️ 不能复用 `loading`：它的语义是「首屏还没好」，只在首次加载时为 true。
+ * 若让 `load()` 每次都把它置 true，迁移后刷新、干体重保存后重载都会闪一下整页骨架，
+ * 用户正在看的表单被替换成占位块（实测会打挂「迁移：连点只迁移一次」）。
+ * 但 `switchPatient` 又确实需要知道「有加载在途」—— 否则甲的档案会落到乙的上下文。
+ * 所以用一个不影响渲染的独立标记。
+ */
+const reloading = ref(false)
 /** 加载失败：骨架必须收起并给出「重试」，否则用户只能杀进程（与首页/详情页保持一致） */
 const loadError = ref('')
 /** 当前版本：装机后想确认「装的是哪一版」时，不用再翻系统设置 */
@@ -201,7 +211,7 @@ async function switchPatient(id: string) {
     showToast('正在保存档案，请稍候再切换病人')
     return
   }
-  if (loading.value) {
+  if (reloading.value) {
     showToast('正在加载病人档案，请稍候再切换')
     return
   }
@@ -336,6 +346,10 @@ function fillForm(p: Patient | null) {
 
 async function load(force = false, opts: { fresh?: boolean } = {}) {
   loadError.value = ''
+  // ⚠️ 第四轮自查：`loading` 只在 `finally` 里置 false、**从不重新置 true** ——
+  // 于是 `switchPatient` 的 `if (loading.value)` 守卫在首屏之后永远不成立（死代码）。
+  // 这里用独立的 `reloading` 标记（不动骨架屏，见其定义处的注释）。
+  reloading.value = true
   try {
     const pid = currentPatientId.value
     const [p, dw] = await Promise.all([repository.getPatient(pid, opts), repository.listDryWeights(pid)])
@@ -358,6 +372,7 @@ async function load(force = false, opts: { fresh?: boolean } = {}) {
   } finally {
     // 无论成败都要收起骨架（首页/详情页/趋势页/报告页都是这么做的）
     loading.value = false
+    reloading.value = false
   }
 }
 
@@ -462,7 +477,11 @@ async function savePatient(opts: { override?: boolean } = {}) {
     //   这条变更就永久缺失了（而提示只说「请检查网络」，用户不知道该做什么）。
     if (wheelchairChanged) {
       // 先补上次没记上的（顺序才不会乱：老变更在前、新变更在后）
-      await flushPendingWheelchairLog()
+      //
+      // ⚠️ 返回值**必须接住**（第四轮自查）：原来这里丢弃了 flush 的结果，
+      // 于是「旧待补项没补上、本次这条写成功」时会 toast「已保存」——
+      // 用户以为历史齐了，实际还缺一条。本次成功不等于历史完整。
+      const flushedOk = await flushPendingWheelchairLog()
       // ⚠️ 用**发起保存时**捕获的 pid（`p.id`），不要在这里读 `currentPatientId.value`：
       // 上面 `await savePatient(...)` 期间用户可能已经切病人了（S-1）。
       const logged = await appendWheelchairLog(prevWheelchair, wheelchairWeight, p.id)
@@ -483,6 +502,9 @@ async function savePatient(opts: { override?: boolean } = {}) {
             ? '已保存，但变更记录未能写入（下次保存时会自动补记）'
             : '已保存，但变更记录未能写入，且本机无法暂存待补项，这条变更记录将缺失',
         )
+      } else if (!flushedOk) {
+        // 本次这条写成功了，但**之前**的待补项仍未补上 → 历史仍不完整，不能说「已保存」
+        showToast('已保存，但此前的变更记录仍未能写入（下次保存时会自动补记）')
       } else {
         showToast('已保存')
       }
@@ -1086,8 +1108,8 @@ function showHelp() {
           borderTop: '1px solid #f2f3f5',
           // 保存/加载在途时病人行点不动：切过去会污染档案（见 switchPatient 注释），
           // 用样式和 cursor 让用户看得出来，而不是点了没反应
-          cursor: savingPatient || loading ? 'not-allowed' : 'pointer',
-          opacity: savingPatient || loading ? 0.5 : 1,
+          cursor: savingPatient || reloading ? 'not-allowed' : 'pointer',
+          opacity: savingPatient || reloading ? 0.5 : 1,
         }"
         @click="switchPatient(item.patient.id)"
       >

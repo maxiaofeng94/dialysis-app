@@ -1884,6 +1884,74 @@ describe('SettingsView · 轮椅及衣物重量变更记录（运行时行为）
   })
 
   /**
+   * 第四轮自查（由「flush 返回值被丢弃」这个模式扫出来的同类问题）：
+   * `wheelchairChanged` 分支里 `await flushPendingWheelchairLog()` 的返回值原来也被丢弃。
+   *
+   * 场景：队列里有一条旧待补项补不上，但**本次**这条变更写成功了 →
+   * 旧实现 toast「已保存」，用户以为历史齐了，实际还缺一条。
+   * 本次成功 ≠ 历史完整。
+   */
+  it('旧待补项没补上但本次写成功：不能说「已保存」，要说明此前的仍缺', async () => {
+    currentPatientIdRef.value = 'patient-default'
+    // 预置一条补不上的旧待补项（13.5→13.6），本次要改的是 13.6→13.7
+    localStorage.setItem(
+      'dialysis-pending-wheelchair-logs',
+      JSON.stringify([{ patientId: 'patient-default', oldValue: 13.5, newValue: 13.6, changedAt: 1 }]),
+    )
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.6 }) })
+
+    // 第 1 次调用（补旧的那条）失败，第 2 次（本次这条）成功
+    let calls = 0
+    vi.mocked(repository.addPatientChangeLog).mockImplementation(async () => {
+      calls += 1
+      if (calls === 1) throw new Error('offline')
+      return undefined as never
+    })
+
+    await fieldInput(w, '轮椅及衣物重量').setValue('13.7')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 本次写成功了，但旧的那条仍缺 → 不能报「已保存」
+    expect(mocks.showToast).not.toHaveBeenCalledWith('已保存')
+    expect(mocks.showToast).toHaveBeenCalledWith('已保存，但此前的变更记录仍未能写入（下次保存时会自动补记）')
+    // 旧待补项必须仍在队列里
+    const queued = JSON.parse(localStorage.getItem('dialysis-pending-wheelchair-logs') || '[]')
+    expect(queued.map((x: { oldValue: number; newValue: number }) => `${x.oldValue}->${x.newValue}`)).toEqual([
+      '13.5->13.6',
+    ])
+  })
+
+  /**
+   * `switchPatient` 的「加载在途」守卫（第四轮自查补测）：
+   * 加载在途时切病人，同样会让甲的档案落到乙的上下文 —— 与严重-1 同类。
+   *
+   * ⚠️ 守卫用的是独立的 `reloading` 标记，不是首屏骨架的 `loading`：
+   * `loading` 只在首次加载时为 true，之后再也不置 true → 拿它做守卫就是死代码
+   * （第四轮自查实测：`loading` 版本在首屏后永远不成立）。
+   * 而让 `load()` 每次都置 `loading = true` 又会把整页换成骨架屏（打挂迁移用例）。
+   *
+   * 判别力：去掉 `if (reloading.value)` 分支 → 本用例红。
+   */
+  it('加载在途时调用 switchPatient：必须挡住并提示', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', name: '甲' }) })
+
+    // 让下一次 load 挂住 → loading 停在 true
+    vi.mocked(repository.getPatient).mockReturnValue(new Promise(() => {}) as never)
+    const vm = w.vm as unknown as { switchPatient: (id: string) => Promise<void> }
+    // 先触发一次挂住的加载（不 await，让它停在 await 上）
+    void vm.switchPatient('patient-b')
+    await flushPromises()
+
+    // 此时 loading 为 true：再切一次必须被挡
+    mocks.showToast.mockClear()
+    await vm.switchPatient('patient-a')
+    await flushPromises()
+    expect(mocks.showToast).toHaveBeenCalledWith('正在加载病人档案，请稍候再切换')
+  })
+
+  /**
    * 严重-1（第三轮独立评审）：保存在途时点**真实的病人行**切病人，
    * 甲的档案值会被回写进页面状态，再点保存 / 覆盖保存就把甲的姓名生日写进乙的服务器档案。
    *
