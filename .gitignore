@@ -52,3 +52,6 @@ supabase/.branches
 
 # IM 入站附件落盘目录（QQ/IM 发来的图片等，只在本地，不入库）
 .dsh-im/
+
+# 提交信息临时文件（写完就删，绝不入库）
+.commit-msg.txt
