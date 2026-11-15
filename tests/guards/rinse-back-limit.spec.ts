@@ -75,26 +75,42 @@ function extractFromEdge(): Extracted {
   return { file, max: Number(m![1]), snippet: m![0] }
 }
 
+/**
+ * create-patient：`rinseBackVolume > 2000`
+ *
+ * ⚠️ 轻微-8（第三轮独立评审）：这里原来**完全没有上限**，任何登录用户直接 POST
+ * 就能写进 13000kg。App 端会先拦，但迁移路径能绕过前端，所以服务端必须自己守。
+ */
+function extractFromCreatePatient(): Extracted {
+  const file = 'supabase/functions/create-patient/index.ts'
+  const src = stripComments(read(file))
+  const m = src.match(/rinseBackVolume\s*>\s*(\d+)/)
+  expect(m, `${file} 里找不到 rinseBackVolume > <数字>（改写法了？请同步更新本守卫）`).toBeTruthy()
+  return { file, max: Number(m![1]), snippet: m![0] }
+}
+
 describe('静态守卫 · 回水量上限三处一致', () => {
   it('三处解析器都能找到上限（解析器自检：跟不上就报错，不许静默通过）', () => {
-    for (const fn of [extractFromApp, extractFromAdmin, extractFromEdge]) {
+    for (const fn of [extractFromApp, extractFromAdmin, extractFromEdge, extractFromCreatePatient]) {
       const r = fn()
       expect(Number.isFinite(r.max), `${r.file} 解析出的上限不是有限数字`).toBe(true)
       expect(r.max, `${r.file} 解析出的上限为 0 或负数，解析器可能匹配错了位置`).toBeGreaterThan(0)
     }
   })
 
-  it('App / 后台 / Edge 的回水量上限必须完全相同（走散会让前端放行、后端 400）', () => {
+  it('App / 后台 / Edge / create-patient 的回水量上限必须完全相同（走散会让前端放行、后端 400）', () => {
     const app = extractFromApp()
     const admin = extractFromAdmin()
     const edge = extractFromEdge()
+    const create = extractFromCreatePatient()
 
-    // 报错时把三处的原始片段都打出来，一眼看出谁跟谁不一致
-    const all = [app, admin, edge]
+    // 报错时把各处的原始片段都打出来，一眼看出谁跟谁不一致
+    const all = [app, admin, edge, create]
     const desc = all.map((x) => `  ${x.file}: ${x.snippet}  → ${x.max}`).join('\n')
 
     expect(admin.max, `后台与 App 的上限不一致：\n${desc}`).toBe(app.max)
     expect(edge.max, `Edge 与 App 的上限不一致：\n${desc}`).toBe(app.max)
+    expect(create.max, `create-patient 与 App 的上限不一致：\n${desc}`).toBe(app.max)
   })
 
   it('上限就是 2000ml（实测合理量程；改这个数字必须同时改三处 + 三条边界用例）', () => {

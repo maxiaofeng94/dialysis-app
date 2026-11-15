@@ -163,12 +163,20 @@ describe('useAuth · 未配置云端（纯本地单机模式）', () => {
   it('未配置云端时 logout() 不抛错（supabase 为 null 走可选链），user 置空并清理本机残留', async () => {
     const { store, cacheClear, clearCurrentPatient } = await loadAuth({ configured: false })
     store.user.value = makeUser('u1') as never
+    // 轻微-7（第三轮独立评审）：待补的变更记录队列也必须清掉。
+    // 不清不构成数据泄露（flush 按 currentPatientId 过滤），但会留下永远补不上的
+    // 陈旧条目（病人 id 是 uuid，换账号后永远匹配不到），隐私模式下还会占 quota。
+    localStorage.setItem(
+      'dialysis-pending-wheelchair-logs',
+      JSON.stringify([{ patientId: 'p-old', oldValue: 13.4, newValue: 13.5, changedAt: 1 }]),
+    )
 
     await expect(store.logout()).resolves.toBeUndefined()
 
     expect(store.user.value).toBeNull()
     expect(cacheClear).toHaveBeenCalledTimes(1)
     expect(clearCurrentPatient).toHaveBeenCalledTimes(1)
+    expect(localStorage.getItem('dialysis-pending-wheelchair-logs')).toBeNull()
   })
 })
 

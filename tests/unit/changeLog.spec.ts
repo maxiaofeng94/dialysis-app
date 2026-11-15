@@ -211,7 +211,11 @@ describe('SettingsView 的留痕纪律（源码级守卫）', () => {
     // 缓存 key 也要用归属病人的 id，不能读全局
     expect(body).toMatch(/cacheDelete\(\s*`patientChangeLogs:\$\{patientId\}`/)
     expect(body).toMatch(/field:\s*'wheelchairWeight'/)
-    expect(body).toMatch(/changedAt:\s*Date\.now\(\)/)
+    // ⚠️ 中级-6（第三轮独立评审）：`changedAt` 必须是**参数**（补写时传变更发生时刻），
+    // 不能写死 `Date.now()` —— 否则 10:00 的变更补写时被盖上 11:00 的时间戳，
+    // 按 changedAt 倒序排的历史会倒着长。
+    expect(body).toMatch(/changedAt[,\s]*\n/) // 简写属性 `changedAt,`（来自参数）
+    expect(body).not.toMatch(/changedAt:\s*Date\.now\(\)/)
     expect(body).toMatch(/operator:/)
   })
 

@@ -184,7 +184,28 @@ function pickAddedPatientId(beforeIds: Set<string>): string | null {
   return myPatients.value.find((item) => !beforeIds.has(item.patient.id))?.patient.id ?? null
 }
 
+/**
+ * 切换当前病人。
+ *
+ * ⚠️ 严重-1（第三轮独立评审）：必须挡住「保存 / 加载在途」时的切换。
+ *
+ * 否则可达路径：改甲的重量 → 点保存（弱网挂住）→ 点乙那一行 → 甲的保存返回 →
+ * `patient.value`/`knownPatientUpdatedAtIso` 被回写成甲 → 用户点保存 = 乙的 id +
+ * 甲的版本号与生日 → 假冲突 → 点「覆盖保存」→ **甲的姓名生日被永久写进乙的服务器档案**。
+ * 这是「病人身份」级别的数据污染，任何页面都不会提示。
+ *
+ * 保存通常只等几百毫秒，等一下比写错病人档案好得多。
+ */
 async function switchPatient(id: string) {
+  if (savingPatient.value) {
+    showToast('正在保存档案，请稍候再切换病人')
+    return
+  }
+  if (loading.value) {
+    showToast('正在加载病人档案，请稍候再切换')
+    return
+  }
+  if (id === currentPatientId.value) return // 重复点同一行：没必要重新加载
   setCurrentPatientId(id)
   await refreshCurrentRole()
   showToast('已切换病人')
@@ -318,6 +339,11 @@ async function load(force = false, opts: { fresh?: boolean } = {}) {
   try {
     const pid = currentPatientId.value
     const [p, dw] = await Promise.all([repository.getPatient(pid, opts), repository.listDryWeights(pid)])
+    // ⚠️ 严重-1（第三轮独立评审）：`await` 之后必须复查「当前病人还是不是发起时那位」。
+    // 不复查就会把甲的档案写进 `patient.value`，而表单里是乙的内容 → 用户点保存 =
+    // 用乙的 id + 甲的版本号/生日/体重，触发假冲突、再点「覆盖保存」就把甲的
+    // 姓名生日永久写进乙的服务器档案。
+    if (currentPatientId.value !== pid) return
     patient.value = p ?? null
     knownPatientUpdatedAtIso = p?.updatedAtIso ?? null
     if (force || formSnapshot === null || snapshotForm() === formSnapshot) {
@@ -407,12 +433,26 @@ async function savePatient(opts: { override?: boolean } = {}) {
   savingPatient.value = true
   try {
     const iso = await repository.savePatient(p, opts.override ? null : knownPatientUpdatedAtIso)
-    if (iso) {
-      p.updatedAtIso = iso
-      knownPatientUpdatedAtIso = iso
+    // ⚠️ 严重-1（第三轮独立评审）：`knownPatientUpdatedAtIso` / `patient.value` / `formSnapshot`
+    // 都是**当前页面的状态**，只有在「当前病人仍是发起保存那位」时才能回写。
+    // 保存期间切病人是真实可达的（`switchPatient` 原来不挡在途保存），
+    // 不回写判断的后果：甲的值 + 乙的 id 组成下一次保存的 payload → 假冲突 →
+    // 用户点「覆盖保存」→ 甲的姓名/生日/体重被永久写进乙的服务器档案。
+    //
+    // ⚠️ `iso` 可能为空（本地模式 / 仓储没返回新版本号）：那时**仍要**回写
+    // `patient.value` 与 `formSnapshot`，否则下一次保存会把这次改动当成「又改了」
+    // 重复写一条变更记录。
+    if (currentPatientId.value === p.id) {
+      if (iso) {
+        p.updatedAtIso = iso
+        knownPatientUpdatedAtIso = iso
+      }
+      patient.value = p
+      formSnapshot = snapshotForm() // 保存后表单就是「服务端值」，后续 load 可正常回填
+    } else {
+      // 已切到别的病人：这次保存结果只对原病人生效，不要污染当前页面的状态
+      showToast('已保存（保存期间切换了病人，当前页面未更新）')
     }
-    patient.value = p
-    formSnapshot = snapshotForm() // 保存后表单就是「服务端值」，后续 load 可正常回填
     // 需求②：轮椅及衣物重量的变更留痕。
     // - 必须在档案保存**成功之后**写，否则会出现「日志说改了、实际没改」；
     // - 写失败**不影响**档案保存的结果（档案已经进库了），但必须明确告诉用户日志没记上 ——
@@ -432,6 +472,8 @@ async function savePatient(opts: { override?: boolean } = {}) {
           patientId: p.id,
           oldValue: prevWheelchair,
           newValue: wheelchairWeight,
+          // 变更发生时刻 = 这次保存的时间，不是将来补写的时刻（中级-6）
+          changedAt: now,
         })
         // ⚠️ 队列也存不下时**绝不能**再说「下次保存时会自动补记」——
         // 那是空头承诺（独立评审 D2：隐私模式下队列静默丢失，第二次保存还报「已保存」，
@@ -497,6 +539,7 @@ async function appendWheelchairLog(
   oldValue: number,
   newValue: number,
   patientId: string,
+  changedAt: number = Date.now(),
 ): Promise<boolean> {
   const log: PatientChangeLog = {
     id: uuid(),
@@ -507,7 +550,10 @@ async function appendWheelchairLog(
     // 变更人显示名：优先用本页已加载的「我的姓名」，没填就退回手机号；
     // 云端记录里 operator_id 由仓储填当前登录用户（RLS 强制 operator_id = auth.uid()）
     operator: myName.value.trim() || myPhone.value || null,
-    changedAt: Date.now(),
+    // ⚠️ 中级-6（第三轮独立评审）：补写时必须传**变更发生时刻**，不能取 `Date.now()`。
+    // 历史是按 `changedAt` 倒序排的；补写取「补写那一刻」会让 10:00 的变更排到 10:30 之后，
+    // 用户看到的历史倒着长 —— 与 D1 是同一类问题，`break` 修不到（那是同一次 flush 内部）。
+    changedAt,
   }
   try {
     await repository.addPatientChangeLog(log)
@@ -550,6 +596,16 @@ interface PendingWheelchairLog {
   patientId: string
   oldValue: number
   newValue: number
+  /**
+   * 变更**发生**时刻（不是补写时刻）。
+   *
+   * ⚠️ 中级-6（第三轮独立评审）：历史按 `changedAt` 倒序排，补写时若取 `Date.now()`，
+   * 10:00 的变更会排到 10:30 之后 —— 历史倒着长。D1 的 `break` 只管同一次 flush 内部，
+   * 管不住「补写条目 vs 之后实时写入的条目」，所以必须把时刻一起存下来。
+   *
+   * 旧数据可能没有这个字段（升级前存下的队列）→ 读出时补成当前时间，行为与旧版一致。
+   */
+  changedAt: number
 }
 
 function readPendingWheelchairLogs(): PendingWheelchairLog[] {
@@ -559,14 +615,20 @@ function readPendingWheelchairLogs(): PendingWheelchairLog[] {
     const parsed: unknown = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
     // 逐条校验：宁可丢一条坏数据，也不能让整个补写流程抛错
-    return parsed.filter(
-      (x): x is PendingWheelchairLog =>
-        !!x &&
-        typeof x === 'object' &&
-        typeof (x as PendingWheelchairLog).patientId === 'string' &&
-        Number.isFinite((x as PendingWheelchairLog).oldValue) &&
-        Number.isFinite((x as PendingWheelchairLog).newValue),
-    )
+    return parsed
+      .filter(
+        (x): x is PendingWheelchairLog =>
+          !!x &&
+          typeof x === 'object' &&
+          typeof (x as PendingWheelchairLog).patientId === 'string' &&
+          Number.isFinite((x as PendingWheelchairLog).oldValue) &&
+          Number.isFinite((x as PendingWheelchairLog).newValue),
+      )
+      .map((x) => ({
+        ...x,
+        // 兼容升级前没有 changedAt 的旧队列：补成现在，至少不会变成 NaN 打乱排序
+        changedAt: Number.isFinite(x.changedAt) ? x.changedAt : Date.now(),
+      }))
   } catch {
     return []
   }
@@ -619,7 +681,13 @@ async function flushPendingWheelchairLog(): Promise<boolean> {
   let allOk = true
   let stoppedAt = -1
   for (let i = 0; i < mine.length; i++) {
-    const ok = await appendWheelchairLog(mine[i].oldValue, mine[i].newValue, mine[i].patientId)
+    // 传**变更发生时刻**（不是补写时刻），否则历史会按补写顺序倒排（中级-6）
+    const ok = await appendWheelchairLog(
+      mine[i].oldValue,
+      mine[i].newValue,
+      mine[i].patientId,
+      mine[i].changedAt,
+    )
     if (!ok) {
       // 这一条没补上：网络多半还没恢复，后面的也别试了（否则历史会倒序）
       allOk = false
@@ -629,7 +697,11 @@ async function flushPendingWheelchairLog(): Promise<boolean> {
   }
   // 失败的那条 + 它之后没来得及试的，按原顺序放回队列
   if (stoppedAt >= 0) remaining.push(...mine.slice(stoppedAt))
-  writePendingWheelchairLogs(remaining)
+  // ⚠️ 中级-5（第三轮独立评审）：写回结果**必须检查**。
+  // `setItem` 失败时队列没清掉（成功补写的那几条还在磁盘上），下次 flush 会**再写一遍** ——
+  // 变更历史里出现两条一模一样的记录，而 toast 说「已保存」，用户无法判断哪条是真的。
+  // 这正是 D2 想消灭的「文案撒谎」，只是换了个分支。
+  if (!writePendingWheelchairLogs(remaining)) return false
   return allOk
 }
 
@@ -1009,7 +1081,14 @@ function showHelp() {
         v-for="item in myPatients"
         :key="item.patient.id"
         class="row"
-        style="padding: 10px 0; border-top: 1px solid #f2f3f5; cursor: pointer"
+        :style="{
+          padding: '10px 0',
+          borderTop: '1px solid #f2f3f5',
+          // 保存/加载在途时病人行点不动：切过去会污染档案（见 switchPatient 注释），
+          // 用样式和 cursor 让用户看得出来，而不是点了没反应
+          cursor: savingPatient || loading ? 'not-allowed' : 'pointer',
+          opacity: savingPatient || loading ? 0.5 : 1,
+        }"
         @click="switchPatient(item.patient.id)"
       >
         <div>

@@ -139,7 +139,7 @@ await step(
 // ---------- 写接口 ----------
 await step(
   'W1',
-  'patient.update 修改病人配置（轮椅重量 1500→2000）',
+  'patient.update 修改病人配置（轮椅及衣物重量 1500→2000）',
   () => call('patient.update', { patientId: tempPatientId, wheelchairWeight: 2000 }, admin.token),
   () => true,
 )

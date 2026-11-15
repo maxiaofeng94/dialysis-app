@@ -34,7 +34,18 @@ Deno.serve(async (req) => {
       !Number.isFinite(rinseBackVolume) ||
       rinseBackVolume < 0
     ) {
-      return json({ error: '轮椅重量与回水量必须是不小于 0 的数字' }, 400)
+      return json({ error: '轮椅及衣物重量与回水量必须是不小于 0 的数字' }, 400)
+    }
+    // ⚠️ 轻微-8（第三轮独立评审）：上限校验必须与 App / 后台 / admin-api 一致。
+    // 这里原来只判 `>= 0`，任何登录用户直接 POST 本函数就能写进 13000kg ——
+    // 之后所有按档案计算的「上机前实际体重」都会是负数，用户看到的是离谱数字却查不出原因。
+    // App 端会先拦，但迁移路径（`migrate.ts` 透传本地档案值，`validateBackup` 不校验量程）
+    // 能绕过前端，所以服务端必须自己守住。
+    if (wheelchairWeight > 100) {
+      return json({ error: '轮椅及衣物重量不能超过 100kg（单位是 kg，不是克）' }, 400)
+    }
+    if (rinseBackVolume > 2000) {
+      return json({ error: '回水量不能超过 2000ml' }, 400)
     }
 
     // 识别调用者：service 客户端自身没有 session，必须显式传入请求头里的用户 access token

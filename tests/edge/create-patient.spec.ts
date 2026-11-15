@@ -89,17 +89,46 @@ describe('create-patient · 参数校验（先于鉴权）', () => {
     ['回水量为负', { rinseBackVolume: -0.5 }],
     ['回水量非数字', { rinseBackVolume: 'abc' }],
     ['回水量是字符串 Infinity', { rinseBackVolume: 'Infinity' }],
-  ])('%s → 400「轮椅重量与回水量必须是不小于 0 的数字」且不插库', async (_label, patch) => {
+  ])('%s → 400「轮椅及衣物重量与回水量必须是不小于 0 的数字」且不插库', async (_label, patch) => {
     const h = await load()
     const { status, body: res } = await readResult(
       await h.handle(edgeRequest({ name: '张三', ...patch }, { headers: AUTH })),
     )
     expect(status).toBe(400)
-    expect(res.error).toBe('轮椅重量与回水量必须是不小于 0 的数字')
+    expect(res.error).toBe('轮椅及衣物重量与回水量必须是不小于 0 的数字')
     expect(h.fake.callsOn('patients')).toHaveLength(0)
     expect(h.fake.callsOn('patient_members')).toHaveLength(0)
     // 数值校验同样在鉴权之前
     expect(h.fake.client.auth.getUser).not.toHaveBeenCalled()
+  })
+
+  /**
+   * ⚠️ 轻微-8（第三轮独立评审）：本函数原来只判 `>= 0`，**没有上限** ——
+   * 任何登录用户直接 POST 就能写进 13000kg，之后按档案算出的「上机前实际体重」全是负数。
+   * App 端会先拦，但迁移路径（`migrate.ts` 透传本地档案值、`validateBackup` 不校验量程）
+   * 能绕过前端，所以服务端必须自己守住。上限与 App / 后台 / admin-api 保持一致。
+   */
+  it.each([
+    ['轮椅及衣物重量超上限（13000，误以为是克）', { wheelchairWeight: 13000 }, '轮椅及衣物重量不能超过 100kg（单位是 kg，不是克）'],
+    ['轮椅及衣物重量刚超上限（101）', { wheelchairWeight: 101 }, '轮椅及衣物重量不能超过 100kg（单位是 kg，不是克）'],
+    ['回水量超上限（2001）', { rinseBackVolume: 2001 }, '回水量不能超过 2000ml'],
+  ])('%s → 400 且不插库', async (_label, patch, message) => {
+    const h = await load()
+    const { status, body: res } = await readResult(
+      await h.handle(edgeRequest({ name: '张三', ...patch }, { headers: AUTH })),
+    )
+    expect(status).toBe(400)
+    expect(res.error).toBe(message)
+    expect(h.fake.callsOn('patients')).toHaveLength(0)
+  })
+
+  it.each([
+    ['轮椅及衣物重量 100 是合法上限', { wheelchairWeight: 100 }],
+    ['回水量 2000 是合法上限', { rinseBackVolume: 2000 }],
+  ])('%s → 200（上限本身不能误拦）', async (_label, patch) => {
+    const h = await load()
+    const res = await h.handle(edgeRequest({ name: '张三', ...patch }, { headers: AUTH }))
+    expect(res.status).toBe(200)
   })
 
   it('姓名过长不做限制（1~30 由前端约束，函数只挡空值）', async () => {
@@ -222,11 +251,12 @@ describe('create-patient · 成功路径', () => {
   it('传入 wheelchairWeight / rinseBackVolume 时按值写入', async () => {
     const h = await load()
     await h.handle(
-      edgeRequest({ name: '李四', wheelchairWeight: 21500, rinseBackVolume: 500 }, { headers: AUTH }),
+      // 样本值必须在合法量程内（轻微-8 加了 100kg / 2000ml 上限，21500 现在会被拦）
+      edgeRequest({ name: '李四', wheelchairWeight: 21.5, rinseBackVolume: 500 }, { headers: AUTH }),
     )
     expect(h.fake.lastCall('patients')?.payload).toEqual({
       name: '李四',
-      wheelchair_weight: 21500,
+      wheelchair_weight: 21.5,
       rinse_back_volume: 500,
     })
   })
@@ -246,12 +276,12 @@ describe('create-patient · 成功路径', () => {
   it('数字字符串按 Number() 转成数字后写库（不再是原样的字符串）', async () => {
     const h = await load()
     await h.handle(
-      edgeRequest({ name: '李四', wheelchairWeight: '21500', rinseBackVolume: ' 500 ' }, { headers: AUTH }),
+      edgeRequest({ name: '李四', wheelchairWeight: '21.5', rinseBackVolume: ' 500 ' }, { headers: AUTH }),
     )
     // Number(' 500 ') === 500：两端空白与字符串形态都会被归一化成数字
     expect(h.fake.lastCall('patients')?.payload).toEqual({
       name: '李四',
-      wheelchair_weight: 21500,
+      wheelchair_weight: 21.5,
       rinse_back_volume: 500,
     })
   })

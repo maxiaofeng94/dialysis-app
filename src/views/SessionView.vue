@@ -348,18 +348,22 @@ async function mergeRemoteIfUntouched() {
       repository.getSession(sessionId), // 命中后台刚写回的新缓存，不用再等一次网络
       needPatient ? repository.getPatient(currentPatientId.value) : Promise.resolve(undefined),
     ])
-    if (p) patient.value = p
     if (!s) return // 另一端删掉了这条：这里不复活它，也不打断用户
-    if (s.updatedAt <= knownUpdatedAt) return // 旧的后台刷新结果，不允许把刚保存的值顶回去
+    if (stateSnapshot() !== knownSnapshot) return
     // ⚠️ 上面那次「用户动过没有」的检查是在 await **之前**做的 —— 等网络这段时间用户完全可能
     // 已经开始输入，回来后无条件回填就会把他刚敲的数字顶掉（AGENTS 明确禁止）。
     // 所以合并前再确认一次。
     //
     // ⚠️ `patient.value = p` 也放在这次复查**之后**：它虽然不碰表单，但会改变页面上
     // 「上机前实际 / 计划脱水」等派生数字 —— 用户正在输入时数字突然跳变同样是惊吓。
-    // 上面先判 `if (!s) return` 与版本号，再复查一次，最后才落值。
     if (stateSnapshot() !== knownSnapshot) return
+    // 档案更新与「记录版本号」是**两件独立的事**（中级-2，第三轮独立评审）：
+    // 另一端只改了轮椅及衣物重量、没动这条记录时，`s.updatedAt` 不变 ——
+    // 若把 `patient.value = p` 塞在版本号检查之后，本页就永远看不到新档案，
+    // 需求①的「实时跟随」在这条最常见路径上直接失效。
+    // 所以：用户没动过就先更新档案，记录本身再按版本号决定是否回填。
     if (p) patient.value = p
+    if (s.updatedAt <= knownUpdatedAt) return // 旧的后台刷新结果，不允许把刚保存的值顶回去
     session.value = s
     applySessionToForm(s)
     markStateKnown()

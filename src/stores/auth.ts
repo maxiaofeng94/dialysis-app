@@ -61,6 +61,15 @@ function isNetworkFailure(message: string): boolean {
 async function clearLocalState() {
   await cacheClear()
   await clearCurrentPatient()
+  // ⚠️ 轻微-7（第三轮独立评审）：待补的「轮椅及衣物重量变更记录」队列也要清。
+  // 不清不构成数据泄露（flush 按 currentPatientId 过滤，且 RLS 强制 operator_id = auth.uid()），
+  // 但会留下永远补不上的陈旧条目（病人 id 是 uuid，换账号后永远匹配不到），
+  // 而且隐私模式下 quota 更容易爆。队列是纯本地补偿机制，换账号后它就没有意义了。
+  try {
+    localStorage.removeItem('dialysis-pending-wheelchair-logs')
+  } catch {
+    // localStorage 不可用（隐私模式）：本来也没有队列可清
+  }
 }
 
 /** init() 的重入锁：路由守卫在并发导航时可能同时触发多次，重复注册 onAuthStateChange 会叠加回调 */

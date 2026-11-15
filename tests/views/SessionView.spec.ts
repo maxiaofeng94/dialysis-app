@@ -1984,6 +1984,57 @@ describe('SessionView · 进行中按当前档案计算（需求①）', () => {
     expect(fieldInput(w, '记录人').element.value).toBe('李护士')
   })
 
+  /**
+   * 中级-2（第三轮独立评审）：P2 声称「`patient.value = p` 已移到复查之后」，
+   * 但 `mergeRemoteIfUntouched` 里曾**同时**留着一处在 `await` 之后、复查之前的赋值
+   * （`if (p) patient.value = p` 在 `if (!s) return` 之前）。既有 P2 用例是**假绿**：
+   * 它没有把网络挂住，`getPatient` 立即 resolve，那行赋值落在用户输入**之前**，
+   * 所以永远测不到 —— 评审实测：删掉那一行，该用例照样绿。
+   *
+   * 这条用例把 `getPatient` 挂在 promise 上，让「用户输入」发生在 `await` **期间**，
+   * 才能真正区分赋值时机。判别力：把 `patient.value = p` 移回复查之前 → 本用例红。
+   */
+  it('后台刷新在途时用户开始输入：派生数字不许跳变（把网络挂住才测得到时序）', async () => {
+    const w = await mountSession(
+      defaultData({
+        session: makeSession({
+          id: 'session-1',
+          status: 'ongoing',
+          preWeightMeasured: 80,
+          postWeightMeasured: null,
+          wheelchairWeightUsed: 20,
+          updatedAt: 1_000,
+        }),
+        patient: makePatient({ wheelchairWeight: 20 }),
+      }),
+    )
+    expect(w.findAll('.flow-val')[0].text()).toBe('60.0kg')
+
+    // 把 getPatient 挂住：返回一个手动 resolve 的 promise
+    let releasePatient: (v: ReturnType<typeof makePatient>) => void = () => {}
+    vi.mocked(repository.getPatient).mockReturnValue(
+      new Promise((resolve) => {
+        releasePatient = resolve as never
+      }) as never,
+    )
+
+    // 触发后台刷新（进入 await，卡在挂住的 getPatient 上）
+    cacheVersion.value += 1
+    await flushPromises()
+
+    // 用户**在等待期间**开始输入（此时 merge 还没走到复查）
+    await fieldInput(w, '记录人').setValue('李护士')
+    expect(fieldInput(w, '记录人').element.value).toBe('李护士')
+
+    // 网络回来：另一端把档案改成 13.4
+    releasePatient(makePatient({ wheelchairWeight: 13.4 }))
+    await flushPromises()
+
+    // 用户正在输入 → 合并必须整体跳过：派生数字仍是 60.0（80−20），不能跳到 66.6
+    expect(w.findAll('.flow-val')[0].text()).toBe('60.0kg')
+    expect(fieldInput(w, '记录人').element.value).toBe('李护士')
+  })
+
   it('已完成的记录：另一端改档案后本页数字不变，且不多发一次 getPatient', async () => {
     const w = await mountSession(
       defaultData({

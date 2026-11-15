@@ -1793,4 +1793,149 @@ describe('SettingsView · 轮椅及衣物重量变更记录（运行时行为）
     expect(log.patientId).toBe('patient-a')
     expect(log).toMatchObject({ oldValue: 13.4, newValue: 13.5 })
   })
+
+  /**
+   * 中级-5（第三轮独立评审）：`flushPendingWheelchairLog` 丢弃了队列写回结果。
+   *
+   * 场景（Safari 无痕 / 配额满）：`setItem` 抛错但 `removeItem` 正常，队列里还有**别的病人**的
+   * 待补项 → 补写成功后写回 `remaining` 失败 → 成功的那条仍留在磁盘上 → 下次 flush 再写一遍。
+   * 变更历史里出现两条一模一样的记录，而 toast 说「已保存」，用户无法判断哪条是真的。
+   *
+   * 修法：检查写回结果，失败时不能报「已保存」。
+   */
+  it('补写成功后队列写不回（配额满）：不能报「已保存」，否则下次会重复写同一条', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    // 队列里同时有 A（本病人，会补写成功）和 B（别的病人，必须写回磁盘 → 触发 setItem）
+    localStorage.setItem(
+      'dialysis-pending-wheelchair-logs',
+      JSON.stringify([
+        { patientId: 'patient-a', oldValue: 13.4, newValue: 13.5, changedAt: 1_700_000_000_000 },
+        { patientId: 'patient-b', oldValue: 20, newValue: 21, changedAt: 1_700_000_100_000 },
+      ]),
+    )
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', wheelchairWeight: 13.5 }) })
+
+    // 补写成功；但写回队列（setItem）抛错
+    vi.mocked(repository.addPatientChangeLog).mockResolvedValue(undefined as never)
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError')
+    })
+
+    try {
+      await buttonByText(w, '保存档案').trigger('click')
+      await flushPromises()
+
+      // 关键：队列没清干净，绝不能报「已保存」（否则用户以为补完了）
+      expect(mocks.showToast).not.toHaveBeenCalledWith('已保存')
+      expect(mocks.showToast).toHaveBeenCalledWith('已保存，但变更记录仍未能写入（下次保存时会自动补记）')
+    } finally {
+      setItemSpy.mockRestore()
+    }
+  })
+
+  /**
+   * 中级-6（第三轮独立评审）：待补项原来不存「变更发生时刻」，补写时取 `Date.now()`。
+   *
+   * 历史按 `changedAt` 倒序排 → 10:00 的变更补写时被盖上 11:00 的时间戳，
+   * 排到 10:30 那条**之后**，历史倒着长。D1 的 `break` 只管同一次 flush 内部，
+   * 管不住「补写条目 vs 之后实时写入的条目」。
+   *
+   * 判别力：把 `appendWheelchairLog` 的 `changedAt` 参数去掉（退回 `Date.now()`）→ 本用例红。
+   */
+  it('补写时用的是「变更发生时刻」，不是「补写时刻」（否则历史按补写顺序倒排）', async () => {
+    currentPatientIdRef.value = 'patient-default'
+    const changedAt = 1_700_000_000_000 // 10:00 发生的变更
+    localStorage.setItem(
+      'dialysis-pending-wheelchair-logs',
+      JSON.stringify([{ patientId: 'patient-default', oldValue: 13.4, newValue: 13.5, changedAt }]),
+    )
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.5 }) })
+    vi.mocked(repository.addPatientChangeLog).mockResolvedValue(undefined as never)
+
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    const written = vi.mocked(repository.addPatientChangeLog).mock.calls[0][0]
+    expect(written).toMatchObject({ oldValue: 13.4, newValue: 13.5 })
+    // 必须是变更发生时刻，不是补写时的 Date.now()
+    expect(written.changedAt).toBe(changedAt)
+  })
+
+  /**
+   * 中级-6 的兼容性：升级前存下的队列没有 `changedAt` 字段，
+   * 读出时必须补成有效数字（否则 NaN 会把排序彻底打乱）。
+   */
+  it('旧队列没有 changedAt 字段：读出时补成有效时间，不产生 NaN', async () => {
+    currentPatientIdRef.value = 'patient-default'
+    // 故意不带 changedAt（模拟升级前的队列）
+    localStorage.setItem(
+      'dialysis-pending-wheelchair-logs',
+      JSON.stringify([{ patientId: 'patient-default', oldValue: 13.4, newValue: 13.5 }]),
+    )
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-default', wheelchairWeight: 13.5 }) })
+    vi.mocked(repository.addPatientChangeLog).mockResolvedValue(undefined as never)
+
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    const written = vi.mocked(repository.addPatientChangeLog).mock.calls[0][0]
+    expect(Number.isFinite(written.changedAt)).toBe(true)
+    expect(written.changedAt).toBeGreaterThan(0)
+  })
+
+  /**
+   * 严重-1（第三轮独立评审）：保存在途时点**真实的病人行**切病人，
+   * 甲的档案值会被回写进页面状态，再点保存 / 覆盖保存就把甲的姓名生日写进乙的服务器档案。
+   *
+   * 上面那条 S-1 用例直接改 `currentPatientIdRef`，**绕过了 `switchPatient`**，
+   * 所以只覆盖「日志归属」，覆盖不到「档案被污染」这个入口。
+   *
+   * 这条用例点真实的行，断言：
+   * ① 保存在途时点另一行 → 被挡住并说明原因，当前病人不变；
+   * ② 保存返回后仍是甲，唯一一次 savePatient 是甲的 id + 甲的姓名（不会串成乙的 id）。
+   *
+   * 判别力：把 `switchPatient` 里的 `savingPatient` 守卫去掉 → 本用例红。
+   */
+  it('保存在途时点另一个病人行：必须挡住切换，不能让甲的档案值配乙的 id 保存', async () => {
+    currentPatientIdRef.value = 'patient-a'
+    isLoggedInRef.value = true // 病人列表只在登录态加载
+    vi.mocked(listMyPatients).mockResolvedValue([
+      { patient: makePatient({ id: 'patient-a', name: '甲' }), role: 'owner' },
+      { patient: makePatient({ id: 'patient-b', name: '乙' }), role: 'owner' },
+    ] as never)
+    const w = await mountSettings({ patient: makePatient({ id: 'patient-a', wheelchairWeight: 13.4, name: '甲' }) })
+    await flushPromises()
+
+    // 让 savePatient 挂住（弱网下的秒级等待）
+    let releaseSave!: () => void
+    vi.mocked(repository.savePatient).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseSave = () => resolve('2026-01-01T00:00:00.000000+00:00')
+        }),
+    )
+
+    await fieldInput(w, '轮椅及衣物重量').setValue('13.5')
+    await buttonByText(w, '保存档案').trigger('click')
+    await flushPromises()
+
+    // 保存还在途中 → 点「乙」那一行（真实的行点击，不是改 ref）
+    mocks.showToast.mockClear()
+    const rowB = w.findAll('.row').find((r) => r.text().includes('乙'))
+    expect(rowB, '找不到乙那一行').toBeTruthy()
+    await rowB!.trigger('click')
+    await flushPromises()
+
+    // ① 被挡住：仍停在甲，并明确告诉用户为什么
+    expect(currentPatientIdRef.value).toBe('patient-a')
+    expect(mocks.showToast).toHaveBeenCalledWith('正在保存档案，请稍候再切换病人')
+
+    // ② 放行保存后仍是甲；唯一一次 savePatient 是甲的 id + 甲的姓名（没有串成乙的 id）
+    releaseSave()
+    await flushPromises()
+    expect(currentPatientIdRef.value).toBe('patient-a')
+    const saveCalls = vi.mocked(repository.savePatient).mock.calls
+    expect(saveCalls.length).toBe(1)
+    expect(saveCalls[0][0]).toMatchObject({ id: 'patient-a', name: '甲', wheelchairWeight: 13.5 })
+  })
 })
